@@ -106,8 +106,7 @@ rmcp = { version = "0.3.2", features = [
 # Random number generation for request IDs
 rand = "0.8"
 
-# Bring in proxy + common as path dependencies (minimal change)
-ramparts-proxy = { path = "proxy" }
+# Bring in common as path dependency
 ramparts-common = { path = "common" }
 
 [build-dependencies]
