@@ -52,6 +52,7 @@ jobs:
       - name: Trigger private repo workflow
         env:
           GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
+        shell: bash
         run: |
           echo "Dispatching to repo: ${{ env.DEVOPS_REPO }} with event_type: ${{ env.EVENT_TYPE }}"
           gh api --method POST \
