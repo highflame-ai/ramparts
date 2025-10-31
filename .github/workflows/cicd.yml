@@ -52,6 +52,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
         run: |
           gh api --method POST \
+            -H "Authorization: token ${{ secrets.DEVOPS_GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             /repos/${{ github.repository_owner }}/${{ env.DEVOPS_REPO }}/dispatches \
             -f event_type=${{ env.EVENT_TYPE }} \
