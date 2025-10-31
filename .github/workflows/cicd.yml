@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - "main"
+      - "devops-trigger"
     paths-ignore:
       - "**/*CHANGELOG.md"
       - "*CHANGELOG.md"
@@ -14,9 +15,9 @@ concurrency:
 
 env:
   DEVOPS_REPO: "javelin-cloud"
-  DEVOPS_BRANCH: "main"
+  DEVOPS_BRANCH: "devops-triggercd.."
   CICD_TRIGGER: "enable"
-  CICD_WORKFLOW: "trigger-cicd-deploy-ramparts-server.yml"
+  EVENT_TYPE: "cicd-trigger"
 
 jobs:
   reusable-vars:
@@ -50,7 +51,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
         run: |
-          gh workflow run ${{ env.CICD_WORKFLOW }} \
-            --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \
-            --ref ${{ env.DEVOPS_BRANCH }}
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository_owner }}/${{ env.DEVOPS_REPO }}/dispatches \
+            -f event_type=${{ env.EVENT_TYPE }} \
+            -F client_payload[ref]=${{ env.DEVOPS_BRANCH }}
 
