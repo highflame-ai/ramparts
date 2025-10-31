@@ -51,7 +51,7 @@ jobs:
 
       - name: Trigger private repo workflow
         env:
-          GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           echo "Dispatching to repo: ${{ env.DEVOPS_REPO }} with event_type: ${{ env.EVENT_TYPE }}"
