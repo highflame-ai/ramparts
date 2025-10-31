@@ -46,18 +46,24 @@ jobs:
 
       - name: Install GitHub CLI
         shell: bash
-        run: |-
-          sudo apt install gh -y
+        run: |
+            sudo apt update
+              sudo apt install gh -y
 
       - name: Trigger private repo workflow
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            DEVOPS_REPO: javelin-cloud
+            DEVOPS_BRANCH: devops-trigger
+            EVENT_TYPE: cicd-trigger
         shell: bash
         run: |
-          echo "Dispatching to repo: ${{ env.DEVOPS_REPO }} with event_type: ${{ env.EVENT_TYPE }}"
-          gh api --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository_owner }}/${{ env.DEVOPS_REPO }}/dispatches \
-            -f event_type=${{ env.EVENT_TYPE }} \
-            -F client_payload[ref]=${{ env.DEVOPS_BRANCH }}
+          echo "Dispatching to repo: $DEVOPS_REPO with event_type: $EVENT_TYPE and ref: $DEVOPS_BRANCH"
+  
+           gh api --method POST \
+          -H "Authorization: token ${{ secrets.DEVOPS_GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github+json" \
+          /repos/getjavelin/$DEVOPS_REPO/dispatches \
+          -f event_type=$EVENT_TYPE \
+          -F client_payload[ref]=$DEVOPS_BRANCH \
+           --jq .
 
