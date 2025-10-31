@@ -45,7 +45,12 @@ jobs:
           persist-credentials: false
 
       - name: Install GitHub CLI
-        run: sudo apt install gh -y
+        shell: bash
+        run: |-
+          sudo apt install gh -y
+
+      
+
 
       - name: Trigger private repo workflow
         env:
