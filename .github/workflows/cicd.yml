@@ -57,7 +57,6 @@ jobs:
           echo "Dispatching to repo: ${{ env.DEVOPS_REPO }} with event_type: ${{ env.EVENT_TYPE }}"
           gh api --method POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
             /repos/${{ github.repository_owner }}/${{ env.DEVOPS_REPO }}/dispatches \
             -f event_type=${{ env.EVENT_TYPE }} \
             -F client_payload[ref]=${{ env.DEVOPS_BRANCH }}
