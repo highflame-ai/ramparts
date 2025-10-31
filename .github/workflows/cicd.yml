@@ -49,16 +49,11 @@ jobs:
         run: |-
           sudo apt install gh -y
 
-      - name: Authenticate GitHub CLI
-        shell: bash
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
-  
       - name: Trigger private repo workflow
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh api --method POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             /repos/${{ github.repository_owner }}/${{ env.DEVOPS_REPO }}/dispatches \
             -f event_type=${{ env.EVENT_TYPE }} \
