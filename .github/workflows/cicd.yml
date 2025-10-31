@@ -51,10 +51,11 @@ jobs:
 
       - name: Trigger private repo workflow
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
         run: |
           gh api --method POST \
             -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
             /repos/${{ github.repository_owner }}/${{ env.DEVOPS_REPO }}/dispatches \
             -f event_type=${{ env.EVENT_TYPE }} \
             -F client_payload[ref]=${{ env.DEVOPS_BRANCH }}
