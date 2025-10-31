@@ -53,6 +53,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
         run: |
+          echo "Dispatching to repo: ${{ env.DEVOPS_REPO }} with event_type: ${{ env.EVENT_TYPE }}"
           gh api --method POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
