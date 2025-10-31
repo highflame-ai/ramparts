@@ -51,14 +51,14 @@ jobs:
 
       - name: Authenticate GitHub CLI
         shell: bash
-        run: echo "${{ secrets.DEVOPS_GITHUB_TOKEN }}" | gh auth login --with-token
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
   
       - name: Trigger private repo workflow
         env:
-          GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh api --method POST \
-            -H "Authorization: token ${{ secrets.DEVOPS_GITHUB_TOKEN }}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             /repos/${{ github.repository_owner }}/${{ env.DEVOPS_REPO }}/dispatches \
             -f event_type=${{ env.EVENT_TYPE }} \
