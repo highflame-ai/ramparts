@@ -49,9 +49,10 @@ jobs:
         run: |-
           sudo apt install gh -y
 
-      
-
-
+      - name: Authenticate GitHub CLI
+        shell: bash
+        run: echo "${{ secrets.DEVOPS_GITHUB_TOKEN }}" | gh auth login --with-token
+  
       - name: Trigger private repo workflow
         env:
           GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
