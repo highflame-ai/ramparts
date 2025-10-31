@@ -15,7 +15,7 @@ concurrency:
 
 env:
   DEVOPS_REPO: "javelin-cloud"
-  DEVOPS_BRANCH: "devops-triggercd.."
+  DEVOPS_BRANCH: "devops-trigger"
   CICD_TRIGGER: "enable"
   EVENT_TYPE: "cicd-trigger"
 
