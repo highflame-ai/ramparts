@@ -60,11 +60,11 @@ jobs:
           echo "Dispatching to repo: $DEVOPS_REPO with event_type: $EVENT_TYPE and ref: $DEVOPS_BRANCH"
   
            gh api --method POST \
-          -H "Authorization: token $GH_TOKEN" \
-          -H "Accept: application/vnd.github+json" \
-          -H "X-GitHub-Api-Version: 2022-11-28" \
-           https://api.github.com/repos/getjavelin/$DEVOPS_REPO/dispatches \
-          -f event_type=$EVENT_TYPE \
-          -F client_payload[ref]=$DEVOPS_BRANCH \
-          --jq .
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+             https://api.github.com/repos/getjavelin/$DEVOPS_REPO/dispatches \
+            -f event_type=$EVENT_TYPE \
+            -F client_payload[ref]=$DEVOPS_BRANCH \
+            -i
 
