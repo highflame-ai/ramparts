@@ -52,7 +52,7 @@ jobs:
       - name: Trigger private repo workflow
         env:
             DEVOPS_REPO: javelin-cloud
-            DEVOPS_BRANCH: devops-trigger
+            DEVOPS_BRANCH: main
             EVENT_TYPE: cicd-trigger
             GH_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
         shell: bash
