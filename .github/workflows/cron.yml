@@ -13,7 +13,7 @@ env:
   DEVOPS_REPO: "javelin-cloud"
   DEVOPS_BRANCH: "main"
   CICD_TRIGGER: "enable"
-  CICD_WORKFLOW: "trigger-cron-deploy-ramparts-server.yml"
+  EVENT_TYPE: "cron-trigger"
 
 jobs:
   reusable-vars:
@@ -47,6 +47,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
         run: |
-          gh workflow run ${{ env.CICD_WORKFLOW }} \
-            --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \
-            --ref ${{ env.DEVOPS_BRANCH }}
+          echo "Dispatching to repo: $DEVOPS_REPO with event_type: $EVENT_TYPE and ref: $DEVOPS_BRANCH"
+  
+           gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+             https://api.github.com/repos/getjavelin/$DEVOPS_REPO/dispatches \
+            -f event_type=$EVENT_TYPE \
+            -F client_payload[ref]=$DEVOPS_BRANCH \
