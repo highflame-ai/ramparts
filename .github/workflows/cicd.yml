@@ -15,7 +15,7 @@ concurrency:
 
 env:
   DEVOPS_REPO: "javelin-cloud"
-  DEVOPS_BRANCH: "devops-trigger"
+  DEVOPS_BRANCH: "main"
   CICD_TRIGGER: "enable"
   EVENT_TYPE: "cicd-trigger"
 
@@ -51,20 +51,15 @@ jobs:
 
       - name: Trigger private repo workflow
         env:
-            DEVOPS_REPO: javelin-cloud
-            DEVOPS_BRANCH: main
-            EVENT_TYPE: cicd-trigger
             GH_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
         shell: bash
         run: |
           echo "Dispatching to repo: $DEVOPS_REPO with event_type: $EVENT_TYPE and ref: $DEVOPS_BRANCH"
   
            gh api --method POST \
-            -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
              https://api.github.com/repos/getjavelin/$DEVOPS_REPO/dispatches \
             -f event_type=$EVENT_TYPE \
             -F client_payload[ref]=$DEVOPS_BRANCH \
-            -i
+            
 
