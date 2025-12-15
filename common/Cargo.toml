@@ -2,10 +2,10 @@
 name = "ramparts-common"
 version = "0.7.0"
 edition = "2021"
-authors = ["Sharath Rajasekar <sharath@getjavelin.com>"]
+authors = ["Sharath Rajasekar <sharath@highflame.com>"]
 description = "Common types and utilities for Ramparts MCP tools"
 license = "Apache-2.0"
-repository = "https://github.com/getjavelin/ramparts"
+repository = "https://github.com/highflame-ai/ramparts"
 
 [dependencies]
 # JSON handling

@@ -28,8 +28,8 @@ pub fn display_banner() {
     );
     println!(
         "Repository: {}",
-        "https://github.com/getjavelin/ramparts".bright_blue()
+        "https://github.com/highflame-ai/ramparts".bright_blue()
     );
-    println!("Support: {}", "support@getjavelin.com".bright_blue());
+    println!("Support: {}", "support@highflame.com".bright_blue());
     println!();
 }

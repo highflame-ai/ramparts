@@ -220,7 +220,7 @@ For command-line MCP servers:
 For servers running inside containers (e.g., Docker MCP Toolkit):
 ```json
 {
-    "image": "ghcr.io/getjavelin/ramparts:latest",
+    "image": "ghcr.io/highflame-ai/ramparts:latest",
     "command": ["/app/ramparts", "mcp-stdio"],
     "description": "Ramparts MCP server over stdio"
 }

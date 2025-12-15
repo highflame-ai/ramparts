@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DEVOPS_REPO: "javelin-cloud"
+  DEVOPS_REPO: "highflame-cloud"
   DEVOPS_BRANCH: "main"
   CICD_TRIGGER: "enable"
   CICD_WORKFLOW: "trigger-cron-deploy-ramparts-server.yml"

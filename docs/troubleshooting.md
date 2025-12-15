@@ -661,7 +661,7 @@ EOF
 
 If you're still experiencing issues:
 
-1. **Check GitHub Issues**: [https://github.com/getjavelin/ramparts/issues](https://github.com/getjavelin/ramparts/issues)
+1. **Check GitHub Issues**: [https://github.com/highflame-ai/ramparts/issues](https://github.com/highflame-ai/ramparts/issues)
 2. **Create Bug Report**: Include debug report and steps to reproduce
 3. **Search Documentation**: Check all docs in the `docs/` directory
 4. **Community Support**: Join discussions in GitHub Discussions

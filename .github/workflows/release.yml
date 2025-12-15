@@ -10,7 +10,7 @@ env:
   RELEASE_BRANCH: "main"
   REGEX_PATTERN: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
   RELEASE_NAME: ${{ github.event.release.name }}
-  DEVOPS_REPO: "javelin-cloud"
+  DEVOPS_REPO: "highflame-cloud"
   DEVOPS_BRANCH: "main"
   RELEASE_TRIGGER: "enable"
   RELEASE_WORKFLOW: "trigger-release-deploy-ramparts-server.yml"
