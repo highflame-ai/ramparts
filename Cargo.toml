@@ -2,10 +2,10 @@
 name = "ramparts"
 version = "0.7.0"
 edition = "2021"
-authors = ["Sharath Rajasekar <sharath@getjavelin.com>"]
+authors = ["Sharath Rajasekar <sharath@highflame.com>"]
 description = "A CLI tool for scanning Model Context Protocol (MCP) servers"
 license = "Apache-2.0"
-repository = "https://github.com/getjavelin/ramparts"
+repository = "https://github.com/highflame-ai/ramparts"
 keywords = ["mcp", "scanner", "cli", "llm", "security"]
 categories = ["command-line-utilities", "network-programming"]
 include = ["src/**/*", "LICENSE", "README.md", "build.rs"]

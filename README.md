@@ -7,12 +7,12 @@
 *A fast, lightweight security scanner for Model Context Protocol (MCP) servers with built-in vulnerability detection.*
 
 [![Crates.io](https://img.shields.io/crates/v/ramparts)](https://crates.io/crates/ramparts)
-[![GitHub stars](https://img.shields.io/github/stars/getjavelin/ramparts?style=social)](https://github.com/getjavelin/ramparts)
+[![GitHub stars](https://img.shields.io/github/stars/highflame-ai/ramparts?style=social)](https://github.com/highflame-ai/ramparts)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-blue.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/github/actions/workflow/status/getjavelin/ramparts/pr-check.yml?label=tests)](https://github.com/getjavelin/ramparts/actions)
-[![Clippy](https://img.shields.io/github/actions/workflow/status/getjavelin/ramparts/pr-check.yml?label=lint)](https://github.com/getjavelin/ramparts/actions)
-[![Release](https://img.shields.io/github/release/getjavelin/ramparts)](https://github.com/getjavelin/ramparts/releases)
+[![Tests](https://img.shields.io/github/actions/workflow/status/highflame-ai/ramparts/pr-check.yml?label=tests)](https://github.com/highflame-ai/ramparts/actions)
+[![Clippy](https://img.shields.io/github/actions/workflow/status/highflame-ai/ramparts/pr-check.yml?label=lint)](https://github.com/highflame-ai/ramparts/actions)
+[![Release](https://img.shields.io/github/release/highflame-ai/ramparts)](https://github.com/highflame-ai/ramparts/releases)
 
 </div>
 
@@ -163,7 +163,7 @@ We welcome contributions to Ramparts mcp scan. If you have suggestions, bug repo
 - 📖 **[CLI Reference](docs/cli.md)** - All commands, options, and usage examples
 
 ## Additional Resources
-- [Need Support?](https://github.com/getjavelin/ramparts/issues)
+- [Need Support?](https://github.com/highflame-ai/ramparts/issues)
 - [MCP Protocol Documentation](https://modelcontextprotocol.io/)
 // Examples folder was removed to reduce branch diff; see configuration docs instead.
 - [Configuration Guide](docs/configuration.md)

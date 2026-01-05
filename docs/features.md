@@ -174,7 +174,7 @@ If you run into connection issues, try increasing timeouts with `--timeout 60`. 
 🔍 **[Complete Troubleshooting Guide](troubleshooting.md)** has detailed solutions for common problems.
 
 **Community Resources:**
-- [GitHub Issues](https://github.com/getjavelin/ramparts/issues) for bug reports and feature requests
+- [GitHub Issues](https://github.com/highflame-ai/ramparts/issues) for bug reports and feature requests
 - [Documentation](docs/) for comprehensive guides and references
 
 The docs are designed to be practical—they focus on what you're trying to accomplish rather than just listing options. If something isn't clear or you think we're missing a use case, open an issue and let us know.

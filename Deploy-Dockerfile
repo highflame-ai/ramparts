@@ -2,19 +2,19 @@ FROM ubuntu:24.04
 LABEL maintainer="Akhil Raj"
 
 ARG APP_USER="highflame"
-ARG APP_GROUP="highflame"
-
-RUN apt-get update \
-    && groupadd -g 1001 ${APP_GROUP} \
-    && useradd -u 1001 -g ${APP_GROUP} -m -s /bin/bash ${APP_USER}
+ARG APP_ID="10000"
     
 WORKDIR /app
 COPY target/release/ramparts /app/
 COPY rules /app/rules
 COPY config.yaml /app/
 
-RUN chown -R ${APP_USER}:${APP_GROUP} /app
-USER ${APP_USER}
+RUN apt-get update \
+    && groupadd -g ${APP_ID} ${APP_USER} \
+    && useradd -u ${APP_ID} -g ${APP_USER} -m -s /bin/bash ${APP_USER} \
+    && chown -R ${APP_USER}:${APP_USER} /app
+
+USER ${APP_USER}:${APP_USER}
 EXPOSE 8080
 
 ENTRYPOINT [ "/app/ramparts", "server", "--port", "8080", "--host", "0.0.0.0" ]
