@@ -1,4 +1,4 @@
-name: CICD Build - Javelin Ramparts Server
+name: CICD Build - Highflame Ramparts Server
 
 on:
   push:
@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DEVOPS_REPO: "javelin-cloud"
+  DEVOPS_REPO: "highflame-cloud"
   DEVOPS_BRANCH: "main"
   CICD_TRIGGER: "enable"
   CICD_WORKFLOW: "trigger-cicd-deploy-ramparts-server.yml"
@@ -29,7 +29,7 @@ jobs:
     outputs:
       CICD_TRIGGER: ${{ env.CICD_TRIGGER }}
 
-  javelin-trigger:
+  highflame-trigger:
     needs:
       - reusable-vars
     permissions:

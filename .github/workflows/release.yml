@@ -1,4 +1,4 @@
-name: Release Build - Ramparts and Javelin Ramparts Server
+name: Release Build - Ramparts and Highflame Ramparts Server
 
 on:
   release:
@@ -10,7 +10,7 @@ env:
   RELEASE_BRANCH: "main"
   REGEX_PATTERN: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
   RELEASE_NAME: ${{ github.event.release.name }}
-  DEVOPS_REPO: "javelin-cloud"
+  DEVOPS_REPO: "highflame-cloud"
   DEVOPS_BRANCH: "main"
   RELEASE_TRIGGER: "enable"
   RELEASE_WORKFLOW: "trigger-release-deploy-ramparts-server.yml"
@@ -26,7 +26,7 @@ jobs:
     outputs:
       RELEASE_TRIGGER: ${{ env.RELEASE_TRIGGER }}
 
-  javelin-validate:
+  highflame-validate:
     permissions:
       contents: 'read'
     runs-on: ubuntu-24.04
@@ -64,9 +64,9 @@ jobs:
           path: Cargo.toml
           retention-days: 1
 
-  javelin-artifact:
+  highflame-artifact:
     needs:
-      - javelin-validate
+      - highflame-validate
     permissions:
       contents: 'read'
     strategy:
@@ -204,10 +204,10 @@ jobs:
           asset_name: ${{ matrix.target }}-${{ matrix.arch }}_checksums.txt
           asset_content_type: text/plain
 
-  javelin-crate:
+  highflame-crate:
     needs:
-      - javelin-validate
-      - javelin-artifact
+      - highflame-validate
+      - highflame-artifact
     permissions:
       contents: 'read'
     runs-on: ubuntu-24.04
@@ -275,10 +275,10 @@ jobs:
           # cargo publish --allow-dirty Cargo.toml --allow-dirty Cargo.lock
           cargo publish --allow-dirty
 
-  javelin-trigger:
+  highflame-trigger:
     needs:
       - reusable-vars
-      - javelin-crate
+      - highflame-crate
     permissions:
       contents: 'read'
       id-token: 'write'

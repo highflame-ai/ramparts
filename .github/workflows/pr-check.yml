@@ -24,7 +24,7 @@ env:
   TRIVY_REPORT_FILE: "trivy-scan-result"
 
 jobs:
-  javelin-lint-check:
+  highflame-lint-check:
     permissions:
       contents: 'read'
     runs-on: ubuntu-24.04
@@ -98,7 +98,7 @@ jobs:
           fi
         shell: bash
 
-  javelin-sast-check:
+  highflame-sast-check:
     permissions:
       contents: 'read'
     runs-on: ubuntu-24.04
@@ -178,7 +178,7 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
-  javelin-security-check:
+  highflame-security-check:
     permissions:
       contents: 'read'
     runs-on: ubuntu-24.04
@@ -235,7 +235,7 @@ jobs:
       - name: Run cargo audit
         run: cargo audit --deny warnings
 
-  javelin-build-check:
+  highflame-build-check:
     permissions:
       contents: 'read'
     strategy:
@@ -315,7 +315,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  javelin-trivy-scan:
+  highflame-trivy-scan:
     permissions:
       contents: 'read'
     runs-on: ubuntu-24.04

@@ -1,8 +1,8 @@
 FROM ubuntu:24.04
 LABEL maintainer="Akhil Raj"
 
-ARG APP_USER="javelin"
-ARG APP_GROUP="javelin"
+ARG APP_USER="highflame"
+ARG APP_GROUP="highflame"
 
 RUN apt-get update \
     && groupadd -g 1001 ${APP_GROUP} \
