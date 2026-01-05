@@ -217,5 +217,5 @@ Tools:
 
 ---
 
-**Full Changelog**: https://github.com/getjavelin/ramparts/compare/v0.6.9...v0.7.0
-**Download**: https://github.com/getjavelin/ramparts/releases/tag/v0.7.0
+**Full Changelog**: https://github.com/highflame-ai/ramparts/compare/v0.6.9...v0.7.0
+**Download**: https://github.com/highflame-ai/ramparts/releases/tag/v0.7.0
