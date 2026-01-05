@@ -1,4 +1,4 @@
-name: Cron Build - Javelin Ramparts Server
+name: Cron Build - Highflame Ramparts Server
 
 on:
   workflow_dispatch:
@@ -26,7 +26,7 @@ jobs:
     outputs:
       CICD_TRIGGER: ${{ env.CICD_TRIGGER }}
 
-  javelin-trigger:
+  highflame-trigger:
     needs:
       - reusable-vars
     permissions:
