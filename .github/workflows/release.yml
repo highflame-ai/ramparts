@@ -74,6 +74,8 @@ jobs:
         include:
           - target: ubuntu-24.04
             arch: x86_64
+          - target: ubuntu-24.04-arm
+            arch: aarch64
           - target: windows-2022
             arch: x86_64
           - target: macOS-15
@@ -104,6 +106,10 @@ jobs:
           if [[ ${{ matrix.target }} == "ubuntu-24.04" && ${{ matrix.arch }} == "x86_64" ]] ; then
             echo "crate_target=x86_64-unknown-linux-gnu" >> ${GITHUB_OUTPUT}
             echo "crate_release=ramparts-linux-x86_64" >> ${GITHUB_OUTPUT}
+            echo "crate_ext=" >> ${GITHUB_OUTPUT}
+          elif [[ ${{ matrix.target }} == "ubuntu-24.04-arm" && ${{ matrix.arch }} == "aarch64" ]] ; then
+            echo "crate_target=aarch64-unknown-linux-gnu" >> ${GITHUB_OUTPUT}
+            echo "crate_release=ramparts-linux-aarch64" >> ${GITHUB_OUTPUT}
             echo "crate_ext=" >> ${GITHUB_OUTPUT}
           elif [[ ${{ matrix.target }} == "windows-2022" && ${{ matrix.arch }} == "x86_64" ]] ; then
             echo "crate_target=x86_64-pc-windows-msvc" >> ${GITHUB_OUTPUT}
