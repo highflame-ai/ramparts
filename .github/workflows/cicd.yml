@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - "main"
+      - "devops-upgrade"
     paths-ignore:
       - "**/*CHANGELOG.md"
       - "*CHANGELOG.md"
@@ -39,7 +40,7 @@ jobs:
     if: (needs.reusable-vars.outputs.CICD_TRIGGER == 'enable')
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
