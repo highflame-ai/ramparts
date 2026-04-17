@@ -11,9 +11,6 @@ on:
   merge_group:
     types:
       - checks_requested
-  push:
-    branches:
-      - "devops-upgrade"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref }}

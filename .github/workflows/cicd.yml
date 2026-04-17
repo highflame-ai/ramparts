@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - "main"
-      - "devops-upgrade"
     paths-ignore:
       - "**/*CHANGELOG.md"
       - "*CHANGELOG.md"
