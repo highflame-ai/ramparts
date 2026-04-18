@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: true
@@ -57,7 +57,7 @@ jobs:
           sed -i 's/^version = ".*"/version = "${{ env.RELEASE_NAME }}"/' Cargo.toml
 
       - name: Upload cargo-toml
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: cargo-toml
@@ -83,12 +83,12 @@ jobs:
     runs-on: ${{ matrix.target }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Download cargo-toml
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: cargo-toml
 
@@ -155,7 +155,7 @@ jobs:
           echo "YARA not available on Windows, will build without YARA features"
 
       - name: Cache dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -213,12 +213,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Download cargo-toml
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: cargo-toml
 
@@ -258,7 +258,7 @@ jobs:
           echo "YARA not available on Windows, will build without YARA features"
 
       - name: Cache dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -286,7 +286,7 @@ jobs:
     if: (needs.reusable-vars.outputs.RELEASE_TRIGGER == 'enable')
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
