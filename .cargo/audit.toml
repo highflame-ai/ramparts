@@ -11,6 +11,26 @@
 ignore = [
     "RUSTSEC-2023-0071",  # rsa: Marvin Attack timing side-channel - no fix available, medium severity
     "RUSTSEC-2024-0436",  # paste: unmaintained but stable proc-macro crate
+    # wasmtime advisories below come in transitively via yara-x. yara-x pins
+    # wasmtime to ^40.0.4 (latest yara-x 1.15.0). Ramparts uses yara-x only to
+    # compile and run a fixed set of repo-supplied YARA rules — we never
+    # execute user-supplied WebAssembly, so the affected code paths are not
+    # reachable. Re-evaluate when yara-x publishes a release with a newer
+    # wasmtime pin.
+    "RUSTSEC-2026-0020",  # wasmtime: additional component model string transcode issue
+    "RUSTSEC-2026-0085",  # wasmtime: panic when lifting `flags` component value
+    "RUSTSEC-2026-0086",  # wasmtime: host data leakage with 64-bit tables (Winch backend)
+    "RUSTSEC-2026-0087",  # wasmtime: f64x2.splat segfault on Cranelift x86-64
+    "RUSTSEC-2026-0088",  # wasmtime: data leakage between pooling allocator instances
+    "RUSTSEC-2026-0089",  # wasmtime: host panic when Winch executes `table.fill`
+    "RUSTSEC-2026-0091",  # wasmtime: out-of-bounds write/crash in component model string transcode
+    "RUSTSEC-2026-0092",  # wasmtime: panic on misaligned component model UTF-16 strings
+    "RUSTSEC-2026-0093",  # wasmtime: heap OOB read in UTF-16 to latin1+utf16 transcoding
+    "RUSTSEC-2026-0094",  # wasmtime: improperly masked return value in `table.grow` (Winch backend)
+    "RUSTSEC-2026-0095",  # wasmtime: sandbox escape via Winch compiler backend (Winch not enabled)
+    "RUSTSEC-2026-0096",  # wasmtime: miscompiled guest heap access on aarch64 Cranelift
+    "RUSTSEC-2025-0118",  # wasmtime: unsound API access to shared linear memory
+    "RUSTSEC-2025-0141",  # bincode: unmaintained warning - pulled in via yara-x 1.15.0 only
 ]
 
 # Warn for categories of informational advisories
