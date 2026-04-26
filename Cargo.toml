@@ -84,7 +84,10 @@ tower = "0.4"
 
 # JSON-RPC handling for microservice
 jsonrpc-core = "18.0"
-yara-x = { version = "1.15.0", optional = true }
+# Pinned to the post-1.15.0 commit that bumps wasmtime to 43.0.1
+# (clears CVE-2026-34971 / CVE-2026-34987). Switch back to a published
+# version once VirusTotal/yara-x cuts a release including this bump.
+yara-x = { git = "https://github.com/VirusTotal/yara-x", rev = "178e2d697a88f6d8fc7a2fc0bc8c1b70af0d71b4", optional = true }
 
 # Official Rust MCP SDK
 rmcp = { version = "1.5", features = [
