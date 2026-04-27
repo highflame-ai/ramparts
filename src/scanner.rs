@@ -47,6 +47,12 @@ fn rule_name_to_file_name(rule_name: &str) -> Option<String> {
         | "IndirectPromptInjection" => Some("skill_prompt_injection".to_string()),
         // skill_authority.yar rules
         "AutonomyAbuse" | "CapabilityInflation" => Some("skill_authority".to_string()),
+        // skill_credential_harvesting.yar
+        "SkillCredentialHarvesting" => Some("skill_credential_harvesting".to_string()),
+        // skill_tool_chaining_abuse.yar
+        "SkillToolChainingExfiltration" => Some("skill_tool_chaining_abuse".to_string()),
+        // skill_system_manipulation.yar
+        "SkillSystemManipulation" => Some("skill_system_manipulation".to_string()),
         _ => None,
     }
 }

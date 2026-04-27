@@ -116,6 +116,24 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         "AutonomyAbuse" => vec![OwaspTag::new("MCP03")],
         "CapabilityInflation" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
 
+        // skill_credential_harvesting.yar — vendor token formats, PEM
+        // private-key blocks, active credential-theft verbs.
+        "SkillCredentialHarvesting" => {
+            vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
+        }
+
+        // skill_tool_chaining_abuse.yar — credential read + network
+        // egress to known exfil destinations, attacker-named hosts.
+        "SkillToolChainingExfiltration" => {
+            vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
+        }
+
+        // skill_system_manipulation.yar — destructive ops, privilege
+        // escalation, PATH hijack, critical-file writes.
+        "SkillSystemManipulation" => {
+            vec![OwaspTag::new("MCP03"), OwaspTag::new("MCP04")]
+        }
+
         // Synthetic findings emitted by the skill parser (src/skills.rs)
         // for structural risks the YARA passes can't see (frontmatter
         // grants, missing triggers, network-egress tool grants).
@@ -176,6 +194,9 @@ mod tests {
             "IndirectPromptInjection",
             "AutonomyAbuse",
             "CapabilityInflation",
+            "SkillCredentialHarvesting",
+            "SkillToolChainingExfiltration",
+            "SkillSystemManipulation",
         ] {
             assert!(
                 !tags_for_yara_rule(name).is_empty(),

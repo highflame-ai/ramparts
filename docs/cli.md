@@ -345,6 +345,22 @@ structural findings the regex/LLM pipeline can't see:
   (SSH/AWS/GnuPG/kube/docker credentials, `.env`, `.netrc`,
   `.npmrc`, `.pypirc`, certificates) into the prompt context.
 
+Three skill-targeted YARA rules complement the structural heuristics
+above by scanning the body content itself:
+
+- **SkillCredentialHarvesting** (MCP06 + MCP09): vendor-specific token
+  formats (`AKIA...`, `ghp_...`, `sk-ant-api...`, `sk-proj-...`,
+  `AIzaSy...`, `xox[abprs]-...`), inline PEM private-key blocks, and
+  active credential-theft verbs (`steal/grab/exfiltrate <credential>`).
+- **SkillToolChainingExfiltration** (MCP06 + MCP09): credential-file
+  read combined with network egress to known exfil destinations
+  (Discord webhooks, Telegram bot API, pastebin, ngrok / requestbin /
+  webhook.site tunnels) or attacker-named hosts.
+- **SkillSystemManipulation** (MCP03 + MCP04): destructive operations
+  and privilege escalation — `dd if=/dev/zero`, `wipefs`, `shred`,
+  recursive deletion of system roots, `chmod 777 /`, `sudo -i`,
+  `LD_PRELOAD=` hijack, PATH poisoning, writes to `/etc/sudoers`.
+
 ## Replay Command
 
 Re-emit a previously-saved scan result through a different output format
