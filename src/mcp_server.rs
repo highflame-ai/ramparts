@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::core::{MCPScannerCore, ScanRequest};
 use crate::scanner::MCPScanner;
 use crate::types::ScanConfigBuilder;
-use rmcp::handler::server::tool::Parameters;
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::JsonSchema;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
@@ -11,7 +11,6 @@ use rmcp::{
     tool, tool_handler, tool_router,
     transport::{
         io::stdio,
-        sse_server::SseServer,
         streamable_http_server::{
             session::local::LocalSessionManager, tower::StreamableHttpService,
             StreamableHttpServerConfig,
@@ -20,7 +19,6 @@ use rmcp::{
     ErrorData, ServiceExt,
 };
 use serde::Deserialize;
-use std::future::Future;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct ScanParams {
@@ -60,6 +58,8 @@ struct ScanConfigParams {
 /// Minimal MCP server that exposes scan and scan-config tools only.
 #[derive(Clone)]
 pub struct RampartsMcpServer {
+    // Required by the `#[tool_router]` macro expansion even when not read directly.
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     core: Arc<MCPScannerCore>,
 }
@@ -149,11 +149,9 @@ impl RampartsMcpServer {
 #[tool_handler]
 impl rmcp::ServerHandler for RampartsMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("Ramparts MCP server - provides scan and scan-config tools for MCP security scanning".into()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Ramparts MCP server - provides scan and scan-config tools for MCP security scanning",
+        )
     }
 }
 
@@ -165,14 +163,13 @@ pub async fn run_stdio_server() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Run the MCP server over SSE transport (HTTP SSE endpoint)
+/// Run the MCP server over the HTTP+SSE endpoint.
+///
+/// In rmcp 1.x, SSE is no longer a separate server transport — it is delivered
+/// as part of the streamable HTTP transport. This function is preserved for CLI
+/// compatibility and delegates to the streamable HTTP server.
 pub async fn run_sse_server(host: &str, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let bind: std::net::SocketAddr = format!("{host}:{port}").parse()?;
-    let sse = SseServer::serve(bind).await?;
-    let _ct = sse.with_service(RampartsMcpServer::new);
-    // Keep the server alive until process exit
-    futures_util::future::pending::<()>().await;
-    Ok(())
+    run_streamable_http_server(host, port).await
 }
 
 /// Run the MCP server over streamable HTTP transport using a Tower service (Axum-compatible)

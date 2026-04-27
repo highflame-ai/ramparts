@@ -42,10 +42,8 @@ impl CrossOriginScanner {
     #[allow(clippy::only_used_in_recursion)]
     fn extract_urls_from_json(&self, value: &Value, urls: &mut Vec<String>) {
         match value {
-            Value::String(s) => {
-                if Self::is_url(s) {
-                    urls.push(s.clone());
-                }
+            Value::String(s) if Self::is_url(s) => {
+                urls.push(s.clone());
             }
             Value::Object(map) => {
                 for (key, val) in map {

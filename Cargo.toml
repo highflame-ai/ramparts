@@ -31,7 +31,7 @@ clap = { version = "4.4", features = ["derive"] }
 tokio = { version = "1.35", features = ["full"] }
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-features = false }
 
 # Async streams
 futures-util = "0.3"
@@ -84,10 +84,13 @@ tower = "0.4"
 
 # JSON-RPC handling for microservice
 jsonrpc-core = "18.0"
-yara-x = { version = "1.4", optional = true }
+# Pinned to the post-1.15.0 commit that bumps wasmtime to 43.0.1
+# (clears CVE-2026-34971 / CVE-2026-34987). Switch back to a published
+# version once VirusTotal/yara-x cuts a release including this bump.
+yara-x = { git = "https://github.com/VirusTotal/yara-x", rev = "178e2d697a88f6d8fc7a2fc0bc8c1b70af0d71b4", optional = true }
 
 # Official Rust MCP SDK
-rmcp = { version = "0.3.2", features = [
+rmcp = { version = "1.5", features = [
     "client",
     "server",
     "macros",
@@ -95,16 +98,15 @@ rmcp = { version = "0.3.2", features = [
     "reqwest",
     "transport-child-process",
     "transport-streamable-http-client",
-    "transport-sse-client",
+    "transport-streamable-http-client-reqwest",
     "transport-worker",
     "transport-io",
-    "transport-sse-server",
     "transport-streamable-http-server",
     "transport-streamable-http-server-session"
 ] }
 
 # Random number generation for request IDs
-rand = "0.8"
+rand = "0.9"
 
 # Bring in common as path dependency
 ramparts-common = { path = "common" }

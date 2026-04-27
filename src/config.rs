@@ -1267,20 +1267,17 @@ impl MCPConfigManager {
                         return Some(MCPClient::VSCode);
                     }
                 }
-                "settings.local.json" => {
+                "settings.local.json" if components.iter().any(|c| c == ".claude") => {
                     // Claude Code local settings (exact match)
-                    if components.iter().any(|c| c == ".claude") {
-                        return Some(MCPClient::ClaudeCode);
-                    }
+                    return Some(MCPClient::ClaudeCode);
                 }
-                "managed-settings.json" => {
-                    // Claude Code enterprise managed settings (exact component matches)
+                "managed-settings.json"
                     if components
                         .iter()
-                        .any(|c| c == "claudecode" || c == "claude-code")
-                    {
-                        return Some(MCPClient::ClaudeCode);
-                    }
+                        .any(|c| c == "claudecode" || c == "claude-code") =>
+                {
+                    // Claude Code enterprise managed settings (exact component matches)
+                    return Some(MCPClient::ClaudeCode);
                 }
                 _ => {}
             }
@@ -1485,14 +1482,14 @@ impl MCPConfigManager {
                     }
                 }
             }
-            Some(MCPClient::ClaudeCode) => {
+            Some(MCPClient::ClaudeCode)
+                if filename == "settings.json" || filename == "settings.local.json" =>
+            {
                 // Claude Code uses settings.json files in .claude directory
-                if filename == "settings.json" || filename == "settings.local.json" {
-                    if let Some(config) =
-                        Self::try_parse_cursor_compatible_config(&content, "Claude Code")
-                    {
-                        return Ok(config);
-                    }
+                if let Some(config) =
+                    Self::try_parse_cursor_compatible_config(&content, "Claude Code")
+                {
+                    return Ok(config);
                 }
             }
             Some(MCPClient::Windsurf) | Some(MCPClient::Gemini) => {
