@@ -340,10 +340,20 @@ structural findings the regex/LLM pipeline can't see:
   the operator knows the skill talks to the network.
 - **VagueSkillTrigger** (MCP02 + MCP03): a substantive skill body
   with a missing or one-word `description` — easy to mis-invoke.
+- **GenericSkillTrigger** (MCP02 + MCP03): the description is a
+  semantically vacuous trigger phrase (`"help"`, `"assistant"`,
+  `"a general purpose tool"`, `"do anything"`, ...) that causes the
+  agent's router to invoke the skill on unrelated requests —
+  trigger-hijack vector.
 - **SkillSensitiveFileReference** (MCP06 + MCP09): the body uses
   Claude Code's `@<path>` syntax to inline a sensitive file
   (SSH/AWS/GnuPG/kube/docker credentials, `.env`, `.netrc`,
   `.npmrc`, `.pypirc`, certificates) into the prompt context.
+- **SkillNameCollision** (MCP02 + MCP03): two or more skill files
+  declare the same `name` (case-insensitive). One shadows the other
+  in the agent's router — an attacker who can write a workspace-
+  level skill with the same name as a trusted user-level skill can
+  silently replace it. Cross-skill check; runs once per scan.
 
 Three skill-targeted YARA rules complement the structural heuristics
 above by scanning the body content itself:

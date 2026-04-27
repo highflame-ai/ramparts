@@ -139,8 +139,10 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         // grants, missing triggers, network-egress tool grants).
         "OverbroadAllowedTools" => vec![OwaspTag::new("MCP03")],
         "VagueSkillTrigger" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
+        "GenericSkillTrigger" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
         "DataExfiltrationGrant" => vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")],
         "SkillSensitiveFileReference" => vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")],
+        "SkillNameCollision" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
 
         _ => Vec::new(),
     }

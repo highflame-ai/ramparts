@@ -589,15 +589,18 @@ async fn handle_skills_scan_command(
 
     // Each skill yields a prompt (for LLM/YARA analysis) plus zero or more
     // heuristic findings produced during parsing (overbroad allowed-tools
-    // grants, vague triggers). We collect both up front; the prompt set
-    // feeds the existing analyzers, and the heuristic findings are
-    // appended to `result.yara_results` so they render through the same
-    // pipeline as real YARA matches.
+    // grants, vague triggers, generic triggers, sensitive @-references).
+    // We collect both up front; the prompt set feeds the existing
+    // analyzers, the per-skill heuristic findings are appended to
+    // `result.yara_results`, and a final cross-skill pass detects
+    // collisions across the whole set (skills declaring the same name).
     let mut prompts: Vec<types::MCPPrompt> = Vec::with_capacity(skill_paths.len());
+    let mut prompt_paths: Vec<std::path::PathBuf> = Vec::with_capacity(skill_paths.len());
     let mut parser_findings: Vec<types::YaraScanResult> = Vec::new();
     for p in &skill_paths {
         if let Some(parsed) = skills::parse_skill_file(p) {
             prompts.push(parsed.prompt);
+            prompt_paths.push(p.clone());
             parser_findings.extend(parsed.heuristic_findings);
         }
     }
@@ -606,6 +609,16 @@ async fn handle_skills_scan_command(
         error!("All discovered skill files failed to parse");
         std::process::exit(1);
     }
+
+    // Cross-skill pass: look for name collisions across the parsed set.
+    // Distinct from per-skill heuristics because it requires comparing
+    // skills against each other.
+    let skill_set: Vec<(std::path::PathBuf, &types::MCPPrompt)> = prompt_paths
+        .iter()
+        .zip(prompts.iter())
+        .map(|(p, pr)| (p.clone(), pr))
+        .collect();
+    parser_findings.extend(skills::analyze_skill_set(&skill_set));
 
     let scan_timer = utils::Timer::start();
     // Display URL pattern matches the rest of ramparts: `<scheme>:<target>`

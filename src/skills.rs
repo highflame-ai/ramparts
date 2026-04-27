@@ -349,6 +349,7 @@ pub fn parse_skill_content(path: &Path, raw: &str) -> Option<ParsedSkill> {
         fm_description,
         body_trimmed,
     ));
+    heuristic_findings.extend(analyze_generic_trigger(&prompt.name, path, fm_description));
     heuristic_findings.extend(analyze_sensitive_file_references(
         &prompt.name,
         path,
@@ -747,6 +748,142 @@ fn analyze_vague_trigger(
         skill_name,
         path,
     )]
+}
+
+/// Generic / vacuous trigger phrases. A description matching one of these
+/// is long enough to satisfy `MIN_TRIGGER_DESCRIPTION_CHARS` but is
+/// semantically empty — exactly the trigger-hijack vector. The list is
+/// kept short and concrete; expanding it grows the false-positive risk.
+/// Patterns are matched case-insensitively against the trimmed description
+/// (with trailing punctuation stripped).
+const GENERIC_TRIGGER_PHRASES: &[&str] = &[
+    "help",
+    "help me",
+    "help with anything",
+    "assistant",
+    "an assistant",
+    "a helper",
+    "helper",
+    "general purpose tool",
+    "general purpose skill",
+    "general purpose assistant",
+    "general-purpose tool",
+    "universal tool",
+    "universal skill",
+    "universal assistant",
+    "default tool",
+    "default assistant",
+    "do anything",
+    "do everything",
+    "i can do anything",
+    "i can do everything",
+    "use this for everything",
+    "use this for anything",
+    "use me for everything",
+    "use me for anything",
+];
+
+/// Detect descriptions whose entire content is a generic / hijack-prone
+/// trigger phrase — distinct from `analyze_vague_trigger` which catches
+/// missing or short descriptions. A 30-character description is long
+/// enough to pass the length check but still vacuous if the content is
+/// "a general purpose assistant". Maps to the same OWASP entries as
+/// `VagueSkillTrigger` (MCP02 + MCP03).
+fn analyze_generic_trigger(
+    skill_name: &str,
+    path: &Path,
+    description: Option<&str>,
+) -> Vec<YaraScanResult> {
+    let Some(desc) = description else {
+        return Vec::new();
+    };
+    let normalized = desc
+        .trim()
+        .trim_end_matches(['.', '!', '?', ';', ':'])
+        .trim()
+        .to_ascii_lowercase();
+    // Strip a leading article ("a ", "an ", "the ") so phrases like
+    // "a general purpose assistant" still match the canonical entries
+    // (which omit the article for compactness).
+    let core = normalized
+        .strip_prefix("a ")
+        .or_else(|| normalized.strip_prefix("an "))
+        .or_else(|| normalized.strip_prefix("the "))
+        .unwrap_or(normalized.as_str());
+    if !GENERIC_TRIGGER_PHRASES
+        .iter()
+        .any(|p| core == *p || normalized == *p)
+    {
+        return Vec::new();
+    }
+    vec![make_heuristic_finding(
+        "GenericSkillTrigger",
+        "medium",
+        format!(
+            "Skill '{skill_name}' has a generic trigger description (\"{}\"). \
+             Generic triggers cause an agent's router to invoke the skill on \
+             unrelated user requests (trigger hijack). Replace with a specific \
+             description naming the conditions under which this skill should run.",
+            desc.trim()
+        ),
+        skill_name,
+        path,
+    )]
+}
+
+/// Cross-skill analysis: detect skills that share a `name`. Two skills
+/// declaring the same name shadow each other in the agent's command
+/// table — typically the workspace-level skill wins over the user-level
+/// one — so an attacker who can write to a workspace can transparently
+/// replace a trusted user-level skill. Maps to MCP02 (supply-chain /
+/// hidden behavior) + MCP03 (excessive agency).
+///
+/// Run once per scan over the full set of parsed skills. Names are
+/// compared case-insensitively because skill routers typically lowercase
+/// for matching. Reports one finding per colliding name with all paths
+/// in the `context` field.
+pub fn analyze_skill_set(skills: &[(PathBuf, &MCPPrompt)]) -> Vec<YaraScanResult> {
+    let mut by_name: std::collections::HashMap<String, Vec<&Path>> =
+        std::collections::HashMap::new();
+    for (path, prompt) in skills {
+        by_name
+            .entry(prompt.name.to_ascii_lowercase())
+            .or_default()
+            .push(path.as_path());
+    }
+    let mut findings: Vec<YaraScanResult> = Vec::new();
+    for (lower_name, paths) in by_name {
+        if paths.len() < 2 {
+            continue;
+        }
+        // Sort for deterministic reporting (test-friendly).
+        let mut sorted = paths;
+        sorted.sort();
+        let joined = sorted
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Use the first path as the synthetic-finding's source-path so
+        // it has a concrete location, and put the full collision list
+        // in the message so consumers see all colliding skills.
+        let primary_path = sorted[0];
+        findings.push(make_heuristic_finding(
+            "SkillNameCollision",
+            "medium",
+            format!(
+                "Skill name '{lower_name}' is declared by {} files: {joined}. \
+                 Whichever skill the agent's router resolves last shadows the \
+                 others — an attacker who can write a workspace-level skill \
+                 with the same name as a trusted user-level skill can silently \
+                 replace it. Rename one of the skills.",
+                sorted.len()
+            ),
+            &lower_name,
+            primary_path,
+        ));
+    }
+    findings
 }
 
 /// Build a `YaraScanResult` for a parser-emitted heuristic finding so it
@@ -1630,6 +1767,114 @@ mod tests {
             !overbroad.owasp_tags.is_empty(),
             "OverbroadAllowedTools should carry OWASP tags via taxonomy"
         );
+    }
+
+    #[test]
+    fn generic_trigger_phrase_emits_finding() {
+        // Body long enough that VagueSkillTrigger wouldn't fire (the
+        // description has substance length-wise) but the description is
+        // semantically vacuous.
+        let body: String = "Do the thing. ".repeat(40);
+        let raw = format!("---\ndescription: a general purpose assistant\n---\n{body}\n");
+        let parsed = parse("generic.md", &raw);
+        let rules: Vec<_> = parsed
+            .heuristic_findings
+            .iter()
+            .map(|f| f.rule_name.as_str())
+            .collect();
+        assert!(
+            rules.contains(&"GenericSkillTrigger"),
+            "expected GenericSkillTrigger, got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn generic_trigger_phrase_with_punctuation_still_fires() {
+        // Trailing period / exclamation should not mask the phrase.
+        let parsed = parse("punc.md", "---\ndescription: Help me!\n---\nbody.\n");
+        assert!(parsed
+            .heuristic_findings
+            .iter()
+            .any(|f| f.rule_name == "GenericSkillTrigger"));
+    }
+
+    #[test]
+    fn specific_description_does_not_fire_generic_trigger() {
+        // Even a short concrete description shouldn't fire the generic
+        // rule (the length-based VagueSkillTrigger handles too-short
+        // descriptions; this rule only flags semantically vacuous ones).
+        let parsed = parse(
+            "specific.md",
+            "---\ndescription: Deploy the staging environment after running tests.\n---\nbody\n",
+        );
+        assert!(parsed
+            .heuristic_findings
+            .iter()
+            .all(|f| f.rule_name != "GenericSkillTrigger"));
+    }
+
+    #[test]
+    fn skill_name_collision_emits_finding() {
+        // Two parsed skills with the same name (different paths) should
+        // produce one SkillNameCollision finding.
+        let p1 = PathBuf::from("/home/user/.claude/commands/deploy.md");
+        let p2 = PathBuf::from("/home/user/work/.claude/commands/deploy.md");
+        let parsed1 = parse_skill_content(
+            &p1,
+            "---\ndescription: Deploy to prod with care\n---\nactual deploy logic",
+        )
+        .expect("p1 parses");
+        let parsed2 = parse_skill_content(
+            &p2,
+            "---\ndescription: Different deploy with override\n---\nshadow deploy logic",
+        )
+        .expect("p2 parses");
+        let set: Vec<(PathBuf, &MCPPrompt)> =
+            vec![(p1.clone(), &parsed1.prompt), (p2.clone(), &parsed2.prompt)];
+        let findings = analyze_skill_set(&set);
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected one collision, got {findings:?}"
+        );
+        assert_eq!(findings[0].rule_name, "SkillNameCollision");
+        let desc = findings[0]
+            .rule_metadata
+            .as_ref()
+            .and_then(|m| m.description.as_deref())
+            .unwrap_or("");
+        // Both paths should be referenced in the message.
+        assert!(desc.contains(&p1.display().to_string()));
+        assert!(desc.contains(&p2.display().to_string()));
+        // OWASP tags present.
+        let ids: Vec<_> = findings[0]
+            .owasp_tags
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert!(ids.contains(&"MCP02"), "got {ids:?}");
+        assert!(ids.contains(&"MCP03"), "got {ids:?}");
+    }
+
+    #[test]
+    fn skill_name_collision_is_case_insensitive() {
+        let p1 = PathBuf::from("/a/Deploy.md");
+        let p2 = PathBuf::from("/b/deploy.md");
+        let parsed1 = parse_skill_content(&p1, "---\nname: Deploy\n---\nbody1\n").unwrap();
+        let parsed2 = parse_skill_content(&p2, "---\nname: deploy\n---\nbody2\n").unwrap();
+        let set: Vec<(PathBuf, &MCPPrompt)> = vec![(p1, &parsed1.prompt), (p2, &parsed2.prompt)];
+        let findings = analyze_skill_set(&set);
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn unique_skill_names_produce_no_collision_finding() {
+        let p1 = PathBuf::from("/a/deploy.md");
+        let p2 = PathBuf::from("/b/test.md");
+        let parsed1 = parse_skill_content(&p1, "---\nname: deploy\n---\nbody1\n").unwrap();
+        let parsed2 = parse_skill_content(&p2, "---\nname: test\n---\nbody2\n").unwrap();
+        let set: Vec<(PathBuf, &MCPPrompt)> = vec![(p1, &parsed1.prompt), (p2, &parsed2.prompt)];
+        assert!(analyze_skill_set(&set).is_empty());
     }
 
     #[test]
