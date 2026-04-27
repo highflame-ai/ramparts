@@ -42,6 +42,23 @@ pub mod error_utils {
         format!("{operation} failed: {details}")
     }
 
+    /// Render the full `std::error::Error` source chain as a single string.
+    ///
+    /// Some libraries (notably reqwest) print very terse `Display`
+    /// representations like `"builder error"` while the actual diagnosis lives
+    /// in the underlying `source()`. Walking the chain surfaces those causes
+    /// when a user reports an error.
+    pub fn format_error_chain<E: std::error::Error + ?Sized>(err: &E) -> String {
+        let mut out = err.to_string();
+        let mut source = err.source();
+        while let Some(s) = source {
+            out.push_str(": ");
+            out.push_str(&s.to_string());
+            source = s.source();
+        }
+        out
+    }
+
     /// Wrap an error with context
     /// Wraps an error with additional context information
     #[allow(dead_code)] // Used in tests and for error context enhancement

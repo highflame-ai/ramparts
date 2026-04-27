@@ -110,7 +110,12 @@ impl McpClient {
             .default_headers(headers)
             .timeout(std::time::Duration::from_secs(self.http_timeout_secs))
             .build()
-            .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to build HTTP client: {}",
+                    crate::utils::error_utils::format_error_chain(&e)
+                )
+            })
     }
 
     /// Try to connect using streamable HTTP transport

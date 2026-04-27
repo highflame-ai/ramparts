@@ -9,7 +9,9 @@ use crate::types::{
     LlmPrompt, MCPPrompt, MCPResource, MCPServerInfo, MCPTool, ScanOptions, ScanResult, ScanStatus,
     YaraScanResult,
 };
-use crate::utils::{error_utils, performance::track_performance, Timer};
+use crate::utils::{
+    error_utils, error_utils::format_error_chain, performance::track_performance, Timer,
+};
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use std::collections::HashMap;
@@ -927,7 +929,7 @@ impl MCPScanner {
             .timeout(Duration::from_secs(http_timeout))
             .user_agent(protocol::USER_AGENT)
             .build()
-            .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
+            .map_err(|e| anyhow!("Failed to create HTTP client: {}", format_error_chain(&e)))?;
 
         // Set up middleware chain with dynamic YARA capabilities
         let mut middleware_chain = ScannerChain::new();
