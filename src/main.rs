@@ -706,7 +706,7 @@ async fn handle_skills_scan_command(
     // with zero findings would be misleading for a security tool.
     match tokio::time::timeout(
         scan_timeout,
-        security_scanner.scan_prompts_batch(&result.prompts, scanner_config.scanner.detailed),
+        security_scanner.scan_skills_batch(&result.prompts, scanner_config.scanner.detailed),
     )
     .await
     {

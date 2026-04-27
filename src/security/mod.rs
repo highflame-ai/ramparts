@@ -342,12 +342,32 @@ impl SecurityScanner {
         })
     }
 
-    /// Generic batch scanner for any type that implements `BatchScannableItem`
+    /// Generic batch scanner for any type that implements `BatchScannableItem`.
+    /// Uses `T::item_type_plural()` as the spinner subject — most callers
+    /// want this default. Use `scan_batch_with_subject` to override when
+    /// the wire-level item type and the user-facing subject diverge
+    /// (e.g. skill scans send `MCPPrompt` to the LLM but the user sees
+    /// "Scanning Skills...").
     async fn scan_batch<T: BatchScannableItem>(
         &self,
         items: &[T],
         prompt_creator: impl Fn(&str) -> String,
         show_details: bool,
+    ) -> Result<Vec<SecurityIssue>> {
+        self.scan_batch_with_subject(items, prompt_creator, show_details, T::item_type_plural())
+            .await
+    }
+
+    /// Like `scan_batch`, but with an explicit `subject` for the
+    /// spinner status line. Lets the skill scan path show
+    /// `Scanning Skills...` even though the underlying batch is over
+    /// `MCPPrompt`s.
+    async fn scan_batch_with_subject<T: BatchScannableItem>(
+        &self,
+        items: &[T],
+        prompt_creator: impl Fn(&str) -> String,
+        show_details: bool,
+        subject: &str,
     ) -> Result<Vec<SecurityIssue>> {
         if items.is_empty() {
             tracing::debug!(
@@ -400,7 +420,7 @@ impl SecurityScanner {
                 T::item_type_plural()
             );
 
-            let response = self.query_llm(&prompt_text, show_details).await?;
+            let response = self.query_llm(&prompt_text, show_details, subject).await?;
 
             tracing::debug!(
                 "Received batch LLM response for {} batch {}: {}",
@@ -489,7 +509,9 @@ impl SecurityScanner {
                 MCPTool::item_type_plural()
             );
 
-            let response = self.query_llm(&prompt, show_details).await?;
+            let response = self
+                .query_llm(&prompt, show_details, MCPTool::item_type_plural())
+                .await?;
 
             tracing::debug!(
                 "Received batch LLM response for {} batch {}: {}",
@@ -525,6 +547,26 @@ impl SecurityScanner {
     ) -> Result<Vec<SecurityIssue>> {
         self.scan_batch(prompts, Self::create_prompts_analysis_prompt, show_details)
             .await
+    }
+
+    /// Scan agent skill files for security vulnerabilities. Mechanically
+    /// identical to `scan_prompts_batch` (skills are routed through the
+    /// `MCPPrompt` shape so every existing analyzer applies), but the
+    /// spinner subject is overridden to "skills" so the user sees
+    /// `Scanning Skills for security vulnerabilities...` instead of the
+    /// generic `Scanning Prompts...`.
+    pub async fn scan_skills_batch(
+        &self,
+        prompts: &[MCPPrompt],
+        show_details: bool,
+    ) -> Result<Vec<SecurityIssue>> {
+        self.scan_batch_with_subject(
+            prompts,
+            Self::create_prompts_analysis_prompt,
+            show_details,
+            "skills",
+        )
+        .await
     }
 
     /// Batch scan resources for security vulnerabilities
@@ -701,8 +743,32 @@ If no genuine security issues found, return empty array []."
         self.model_endpoint.clone()
     }
 
-    /// Query the LLM with the given prompt
-    async fn query_llm(&self, prompt: &str, show_details: bool) -> Result<String> {
+    /// Uppercase the first ASCII character of `s` (used to format the
+    /// spinner status as a complete sentence: "Scanning Skills..."
+    /// rather than "Scanning skills..."). Returns owned `String`
+    /// because callers need it in `format!` and the per-scan cost is
+    /// trivial.
+    fn capitalize_first_inline(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        if let Some(c) = chars.next() {
+            for u in c.to_uppercase() {
+                out.push(u);
+            }
+        }
+        out.push_str(chars.as_str());
+        out
+    }
+
+    /// Query the LLM with the given prompt.
+    ///
+    /// `subject` is a human-readable label for what we're scanning
+    /// (e.g. "skills", "tools", "prompts") and is only used to build
+    /// the spinner message. Callers thread `T::item_type_plural()`
+    /// through `scan_batch` so the message reads "Scanning skills for
+    /// security vulnerabilities..." instead of the previous generic
+    /// "Scanning for security vulnerabilities...".
+    async fn query_llm(&self, prompt: &str, show_details: bool, subject: &str) -> Result<String> {
         // Enhanced validation with detailed error messages
         if !self.is_llm_configured() {
             let endpoint_status = if self.model_endpoint.is_some() {
@@ -797,10 +863,15 @@ Example valid response: [{\"tool_name\": \"example\", \"found_issue\": true, \"i
         // Start spinner only when stdout is an interactive terminal. In CI,
         // pipelines, or any redirected output the animation re-prints
         // hundreds of frames per scan, drowning the actual results.
+        // The capitalized subject (e.g. "Skills", "Tools") makes the
+        // status line read naturally as a complete sentence.
+        let subject_display = Self::capitalize_first_inline(subject);
         let mut sp = std::io::stdout().is_terminal().then(|| {
             Spinner::new(
                 Spinners::Dots9,
-                "Scanning for security vulnerabilities...(this may take a while)".into(),
+                format!(
+                    "Scanning {subject_display} for security vulnerabilities... (this may take a while)"
+                ),
             )
         });
 
@@ -1276,7 +1347,7 @@ mod tests {
             config: None,
         };
 
-        let result = scanner.query_llm("test prompt", false).await;
+        let result = scanner.query_llm("test prompt", false, "items").await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
