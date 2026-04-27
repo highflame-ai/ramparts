@@ -153,6 +153,29 @@ fn is_skill_scan(result: &ScanResult) -> bool {
     result.url.starts_with("skills:")
 }
 
+/// One-line `Ramparts: <version> (<commit>)` header for scan-result
+/// rendering. The banner already shows version + commit at startup,
+/// but the banner is suppressed for machine-readable formats and
+/// scrolls off the top for long human-readable scans. Putting it on
+/// the result itself means a copy-pasted scan output always carries
+/// the scanner build that produced it.
+///
+/// Old JSON scans replayed via `ramparts replay` may have empty
+/// `ramparts_version`/`ramparts_commit` fields (added later, with
+/// `#[serde(default)]`). Handle gracefully.
+fn format_ramparts_version(result: &ScanResult) -> String {
+    let version = if result.ramparts_version.is_empty() {
+        "(unknown)"
+    } else {
+        result.ramparts_version.as_str()
+    };
+    if result.ramparts_commit.is_empty() {
+        format!("Ramparts: {version}")
+    } else {
+        format!("Ramparts: {version} ({})", result.ramparts_commit)
+    }
+}
+
 /// Skill-aware terminal renderer. Replaces the live-MCP framing
 /// (tools / resources / "Unknown MCP Server") with per-skill grouping
 /// (skill name + source path + findings + severity counts).
@@ -167,6 +190,7 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
     // verbatim minus the prefix.
     let display_url = result.url.strip_prefix("skills:").unwrap_or(&result.url);
     println!("Path: {}", display_url.blue());
+    println!("{}", format_ramparts_version(result));
     println!("Status: {}", format_status(&result.status));
     println!("Response Time: {}ms", result.response_time_ms);
     println!(
@@ -984,6 +1008,7 @@ fn print_table_result(result: &ScanResult, detailed: bool) {
 
     // Server Info
     println!("URL: {}", result.url.blue());
+    println!("{}", format_ramparts_version(result));
     println!("Status: {}", format_status(&result.status));
     println!("Response Time: {}ms", result.response_time_ms);
     println!(

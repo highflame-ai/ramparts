@@ -255,6 +255,16 @@ pub struct ScanResult {
     pub security_issues: Option<SecurityScanResult>,
     pub yara_results: Vec<YaraScanResult>,
     pub errors: Vec<String>,
+    /// Ramparts release version that produced this scan
+    /// (`env!("CARGO_PKG_VERSION")`). Useful for triage when an
+    /// archived JSON / replayed scan turns up months later — the
+    /// reader can correlate detections to a specific scanner build.
+    #[serde(default)]
+    pub ramparts_version: String,
+    /// Short git commit ramparts was built from (e.g. `c70cdce`).
+    /// Empty when built outside a git checkout.
+    #[serde(default)]
+    pub ramparts_commit: String,
     /// IDE source that provided this server configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ide_source: Option<String>,
@@ -306,6 +316,8 @@ impl ScanResult {
             security_issues: None,
             yara_results: Vec::new(),
             errors: Vec::new(),
+            ramparts_version: env!("CARGO_PKG_VERSION").to_string(),
+            ramparts_commit: env!("GIT_COMMIT_SHORT").to_string(),
             ide_source: None,
             llm_prompts: None,
         }
