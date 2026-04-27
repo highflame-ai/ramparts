@@ -928,6 +928,7 @@ impl MCPScanner {
         let client = Client::builder()
             .timeout(Duration::from_secs(http_timeout))
             .user_agent(protocol::USER_AGENT)
+            .use_preconfigured_tls((*crate::tls::default_tls_config()).clone())
             .build()
             .map_err(|e| anyhow!("Failed to create HTTP client: {}", format_error_chain(&e)))?;
 
