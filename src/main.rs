@@ -271,19 +271,25 @@ fn determine_log_level(cli: &Cli, scanner_config: &ScannerConfig) -> Level {
     }
 }
 
-/// Creates an MCP scanner instance if needed for the given command
+/// Creates an MCP scanner instance if needed for the given command.
+///
+/// The CLI's `--http-timeout` flag (when present) takes precedence over the
+/// config-file value here so the scanner's HTTP client is constructed with
+/// the same timeout that ends up in `ScanOptions::http_timeout`.
 fn create_scanner_if_needed(cli: &Cli, scanner_config: &ScannerConfig) -> Option<MCPScanner> {
-    match &cli.command {
-        Commands::Scan { .. } | Commands::ScanConfig { .. } => {
-            match MCPScanner::with_timeout(scanner_config.scanner.http_timeout) {
-                Ok(scanner) => Some(scanner),
-                Err(e) => {
-                    error!("Failed to create scanner: {}", e);
-                    std::process::exit(1);
-                }
-            }
+    let http_timeout_override = match &cli.command {
+        Commands::Scan { http_timeout, .. } | Commands::ScanConfig { http_timeout, .. } => {
+            *http_timeout
         }
-        _ => None,
+        _ => return None,
+    };
+    let http_timeout = http_timeout_override.unwrap_or(scanner_config.scanner.http_timeout);
+    match MCPScanner::with_timeout(http_timeout) {
+        Ok(scanner) => Some(scanner),
+        Err(e) => {
+            error!("Failed to create scanner: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 

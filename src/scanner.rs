@@ -960,7 +960,7 @@ impl MCPScanner {
             client,
             http_timeout,
             middleware_chain,
-            mcp_client: McpClient::new(),
+            mcp_client: McpClient::with_http_timeout(http_timeout),
         })
     }
 
@@ -1242,21 +1242,35 @@ impl MCPScanner {
 
         let mut result = ScanResult::new(display_url.clone());
 
-        // Connect to the STDIO server using the MCP client
-        let session = self
-            .mcp_client
-            .connect_subprocess(command, args, server_config.env.as_ref())
-            .await
-            .map_err(|e| anyhow!("Failed to connect to STDIO server {}: {}", command, e))?;
-
-        // Perform the same MCP scanning pattern as HTTP servers
+        // Wrap the entire connect-and-scan pipeline in `options.timeout` so a
+        // hung subprocess (no MCP handshake response, deadlocked tool, etc.)
+        // can't make the CLI hang forever — same overall budget the HTTP path
+        // gets in `scan_single`.
         let scan_result = track_performance("STDIO MCP server scan", || async {
-            self.perform_scan_with_session(&session, &options).await
+            match timeout(Duration::from_secs(options.timeout), async {
+                let session = self
+                    .mcp_client
+                    .connect_subprocess(command, args, server_config.env.as_ref())
+                    .await
+                    .map_err(|e| {
+                        anyhow!("Failed to connect to STDIO server {}: {}", command, e)
+                    })?;
+                let scan_data = self.perform_scan_with_session(&session, &options).await?;
+                Ok::<_, anyhow::Error>((session, scan_data))
+            })
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_) => Err(anyhow!(
+                    "STDIO scan operation timed out after {}s",
+                    options.timeout
+                )),
+            }
         })
         .await;
 
         match scan_result {
-            Ok(mut scan_data) => {
+            Ok((session, mut scan_data)) => {
                 // Apply the same middleware chain as HTTP scanning
                 self.middleware_chain.run_pre_scan(&mut scan_data);
 
@@ -2076,7 +2090,7 @@ impl Clone for MCPScanner {
             client: self.client.clone(),
             http_timeout: self.http_timeout,
             middleware_chain: self.middleware_chain.clone(),
-            mcp_client: McpClient::new(),
+            mcp_client: self.mcp_client.clone(),
         }
     }
 }
