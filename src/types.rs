@@ -75,6 +75,7 @@ pub struct ScanConfigBuilder {
     auth_headers: Option<HashMap<String, String>>,
     // When true, do not call the LLM; instead, return the prompts that would be used
     return_prompts: bool,
+    only: Option<Vec<ArtifactKind>>,
 }
 
 impl Default for ScanConfigBuilder {
@@ -86,6 +87,7 @@ impl Default for ScanConfigBuilder {
             format: "text".to_string(),
             auth_headers: None,
             return_prompts: false,
+            only: None,
         }
     }
 }
@@ -125,6 +127,11 @@ impl ScanConfigBuilder {
         self
     }
 
+    pub fn only(mut self, only: Option<Vec<ArtifactKind>>) -> Self {
+        self.only = only;
+        self
+    }
+
     pub fn build(self) -> ScanOptions {
         ScanOptions {
             timeout: self.timeout,
@@ -133,6 +140,7 @@ impl ScanConfigBuilder {
             format: self.format,
             auth_headers: self.auth_headers,
             return_prompts: self.return_prompts,
+            only: self.only,
         }
     }
 }
@@ -160,6 +168,47 @@ pub mod config_utils {
     }
 }
 
+/// Which artifact kinds (tools, prompts, resources) a scan covers. When
+/// `None`, every kind is included. When `Some`, the scan keeps only the
+/// listed kinds and discards the others before security analysis runs —
+/// see ramparts `--only` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArtifactKind {
+    Tools,
+    Prompts,
+    Resources,
+}
+
+impl ArtifactKind {
+    /// Parse a CLI value like `"tools,prompts"` into a set of kinds.
+    /// Returns an error on unknown tokens so a typo doesn't silently
+    /// turn into "scan everything".
+    pub fn parse_set(raw: &str) -> Result<Vec<Self>> {
+        let mut out = Vec::new();
+        for token in raw.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let kind = match token.to_ascii_lowercase().as_str() {
+                "tool" | "tools" => ArtifactKind::Tools,
+                "prompt" | "prompts" => ArtifactKind::Prompts,
+                "resource" | "resources" => ArtifactKind::Resources,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "Unknown artifact kind '{other}' in --only. \
+                         Expected: tools, prompts, resources (comma-separated)"
+                    ))
+                }
+            };
+            if !out.contains(&kind) {
+                out.push(kind);
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Scan options configuration
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -170,6 +219,9 @@ pub struct ScanOptions {
     pub auth_headers: Option<HashMap<String, String>>,
     /// When true, do not call the LLM; instead, return prompts to the caller
     pub return_prompts: bool,
+    /// Restrict the scan to a subset of artifact kinds. `None` = scan all.
+    /// Set via the `--only` CLI flag; see `ArtifactKind::parse_set`.
+    pub only: Option<Vec<ArtifactKind>>,
 }
 
 impl Default for ScanOptions {
@@ -181,6 +233,7 @@ impl Default for ScanOptions {
             format: "text".to_string(),
             auth_headers: None,
             return_prompts: false,
+            only: None,
         }
     }
 }
@@ -397,6 +450,7 @@ mod tests {
             format: "json".to_string(),
             auth_headers: None,
             return_prompts: false,
+            only: None,
         };
 
         let result = config_utils::validate_scan_config(&options);
@@ -412,6 +466,7 @@ mod tests {
             format: "json".to_string(),
             auth_headers: None,
             return_prompts: false,
+            only: None,
         };
 
         let result = config_utils::validate_scan_config(&options);
@@ -431,6 +486,7 @@ mod tests {
             format: "json".to_string(),
             auth_headers: None,
             return_prompts: false,
+            only: None,
         };
 
         let result = config_utils::validate_scan_config(&options);
@@ -450,6 +506,7 @@ mod tests {
             format: "json".to_string(),
             auth_headers: None,
             return_prompts: false,
+            only: None,
         };
 
         let result = config_utils::validate_scan_config(&options);

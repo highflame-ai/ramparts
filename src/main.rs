@@ -13,6 +13,7 @@ mod core;
 mod integration_tests;
 mod mcp_client;
 mod mcp_server;
+mod osv;
 mod sarif;
 mod scanner;
 mod security;
@@ -125,6 +126,13 @@ enum Commands {
         /// Per-HTTP-request timeout in seconds. Overrides `scanner.http_timeout` from config.yaml.
         #[arg(long, value_name = "SECONDS")]
         http_timeout: Option<u64>,
+
+        /// Restrict the scan to a subset of artifact kinds. Comma-separated:
+        /// `tools`, `prompts`, `resources` (singular forms also accepted).
+        /// When omitted, every kind is scanned. Useful for CI gates that
+        /// only care about one surface (`--only tools`).
+        #[arg(long, value_name = "KINDS")]
+        only: Option<String>,
     },
 
     /// Scan MCP servers from IDE configuration files (~/.cursor/mcp.json, ~/.codeium/windsurf/mcp_config.json)
@@ -155,6 +163,11 @@ enum Commands {
         /// directories like .git, node_modules, target are skipped.
         #[arg(long, value_name = "PATH")]
         root: Option<std::path::PathBuf>,
+
+        /// Restrict the scan to a subset of artifact kinds. Comma-separated:
+        /// `tools`, `prompts`, `resources` (singular forms also accepted).
+        #[arg(long, value_name = "KINDS")]
+        only: Option<String>,
     },
 
     /// Generate a default config.yaml file
@@ -197,6 +210,25 @@ enum Commands {
         #[arg(short, long, default_value = "8081")]
         port: u16,
     },
+
+    /// Replay a previously-saved scan result.
+    ///
+    /// Reads a `ramparts scan` / `scan-config` JSON output and re-emits it
+    /// through the requested format. Useful for: converting an archived JSON
+    /// scan into SARIF for code-scanning ingestion, viewing a CI artifact
+    /// locally, or chaining scan output into downstream tooling without
+    /// re-connecting to the MCP server. No live network or LLM calls.
+    Replay {
+        /// Path to a JSON file containing a `ScanResult` (single-server) or
+        /// `[ScanResult, ...]` (multi-server, as emitted by `scan-config`).
+        #[arg(value_name = "PATH")]
+        input: std::path::PathBuf,
+
+        /// Output format (json, raw, table, text, sarif). Defaults to the
+        /// configured scanner output format.
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -238,7 +270,9 @@ fn should_display_banner(command: &Commands) -> bool {
         return false;
     }
     let format = match command {
-        Commands::Scan { format, .. } | Commands::ScanConfig { format, .. } => format.as_deref(),
+        Commands::Scan { format, .. }
+        | Commands::ScanConfig { format, .. }
+        | Commands::Replay { format, .. } => format.as_deref(),
         _ => None,
     };
     !matches!(
@@ -347,6 +381,7 @@ async fn execute_command(
             report,
             timeout,
             http_timeout,
+            only,
         } => {
             handle_scan_command(
                 url,
@@ -355,6 +390,7 @@ async fn execute_command(
                 report,
                 timeout,
                 http_timeout,
+                only,
                 &scanner_config,
                 scanner,
             )
@@ -367,6 +403,7 @@ async fn execute_command(
             timeout,
             http_timeout,
             root,
+            only,
         } => {
             handle_scan_config_command(
                 auth_headers,
@@ -375,6 +412,7 @@ async fn execute_command(
                 timeout,
                 http_timeout,
                 root,
+                only,
                 &scanner_config,
                 scanner,
             )
@@ -388,7 +426,44 @@ async fn execute_command(
         Commands::McpStdio => handle_mcp_stdio_command().await,
         Commands::McpSse { host, port } => handle_mcp_sse_command(host, port).await,
         Commands::McpHttp { host, port } => handle_mcp_http_command(host, port).await,
+        Commands::Replay { input, format } => handle_replay_command(input, format, &scanner_config),
     }
+}
+
+/// Read a previously-emitted scan result JSON file and re-emit it through
+/// the requested format. Accepts both single-server (`ScanResult`) and
+/// multi-server (`Vec<ScanResult>`) shapes — sniffs which by attempting
+/// the array first, then falling back to a single object.
+fn handle_replay_command(
+    input: std::path::PathBuf,
+    format: Option<String>,
+    scanner_config: &ScannerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(&input).map_err(|e| {
+        Box::<dyn std::error::Error>::from(format!(
+            "Failed to read replay input {}: {e}",
+            input.display()
+        ))
+    })?;
+    let output_format = format.unwrap_or(scanner_config.scanner.format.clone());
+    // Try the multi-server shape first; the single-server shape fits inside
+    // a 1-element Vec for `print_multi_server_results` so we can route both
+    // through the same renderer below.
+    if let Ok(results) = serde_json::from_slice::<Vec<types::ScanResult>>(&bytes) {
+        utils::print_multi_server_results(
+            &results,
+            &output_format,
+            scanner_config.scanner.detailed,
+        );
+        return Ok(());
+    }
+    let result: types::ScanResult = serde_json::from_slice(&bytes).map_err(|e| {
+        Box::<dyn std::error::Error>::from(format!(
+            "Replay input is neither a `ScanResult` nor a `Vec<ScanResult>`: {e}"
+        ))
+    })?;
+    utils::print_result(&result, &output_format, scanner_config.scanner.detailed);
+    Ok(())
 }
 
 /// Handles the scan command for a single URL
@@ -400,17 +475,20 @@ async fn handle_scan_command(
     report: bool,
     timeout: Option<u64>,
     http_timeout: Option<u64>,
+    only: Option<String>,
     scanner_config: &ScannerConfig,
     scanner: Option<MCPScanner>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_headers_map = parse_auth_headers(&auth_headers);
     let output_format = format.unwrap_or(scanner_config.scanner.format.clone());
+    let only_kinds = parse_only_filter(only)?;
     let options = build_scan_options(
         scanner_config,
         &output_format,
         auth_headers_map,
         timeout,
         http_timeout,
+        only_kinds,
     );
 
     validate_scan_config(&options);
@@ -456,17 +534,20 @@ async fn handle_scan_config_command(
     timeout: Option<u64>,
     http_timeout: Option<u64>,
     root: Option<std::path::PathBuf>,
+    only: Option<String>,
     scanner_config: &ScannerConfig,
     scanner: Option<MCPScanner>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_headers_map = parse_auth_headers(&auth_headers);
     let output_format = format.unwrap_or(scanner_config.scanner.format.clone());
+    let only_kinds = parse_only_filter(only)?;
     let options = build_scan_options(
         scanner_config,
         &output_format,
         auth_headers_map,
         timeout,
         http_timeout,
+        only_kinds,
     );
 
     validate_scan_config(&options);
@@ -573,14 +654,17 @@ async fn handle_mcp_http_command(
 
 /// Builds scan options from configuration and parameters.
 ///
-/// `timeout_override` and `http_timeout_override` come from CLI flags and, when
-/// `Some`, take precedence over the values in `scanner_config`.
+/// CLI overrides (`timeout_override`, `http_timeout_override`, `only_kinds`)
+/// take precedence over the values in `scanner_config`. `only_kinds` is
+/// `None` when the user didn't pass `--only`; in that case every artifact
+/// kind is scanned.
 fn build_scan_options(
     scanner_config: &ScannerConfig,
     output_format: &str,
     auth_headers_map: Option<std::collections::HashMap<String, String>>,
     timeout_override: Option<u64>,
     http_timeout_override: Option<u64>,
+    only_kinds: Option<Vec<types::ArtifactKind>>,
 ) -> ScanOptions {
     ScanConfigBuilder::new()
         .timeout(timeout_override.unwrap_or(scanner_config.scanner.scan_timeout))
@@ -588,7 +672,30 @@ fn build_scan_options(
         .detailed(scanner_config.scanner.detailed)
         .format(output_format.to_string())
         .auth_headers(auth_headers_map)
+        .only(only_kinds)
         .build()
+}
+
+/// Parse the `--only` CLI value (e.g. `"tools,prompts"`) into the `Vec` shape
+/// `ScanOptions::only` expects, or surface a clean error when the value is
+/// malformed.
+fn parse_only_filter(
+    raw: Option<String>,
+) -> Result<Option<Vec<types::ArtifactKind>>, Box<dyn std::error::Error>> {
+    match raw {
+        None => Ok(None),
+        Some(s) => {
+            let kinds = types::ArtifactKind::parse_set(&s)
+                .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+            // Empty string parses to empty vec; treat that as "no filter"
+            // rather than "scan nothing".
+            if kinds.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(kinds))
+            }
+        }
+    }
 }
 
 /// Validates scan configuration and exits on error

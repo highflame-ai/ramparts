@@ -92,6 +92,11 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         // approved server's command/args/env fingerprint changes.
         "MCPConfigChanged" => vec![OwaspTag::new("MCP02")],
 
+        // Emitted by the OSV.dev integration when a stdio MCP server's
+        // npx/uvx package release has known security advisories. Pure
+        // supply-chain finding.
+        "VulnerableDependency" => vec![OwaspTag::new("MCP10")],
+
         // cross_origin_escalation.yar + the in-process cross-origin scanner
         "CrossOriginEscalation"
         | "CrossDomainContamination"

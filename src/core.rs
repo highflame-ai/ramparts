@@ -457,6 +457,7 @@ impl MCPScannerCore {
             format: "json".to_string(),
             auth_headers: auth_headers.clone(),
             return_prompts: false,
+            only: None,
         };
 
         let result = self.scanner.scan_single(url, scan_options).await?;
