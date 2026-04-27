@@ -261,7 +261,17 @@ pub fn parse_skill_content(path: &Path, raw: &str) -> Option<ParsedSkill> {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unnamed");
-    let name = parsed_fm.name.unwrap_or_else(|| stem.to_string());
+    // Empty / whitespace-only `name:` falls back to the filename stem.
+    // Without this, `name: ""` produces a skill with an empty prompt
+    // name, which downstream renderers display as a blank field and
+    // which collides with every other empty-named skill in the
+    // SkillNameCollision check.
+    let name = parsed_fm
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| stem.to_string(), str::to_string);
 
     // Try to lift real argument names out of an `argument-hint` string
     // like "<env>" or "<env> <region>". When that yields nothing usable
@@ -318,19 +328,17 @@ pub fn parse_skill_content(path: &Path, raw: &str) -> Option<ParsedSkill> {
     // one (the prompt template renders "No description" instead of an
     // empty field). Only happens when arguments were parsed from a hint
     // but description and body are both empty.
+    // `description` carries the analyzable text (frontmatter
+    // description + body + free-form arg hint, in that order); source
+    // path is *not* included because absolute paths in YARA-scanned
+    // text trip path-traversal rules like `/var/` and `/etc/`.
+    // Provenance lives on heuristic findings via the `context` field
+    // on `YaraScanResult` instead.
     let description = if parts.is_empty() {
         None
     } else {
         Some(parts.join("\n\n"))
     };
-    // Source-path provenance lives on heuristic findings (via the
-    // `context` field on `YaraScanResult`) rather than inside the
-    // analyzed `description`. Putting absolute paths into text the
-    // pre-scan YARA sees triggers spurious matches against rules that
-    // flag paths like `/var/` or `/etc/` (path-traversal heuristics);
-    // keeping provenance off the analyzed text avoids those false
-    // positives while still preserving "which file did this come from"
-    // on every parser-emitted finding.
 
     let prompt = MCPPrompt {
         name,
@@ -481,9 +489,12 @@ fn split_grant_tokens(grant: &str) -> Vec<&str> {
             _ => {}
         }
     }
-    if start <= grant.len() {
-        tokens.push(&grant[start..]);
-    }
+    // Always push the trailing slice. `start` is at a char boundary
+    // (set from `i + c.len_utf8()` after a separator) and at most
+    // equals `grant.len()`, so the slice is valid; an empty trailing
+    // slice (input ending with `,` / `\n`) is harmless because
+    // `parse_grant_token` rejects whitespace-only tokens downstream.
+    tokens.push(&grant[start..]);
     tokens
 }
 
@@ -658,10 +669,17 @@ fn analyze_sensitive_file_references(
         // in `john@example.com` is then "example.com" — which we'd
         // check for sensitive-path content anyway, but the cheap
         // pre-check drops the bulk of email-pattern noise.
-        let prev_is_word_char = body[..i]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        //
+        // Byte-level inspection (vs `body[..i].chars().next_back()`)
+        // is O(1) per match rather than O(prefix-length). For a 1MB
+        // skill body with N `@` matches that's the difference between
+        // O(N) and O(N * body_len). Safe across UTF-8 because the
+        // last byte of any multi-byte codepoint has the high bit set
+        // (>= 0x80) and is_ascii_alphanumeric() returns false on it.
+        let prev_is_word_char = i
+            .checked_sub(1)
+            .and_then(|j| body.as_bytes().get(j))
+            .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_');
         if prev_is_word_char {
             continue;
         }
@@ -757,10 +775,11 @@ fn analyze_embedded_payloads(skill_name: &str, path: &Path, body: &str) -> Vec<Y
         // Data-URI exclusion. A markdown inline image
         // `![alt](data:image/png;base64,SGVsbG8=)` produces a long
         // base64 run preceded by `base64,`; that's intentional and
-        // benign. Look back up to 16 chars for the marker.
-        let lookback_start = start.saturating_sub(16);
-        let context_before = &body[lookback_start..start];
-        if context_before.contains("base64,") {
+        // benign. `ends_with` on a `&str` compares from the end byte-
+        // wise — safe across UTF-8 because the marker is ASCII and
+        // `body[..start]` is a char-boundary slice (`start` came from
+        // `char_indices`).
+        if body[..start].ends_with("base64,") {
             return;
         }
         let kind = if blob.chars().all(is_hex_char) {
@@ -950,14 +969,14 @@ fn analyze_generic_trigger(
 /// compared case-insensitively because skill routers typically lowercase
 /// for matching. Reports one finding per colliding name with all paths
 /// in the `context` field.
-pub fn analyze_skill_set(skills: &[(PathBuf, &MCPPrompt)]) -> Vec<YaraScanResult> {
+pub fn analyze_skill_set(skills: &[(&Path, &MCPPrompt)]) -> Vec<YaraScanResult> {
     let mut by_name: std::collections::HashMap<String, Vec<&Path>> =
         std::collections::HashMap::new();
     for (path, prompt) in skills {
         by_name
             .entry(prompt.name.to_ascii_lowercase())
             .or_default()
-            .push(path.as_path());
+            .push(*path);
     }
     let mut findings: Vec<YaraScanResult> = Vec::new();
     for (lower_name, paths) in by_name {
@@ -1274,23 +1293,20 @@ pub fn default_discovery_roots() -> Vec<PathBuf> {
         &[".openai", "commands"],
     ];
 
-    if let Some(home) = dirs::home_dir() {
+    let push_for_base = |roots: &mut Vec<PathBuf>, base: &Path| {
         for segments in PER_ECOSYSTEM {
-            let mut p = home.clone();
-            for s in *segments {
-                p.push(s);
-            }
-            roots.push(p);
+            let path = segments
+                .iter()
+                .fold(base.to_path_buf(), |acc, seg| acc.join(seg));
+            roots.push(path);
         }
+    };
+
+    if let Some(home) = dirs::home_dir() {
+        push_for_base(&mut roots, &home);
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for segments in PER_ECOSYSTEM {
-        let mut p = cwd.clone();
-        for s in *segments {
-            p.push(s);
-        }
-        roots.push(p);
-    }
+    push_for_base(&mut roots, &cwd);
     roots
 }
 
@@ -1381,6 +1397,24 @@ mod tests {
     fn frontmatter_name_overrides_filename() {
         let parsed = parse("ignored.md", "---\nname: actual-name\n---\nhello\n");
         assert_eq!(parsed.prompt.name, "actual-name");
+    }
+
+    #[test]
+    fn empty_or_whitespace_name_falls_back_to_filename_stem() {
+        // `name: ""` and `name: "   "` should NOT produce an empty
+        // skill name — that would render as a blank in reports and
+        // collide with every other empty-named skill in the
+        // SkillNameCollision check.
+        for raw in [
+            "---\nname: \"\"\n---\nbody\n",
+            "---\nname: \"   \"\n---\nbody\n",
+        ] {
+            let parsed = parse("real-stem.md", raw);
+            assert_eq!(
+                parsed.prompt.name, "real-stem",
+                "expected fallback to stem for: {raw:?}"
+            );
+        }
     }
 
     #[test]
@@ -1937,8 +1971,10 @@ mod tests {
             "---\ndescription: Different deploy with override\n---\nshadow deploy logic",
         )
         .expect("p2 parses");
-        let set: Vec<(PathBuf, &MCPPrompt)> =
-            vec![(p1.clone(), &parsed1.prompt), (p2.clone(), &parsed2.prompt)];
+        let set: Vec<(&Path, &MCPPrompt)> = vec![
+            (p1.as_path(), &parsed1.prompt),
+            (p2.as_path(), &parsed2.prompt),
+        ];
         let findings = analyze_skill_set(&set);
         assert_eq!(
             findings.len(),
@@ -1970,7 +2006,10 @@ mod tests {
         let p2 = PathBuf::from("/b/deploy.md");
         let parsed1 = parse_skill_content(&p1, "---\nname: Deploy\n---\nbody1\n").unwrap();
         let parsed2 = parse_skill_content(&p2, "---\nname: deploy\n---\nbody2\n").unwrap();
-        let set: Vec<(PathBuf, &MCPPrompt)> = vec![(p1, &parsed1.prompt), (p2, &parsed2.prompt)];
+        let set: Vec<(&Path, &MCPPrompt)> = vec![
+            (p1.as_path(), &parsed1.prompt),
+            (p2.as_path(), &parsed2.prompt),
+        ];
         let findings = analyze_skill_set(&set);
         assert_eq!(findings.len(), 1);
     }
@@ -1981,7 +2020,10 @@ mod tests {
         let p2 = PathBuf::from("/b/test.md");
         let parsed1 = parse_skill_content(&p1, "---\nname: deploy\n---\nbody1\n").unwrap();
         let parsed2 = parse_skill_content(&p2, "---\nname: test\n---\nbody2\n").unwrap();
-        let set: Vec<(PathBuf, &MCPPrompt)> = vec![(p1, &parsed1.prompt), (p2, &parsed2.prompt)];
+        let set: Vec<(&Path, &MCPPrompt)> = vec![
+            (p1.as_path(), &parsed1.prompt),
+            (p2.as_path(), &parsed2.prompt),
+        ];
         assert!(analyze_skill_set(&set).is_empty());
     }
 

@@ -612,11 +612,12 @@ async fn handle_skills_scan_command(
 
     // Cross-skill pass: look for name collisions across the parsed set.
     // Distinct from per-skill heuristics because it requires comparing
-    // skills against each other.
-    let skill_set: Vec<(std::path::PathBuf, &types::MCPPrompt)> = prompt_paths
+    // skills against each other. We zip borrows directly — no PathBuf
+    // clones — since `analyze_skill_set` only reads the paths.
+    let skill_set: Vec<(&std::path::Path, &types::MCPPrompt)> = prompt_paths
         .iter()
+        .map(std::path::PathBuf::as_path)
         .zip(prompts.iter())
-        .map(|(p, pr)| (p.clone(), pr))
         .collect();
     parser_findings.extend(skills::analyze_skill_set(&skill_set));
 
