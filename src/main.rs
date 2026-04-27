@@ -584,10 +584,20 @@ async fn handle_skills_scan_command(
 
     debug!("Found {} skill file(s) to scan", skill_paths.len());
 
-    let prompts: Vec<types::MCPPrompt> = skill_paths
-        .iter()
-        .filter_map(|p| skills::parse_skill_file(p))
-        .collect();
+    // Each skill yields a prompt (for LLM/YARA analysis) plus zero or more
+    // heuristic findings produced during parsing (overbroad allowed-tools
+    // grants, vague triggers). We collect both up front; the prompt set
+    // feeds the existing analyzers, and the heuristic findings are
+    // appended to `result.yara_results` so they render through the same
+    // pipeline as real YARA matches.
+    let mut prompts: Vec<types::MCPPrompt> = Vec::with_capacity(skill_paths.len());
+    let mut parser_findings: Vec<types::YaraScanResult> = Vec::new();
+    for p in &skill_paths {
+        if let Some(parsed) = skills::parse_skill_file(p) {
+            prompts.push(parsed.prompt);
+            parser_findings.extend(parsed.heuristic_findings);
+        }
+    }
 
     if prompts.is_empty() {
         error!("All discovered skill files failed to parse");
@@ -649,6 +659,13 @@ async fn handle_skills_scan_command(
         }
         result.prompts = std::mem::take(&mut scan_data.prompts);
     }
+
+    // Append heuristic findings produced during parsing (overbroad
+    // allowed-tools grants, vague triggers). They share the same
+    // `YaraScanResult` shape and `target_type = "prompt"` so the
+    // existing terminal / JSON / SARIF renderers and the OWASP rollup
+    // treat them identically to YARA matches.
+    result.yara_results.append(&mut parser_findings);
 
     // Run the existing security analyzer over the prompt set. We reuse the
     // batch analyzer so LLM batching, OWASP tagging, and result accounting

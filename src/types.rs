@@ -24,7 +24,10 @@ pub struct YaraRuleMetadata {
     pub category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    // `default` is required so `replay` can read JSON we previously wrote
+    // — `skip_serializing_if` omits the field when empty, and without
+    // `default` deserialization fails on the missing key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
 

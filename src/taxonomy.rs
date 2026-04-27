@@ -116,6 +116,12 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         "AutonomyAbuse" => vec![OwaspTag::new("MCP03")],
         "CapabilityInflation" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
 
+        // Synthetic findings emitted by the skill parser (src/skills.rs)
+        // for structural risks the YARA passes can't see (frontmatter
+        // grants, missing triggers).
+        "OverbroadAllowedTools" => vec![OwaspTag::new("MCP03")],
+        "VagueSkillTrigger" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
+
         _ => Vec::new(),
     }
 }
