@@ -149,7 +149,11 @@ impl SecurityIssueType {
         }
     }
 
-    fn default_message(self) -> &'static str {
+    /// Generic, finding-independent description of this issue class.
+    /// Used both as the prefix for `SecurityIssue::message` and as the
+    /// `shortDescription` for the SARIF rule definition (which must be
+    /// generic because multiple findings share the same `ruleId`).
+    pub fn default_message(self) -> &'static str {
         match self {
             SecurityIssueType::ToolPoisoning => "Tool with destructive or malicious intent",
             SecurityIssueType::SQLInjection => "Tool allowing SQL injection attacks",

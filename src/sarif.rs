@@ -126,10 +126,7 @@ fn build_rule_from_yara(yara: &YaraScanResult) -> Value {
         if let Some(sev) = meta.severity.as_ref() {
             let mut props = Map::new();
             props.insert("severity".into(), Value::String(sev.clone()));
-            props.insert(
-                "security-severity".into(),
-                Value::String(severity_score(sev).to_string()),
-            );
+            props.insert("security-severity".into(), severity_score_value(sev));
             if !yara.owasp_tags.is_empty() {
                 props.insert("tags".into(), owasp_tags_value(&yara.owasp_tags));
             }
@@ -160,10 +157,7 @@ fn build_result_from_yara(scan: &ScanResult, yara: &YaraScanResult) -> Value {
         .unwrap_or_else(|| yara.context.clone());
 
     let mut props = Map::new();
-    props.insert(
-        "security-severity".into(),
-        Value::String(severity_score(severity).to_string()),
-    );
+    props.insert("security-severity".into(), severity_score_value(severity));
     if !yara.owasp_tags.is_empty() {
         props.insert("tags".into(), owasp_tags_value(&yara.owasp_tags));
     }
@@ -179,18 +173,25 @@ fn build_result_from_yara(scan: &ScanResult, yara: &YaraScanResult) -> Value {
         "ruleId": yara.rule_name,
         "level": level,
         "message": { "text": message },
-        "locations": [logical_location(&scan.url, &yara.target_name)],
+        "locations": [logical_location(&scan.url, &yara.target_name, &yara.target_type)],
         "properties": Value::Object(props),
     })
 }
 
 fn build_rule_from_security_issue(issue: &SecurityIssue) -> Value {
+    // Multiple findings of the same SecurityIssueType collapse to the same
+    // `ruleId` and therefore share this single rule definition. Use the
+    // class-generic message from `SecurityIssueType::default_message` rather
+    // than `issue.message`/`issue.description`, which describe a specific
+    // finding and would otherwise leak into the shared rule definition
+    // depending only on which finding was processed first.
     let id = security_issue_rule_id(issue.issue_type);
+    let generic_description = issue.issue_type.default_message();
     let mut props = Map::new();
     props.insert("severity".into(), Value::String(issue.severity.clone()));
     props.insert(
         "security-severity".into(),
-        Value::String(severity_score(&issue.severity).to_string()),
+        severity_score_value(&issue.severity),
     );
     if !issue.owasp_tags.is_empty() {
         props.insert("tags".into(), owasp_tags_value(&issue.owasp_tags));
@@ -198,8 +199,8 @@ fn build_rule_from_security_issue(issue: &SecurityIssue) -> Value {
     json!({
         "id": id,
         "name": format!("{:?}", issue.issue_type),
-        "shortDescription": { "text": issue.message },
-        "fullDescription": { "text": issue.description },
+        "shortDescription": { "text": generic_description },
+        "fullDescription": { "text": generic_description },
         "properties": Value::Object(props),
     })
 }
@@ -219,7 +220,7 @@ fn build_result_from_security_issue(
     let mut props = Map::new();
     props.insert(
         "security-severity".into(),
-        Value::String(severity_score(&issue.severity).to_string()),
+        severity_score_value(&issue.severity),
     );
     if !issue.owasp_tags.is_empty() {
         props.insert("tags".into(), owasp_tags_value(&issue.owasp_tags));
@@ -235,19 +236,48 @@ fn build_result_from_security_issue(
         "ruleId": security_issue_rule_id(issue.issue_type),
         "level": level,
         "message": { "text": issue.message },
-        "locations": [logical_location(&scan.url, &target_name)],
+        "locations": [logical_location(&scan.url, &target_name, target_kind)],
         "properties": Value::Object(props),
     })
 }
 
-fn logical_location(server_url: &str, target_name: &str) -> Value {
+/// Build a SARIF `location` whose `kind` reflects what kind of MCP entity
+/// produced the finding. Per the SARIF 2.1.0 logical-location `kind` enum,
+/// `resource` is the literal match for an MCP resource; `function` fits an
+/// MCP tool (callable, takes args, returns output); `member` is the closest
+/// option for prompts (no first-class SARIF kind exists for templated
+/// strings). Unknown target types fall back to `function` rather than being
+/// dropped entirely so consumers always get a `kind` field.
+fn logical_location(server_url: &str, target_name: &str, target_kind: &str) -> Value {
+    let kind = match target_kind {
+        "tool" => "function",
+        "resource" => "resource",
+        "prompt" => "member",
+        // Cross-origin scanner targets ("domain-analysis", "outlier-analysis",
+        // "scheme-analysis") and the YARA pre-scan target_type "server" are
+        // structural, not callable; SARIF doesn't have a perfect kind for
+        // them, so we use "module" as the closest neutral container kind.
+        "server" | "domain-analysis" | "outlier-analysis" | "scheme-analysis" => "module",
+        _ => "function",
+    };
     json!({
         "logicalLocations": [{
             "name": target_name,
             "fullyQualifiedName": format!("{server_url}::{target_name}"),
-            "kind": "function"
+            "kind": kind
         }]
     })
+}
+
+/// Render a numeric `security-severity` (0.0–10.0) as a JSON number.
+/// GitHub Code Scanning accepts both string and number forms but their
+/// SARIF spec annotation calls it a floating point number, so we emit the
+/// stricter form.
+fn severity_score_value(sev: &str) -> Value {
+    let score = severity_score(sev);
+    serde_json::Number::from_f64(f64::from(score))
+        .map(Value::Number)
+        .unwrap_or_else(|| Value::String(score.to_string()))
 }
 
 fn owasp_tags_value(tags: &[crate::taxonomy::OwaspTag]) -> Value {
