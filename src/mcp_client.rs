@@ -23,6 +23,11 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+/// Default per-HTTP-request timeout when none is provided. Kept identical to
+/// the previous hardcoded value so existing behavior doesn't change for
+/// callers that haven't started forwarding the configured `http_timeout`.
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+
 /// MCP client using the official Rust MCP SDK with full transport support
 #[derive(Clone)]
 pub struct McpClient {
@@ -30,6 +35,9 @@ pub struct McpClient {
     services: Arc<Mutex<HashMap<String, RunningService<RoleClient, ()>>>>,
     /// Tool cache with TTL support
     tool_cache: ToolCache,
+    /// Per-HTTP-request timeout applied to every reqwest client this McpClient
+    /// builds. Sourced from `ScanOptions::http_timeout`.
+    http_timeout_secs: u64,
 }
 
 #[allow(dead_code)] // Future feature - will be used when cache is integrated
@@ -38,6 +46,16 @@ impl McpClient {
         Self {
             services: Arc::new(Mutex::new(HashMap::new())),
             tool_cache: ToolCache::default(), // 1 hour default TTL
+            http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
+        }
+    }
+
+    /// Create a new MCP client with the given per-HTTP-request timeout.
+    pub fn with_http_timeout(http_timeout_secs: u64) -> Self {
+        Self {
+            services: Arc::new(Mutex::new(HashMap::new())),
+            tool_cache: ToolCache::default(),
+            http_timeout_secs,
         }
     }
 
@@ -46,6 +64,7 @@ impl McpClient {
         Self {
             services: Arc::new(Mutex::new(HashMap::new())),
             tool_cache: ToolCache::new(cache_ttl_seconds),
+            http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
         }
     }
 
@@ -89,9 +108,14 @@ impl McpClient {
 
         HttpClient::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(self.http_timeout_secs))
             .build()
-            .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to build HTTP client: {}",
+                    crate::utils::error_utils::format_error_chain(&e)
+                )
+            })
     }
 
     /// Try to connect using streamable HTTP transport

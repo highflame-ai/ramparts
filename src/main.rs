@@ -114,6 +114,14 @@ enum Commands {
         /// Generate a detailed markdown report with timestamp (`scan_YYYYMMDD_HHMMSS.md`)
         #[arg(long)]
         report: bool,
+
+        /// Overall scan timeout in seconds. Overrides `scanner.scan_timeout` from config.yaml.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+
+        /// Per-HTTP-request timeout in seconds. Overrides `scanner.http_timeout` from config.yaml.
+        #[arg(long, value_name = "SECONDS")]
+        http_timeout: Option<u64>,
     },
 
     /// Scan MCP servers from IDE configuration files (~/.cursor/mcp.json, ~/.codeium/windsurf/mcp_config.json)
@@ -129,6 +137,14 @@ enum Commands {
         /// Generate a detailed markdown report with timestamp (`scan_YYYYMMDD_HHMMSS.md`)
         #[arg(long)]
         report: bool,
+
+        /// Overall per-server scan timeout in seconds. Overrides `scanner.scan_timeout` from config.yaml.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+
+        /// Per-HTTP-request timeout in seconds. Overrides `scanner.http_timeout` from config.yaml.
+        #[arg(long, value_name = "SECONDS")]
+        http_timeout: Option<u64>,
     },
 
     /// Generate a default config.yaml file
@@ -175,6 +191,15 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install the aws-lc-rs CryptoProvider as the process-wide default for
+    // rustls 0.23. reqwest 0.13's `rustls` feature relies on a default
+    // provider being available before any HTTPS client is built; in some
+    // environments the implicit auto-init races or fails, surfacing as the
+    // opaque `reqwest::Error("builder error")` from `Client::builder().build()`.
+    // Doing this explicitly and ignoring the `Err` (returned only when
+    // something else already installed a provider) makes startup deterministic.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
     // Do not print banner when running as stdio MCP server to avoid corrupting JSON-RPC stdout
     if !matches!(cli.command, Commands::McpStdio) {
@@ -255,19 +280,25 @@ fn determine_log_level(cli: &Cli, scanner_config: &ScannerConfig) -> Level {
     }
 }
 
-/// Creates an MCP scanner instance if needed for the given command
+/// Creates an MCP scanner instance if needed for the given command.
+///
+/// The CLI's `--http-timeout` flag (when present) takes precedence over the
+/// config-file value here so the scanner's HTTP client is constructed with
+/// the same timeout that ends up in `ScanOptions::http_timeout`.
 fn create_scanner_if_needed(cli: &Cli, scanner_config: &ScannerConfig) -> Option<MCPScanner> {
-    match &cli.command {
-        Commands::Scan { .. } | Commands::ScanConfig { .. } => {
-            match MCPScanner::with_timeout(scanner_config.scanner.http_timeout) {
-                Ok(scanner) => Some(scanner),
-                Err(e) => {
-                    error!("Failed to create scanner: {}", e);
-                    std::process::exit(1);
-                }
-            }
+    let http_timeout_override = match &cli.command {
+        Commands::Scan { http_timeout, .. } | Commands::ScanConfig { http_timeout, .. } => {
+            *http_timeout
         }
-        _ => None,
+        _ => return None,
+    };
+    let http_timeout = http_timeout_override.unwrap_or(scanner_config.scanner.http_timeout);
+    match MCPScanner::with_timeout(http_timeout) {
+        Ok(scanner) => Some(scanner),
+        Err(e) => {
+            error!("Failed to create scanner: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -283,13 +314,38 @@ async fn execute_command(
             auth_headers,
             format,
             report,
-        } => handle_scan_command(url, auth_headers, format, report, &scanner_config, scanner).await,
+            timeout,
+            http_timeout,
+        } => {
+            handle_scan_command(
+                url,
+                auth_headers,
+                format,
+                report,
+                timeout,
+                http_timeout,
+                &scanner_config,
+                scanner,
+            )
+            .await
+        }
         Commands::ScanConfig {
             auth_headers,
             format,
             report,
+            timeout,
+            http_timeout,
         } => {
-            handle_scan_config_command(auth_headers, format, report, &scanner_config, scanner).await
+            handle_scan_config_command(
+                auth_headers,
+                format,
+                report,
+                timeout,
+                http_timeout,
+                &scanner_config,
+                scanner,
+            )
+            .await
         }
         Commands::InitConfig { force } => {
             handle_init_config_command(force);
@@ -303,17 +359,26 @@ async fn execute_command(
 }
 
 /// Handles the scan command for a single URL
+#[allow(clippy::too_many_arguments)]
 async fn handle_scan_command(
     url: String,
     auth_headers: Vec<String>,
     format: Option<String>,
     report: bool,
+    timeout: Option<u64>,
+    http_timeout: Option<u64>,
     scanner_config: &ScannerConfig,
     scanner: Option<MCPScanner>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_headers_map = parse_auth_headers(&auth_headers);
     let output_format = format.unwrap_or(scanner_config.scanner.format.clone());
-    let options = build_scan_options(scanner_config, &output_format, auth_headers_map);
+    let options = build_scan_options(
+        scanner_config,
+        &output_format,
+        auth_headers_map,
+        timeout,
+        http_timeout,
+    );
 
     validate_scan_config(&options);
 
@@ -350,16 +415,25 @@ async fn handle_scan_command(
 }
 
 /// Handles the scan-config command for IDE configurations
+#[allow(clippy::too_many_arguments)]
 async fn handle_scan_config_command(
     auth_headers: Vec<String>,
     format: Option<String>,
     report: bool,
+    timeout: Option<u64>,
+    http_timeout: Option<u64>,
     scanner_config: &ScannerConfig,
     scanner: Option<MCPScanner>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_headers_map = parse_auth_headers(&auth_headers);
     let output_format = format.unwrap_or(scanner_config.scanner.format.clone());
-    let options = build_scan_options(scanner_config, &output_format, auth_headers_map);
+    let options = build_scan_options(
+        scanner_config,
+        &output_format,
+        auth_headers_map,
+        timeout,
+        http_timeout,
+    );
 
     validate_scan_config(&options);
 
@@ -458,15 +532,20 @@ async fn handle_mcp_http_command(
     mcp_server::run_streamable_http_server(&host, port).await
 }
 
-/// Builds scan options from configuration and parameters
+/// Builds scan options from configuration and parameters.
+///
+/// `timeout_override` and `http_timeout_override` come from CLI flags and, when
+/// `Some`, take precedence over the values in `scanner_config`.
 fn build_scan_options(
     scanner_config: &ScannerConfig,
     output_format: &str,
     auth_headers_map: Option<std::collections::HashMap<String, String>>,
+    timeout_override: Option<u64>,
+    http_timeout_override: Option<u64>,
 ) -> ScanOptions {
     ScanConfigBuilder::new()
-        .timeout(scanner_config.scanner.scan_timeout)
-        .http_timeout(scanner_config.scanner.http_timeout)
+        .timeout(timeout_override.unwrap_or(scanner_config.scanner.scan_timeout))
+        .http_timeout(http_timeout_override.unwrap_or(scanner_config.scanner.http_timeout))
         .detailed(scanner_config.scanner.detailed)
         .format(output_format.to_string())
         .auth_headers(auth_headers_map)

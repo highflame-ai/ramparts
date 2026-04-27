@@ -8,6 +8,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
 use spinners::{Spinner, Spinners};
+use std::io::IsTerminal;
 use tracing::{debug, error};
 
 /// Trait for items that can be batch scanned for security issues
@@ -782,11 +783,15 @@ Example valid response: [{\"tool_name\": \"example\", \"found_issue\": true, \"i
             );
         }
 
-        // Start spinner with text after animation
-        let mut sp = Spinner::new(
-            Spinners::Dots9,
-            "Scanning for security vulnerabilities...(this may take a while)".into(),
-        );
+        // Start spinner only when stdout is an interactive terminal. In CI,
+        // pipelines, or any redirected output the animation re-prints
+        // hundreds of frames per scan, drowning the actual results.
+        let mut sp = std::io::stdout().is_terminal().then(|| {
+            Spinner::new(
+                Spinners::Dots9,
+                "Scanning for security vulnerabilities...(this may take a while)".into(),
+            )
+        });
 
         debug!("📡 Sending LLM API request to: {}", endpoint);
 
@@ -801,7 +806,9 @@ Example valid response: [{\"tool_name\": \"example\", \"found_issue\": true, \"i
         {
             Ok(resp) => resp,
             Err(e) => {
-                sp.stop();
+                if let Some(s) = sp.as_mut() {
+                    s.stop();
+                }
                 error!("🚨 LLM API Request Failed:");
                 error!("   Endpoint: {}", endpoint);
                 error!("   Error: {}", e);
@@ -821,7 +828,9 @@ Example valid response: [{\"tool_name\": \"example\", \"found_issue\": true, \"i
         };
 
         // Stop spinner
-        sp.stop();
+        if let Some(s) = sp.as_mut() {
+            s.stop();
+        }
 
         let status = response.status();
         debug!("📥 LLM API Response Status: {}", status);

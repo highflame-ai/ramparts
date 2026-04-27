@@ -1439,6 +1439,22 @@ impl MCPConfigManager {
         }
     }
 
+    /// Returns `true` only when the parsed `MCPConfig` actually contains at
+    /// least one server.
+    ///
+    /// Several IDE config schemas have all fields `Option`-wrapped, so a JSON
+    /// document keyed differently than expected (e.g., a Claude-Desktop-style
+    /// `{"mcpServers": ...}` file at a VS Code path) parses as a syntactically
+    /// valid but empty `MCPConfig`. Without this gate, the early-return in
+    /// `load_config_from_path` swallows that case and the caller's fallback
+    /// chain never runs. See ramparts#85.
+    fn config_has_servers(config: &MCPConfig) -> bool {
+        config
+            .servers
+            .as_ref()
+            .is_some_and(|servers| !servers.is_empty())
+    }
+
     /// Load configuration from a specific IDE config path
     pub fn load_config_from_path(path: &Path) -> Result<MCPConfig> {
         if !path.exists() {
@@ -1505,52 +1521,81 @@ impl MCPConfigManager {
                 // VS Code settings.json may contain MCP configuration
                 if filename == "settings.json" {
                     if let Ok(vscode_config) = serde_json::from_str::<VSCodeSettings>(&content) {
-                        debug!("Parsed as VS Code settings configuration format");
-                        return Ok(Self::convert_vscode_config(vscode_config));
+                        let parsed = Self::convert_vscode_config(vscode_config);
+                        if Self::config_has_servers(&parsed) {
+                            debug!("Parsed as VS Code settings configuration format");
+                            return Ok(parsed);
+                        }
                     }
                 }
                 // VS Code mcp.json uses the new format
                 else if filename == "mcp.json" {
                     if let Ok(vscode_mcp_config) = serde_json::from_str::<VSCodeMCPConfig>(&content)
                     {
-                        debug!("Parsed as VS Code MCP configuration format");
-                        return Ok(Self::convert_vscode_mcp_config(vscode_mcp_config));
+                        let parsed = Self::convert_vscode_mcp_config(vscode_mcp_config);
+                        if Self::config_has_servers(&parsed) {
+                            debug!("Parsed as VS Code MCP configuration format");
+                            return Ok(parsed);
+                        }
                     }
                 }
             }
             _ => {}
         }
 
-        // Try parsing as standard format
-        match serde_json::from_str::<MCPConfig>(&content) {
-            Ok(config) => Ok(config),
-            Err(e) => {
-                // Try fallback parsing for different formats
-                if let Some(config) =
-                    Self::try_parse_cursor_compatible_config(&content, "Cursor MCP (fallback)")
-                {
-                    Ok(config)
-                } else if let Ok(claude_config) =
-                    serde_json::from_str::<ClaudeDesktopConfig>(&content)
-                {
-                    debug!("Parsed as Claude Desktop configuration format (fallback)");
-                    Ok(Self::convert_claude_desktop_config(claude_config))
-                } else if let Ok(vscode_config) = serde_json::from_str::<VSCodeSettings>(&content) {
-                    debug!("Parsed as VS Code settings configuration format (fallback)");
-                    Ok(Self::convert_vscode_config(vscode_config))
-                } else if let Ok(vscode_mcp_config) =
-                    serde_json::from_str::<VSCodeMCPConfig>(&content)
-                {
-                    debug!("Parsed as VS Code MCP configuration format (fallback)");
-                    Ok(Self::convert_vscode_mcp_config(vscode_mcp_config))
-                } else {
-                    Err(anyhow!(
-                        "Failed to parse IDE config file {}: {}",
-                        path.display(),
-                        e
-                    ))
-                }
+        // Fallback chain. Used when client detection didn't match (or matched
+        // VS Code but the schema-specific parsers produced an empty config —
+        // e.g., a Claude-Desktop-style `{"mcpServers": ...}` saved at a VS
+        // Code path). The first parser to yield a non-empty config wins.
+        let mcp_config_parse = serde_json::from_str::<MCPConfig>(&content);
+        if let Ok(ref config) = mcp_config_parse {
+            if Self::config_has_servers(config) {
+                return Ok(config.clone());
             }
+        }
+
+        if let Some(config) =
+            Self::try_parse_cursor_compatible_config(&content, "Cursor MCP (fallback)")
+        {
+            if Self::config_has_servers(&config) {
+                return Ok(config);
+            }
+        }
+
+        if let Ok(claude_config) = serde_json::from_str::<ClaudeDesktopConfig>(&content) {
+            let parsed = Self::convert_claude_desktop_config(claude_config);
+            if Self::config_has_servers(&parsed) {
+                debug!("Parsed as Claude Desktop configuration format (fallback)");
+                return Ok(parsed);
+            }
+        }
+
+        if let Ok(vscode_config) = serde_json::from_str::<VSCodeSettings>(&content) {
+            let parsed = Self::convert_vscode_config(vscode_config);
+            if Self::config_has_servers(&parsed) {
+                debug!("Parsed as VS Code settings configuration format (fallback)");
+                return Ok(parsed);
+            }
+        }
+
+        if let Ok(vscode_mcp_config) = serde_json::from_str::<VSCodeMCPConfig>(&content) {
+            let parsed = Self::convert_vscode_mcp_config(vscode_mcp_config);
+            if Self::config_has_servers(&parsed) {
+                debug!("Parsed as VS Code MCP configuration format (fallback)");
+                return Ok(parsed);
+            }
+        }
+
+        // Nothing yielded a non-empty config. If at least one parser succeeded
+        // syntactically, return that empty config so the caller still sees a
+        // "0 servers" entry; otherwise surface the original parse error.
+        match mcp_config_parse {
+            Ok(config) => Ok(config),
+            Err(e) => Err(anyhow!(
+                "Failed to parse IDE config file {}: {}",
+                path.display(),
+                e
+            )),
         }
     }
 
