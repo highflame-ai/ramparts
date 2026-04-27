@@ -1252,9 +1252,7 @@ impl MCPScanner {
                     .mcp_client
                     .connect_subprocess(command, args, server_config.env.as_ref())
                     .await
-                    .map_err(|e| {
-                        anyhow!("Failed to connect to STDIO server {}: {}", command, e)
-                    })?;
+                    .map_err(|e| anyhow!("Failed to connect to STDIO server {}: {}", command, e))?;
                 let scan_data = self.perform_scan_with_session(&session, &options).await?;
                 Ok::<_, anyhow::Error>((session, scan_data))
             })
