@@ -257,9 +257,20 @@ enum SkillsCommand {
         #[arg(value_name = "PATH")]
         path: std::path::PathBuf,
 
-        /// Output format (text, table, json, raw, sarif)
-        #[arg(long, value_name = "FORMAT")]
+        /// Output format (text, table, json, raw, sarif). Use `--json` /
+        /// `--sarif` as shortcuts.
+        #[arg(long, value_name = "FORMAT", conflicts_with_all = ["json", "sarif"])]
         format: Option<String>,
+
+        /// Shortcut for `--format json`. Useful for piping into `jq` or
+        /// archiving for later replay.
+        #[arg(long, conflicts_with = "sarif")]
+        json: bool,
+
+        /// Shortcut for `--format sarif`. Pipe to a file (`> skills.sarif`)
+        /// for upload to GitHub Code Scanning, GitLab, etc.
+        #[arg(long)]
+        sarif: bool,
 
         /// Generate a detailed markdown report
         #[arg(long)]
@@ -276,9 +287,18 @@ enum SkillsCommand {
     /// under the current workspace. Set `RAMPARTS_SKILL_ROOTS` (comma-
     /// separated, `~`-expanded) to add extra roots without rebuilding.
     ScanConfig {
-        /// Output format (text, table, json, raw, sarif)
-        #[arg(long, value_name = "FORMAT")]
+        /// Output format (text, table, json, raw, sarif). Use `--json` /
+        /// `--sarif` as shortcuts.
+        #[arg(long, value_name = "FORMAT", conflicts_with_all = ["json", "sarif"])]
         format: Option<String>,
+
+        /// Shortcut for `--format json`.
+        #[arg(long, conflicts_with = "sarif")]
+        json: bool,
+
+        /// Shortcut for `--format sarif`.
+        #[arg(long)]
+        sarif: bool,
 
         /// Generate a detailed markdown report
         #[arg(long)]
@@ -288,6 +308,22 @@ enum SkillsCommand {
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
     },
+}
+
+/// Resolve the effective output format from the CLI surface. `--format
+/// <X>` wins (clap rejects combining with `--json`/`--sarif`); else
+/// the boolean shortcuts; else `None` so the handler falls back to
+/// the config default.
+fn resolve_format(format: Option<String>, json: bool, sarif: bool) -> Option<String> {
+    if format.is_some() {
+        format
+    } else if sarif {
+        Some("sarif".to_string())
+    } else if json {
+        Some("json".to_string())
+    } else {
+        None
+    }
 }
 
 #[tokio::main]
@@ -328,17 +364,32 @@ fn should_display_banner(command: &Commands) -> bool {
     if matches!(command, Commands::McpStdio) {
         return false;
     }
-    let format = match command {
+    // Check both `--format <X>` and the boolean shortcuts (`--json`,
+    // `--sarif`) — the banner corrupts machine-readable stdout
+    // regardless of which form the user used to ask for it.
+    let (format, machine_shortcut) = match command {
         Commands::Scan { format, .. }
         | Commands::ScanConfig { format, .. }
-        | Commands::Replay { format, .. } => format.as_deref(),
+        | Commands::Replay { format, .. } => (format.as_deref(), false),
         Commands::Skills(args) => match &args.command {
-            SkillsCommand::Scan { format, .. } | SkillsCommand::ScanConfig { format, .. } => {
-                format.as_deref()
+            SkillsCommand::Scan {
+                format,
+                json,
+                sarif,
+                ..
             }
+            | SkillsCommand::ScanConfig {
+                format,
+                json,
+                sarif,
+                ..
+            } => (format.as_deref(), *json || *sarif),
         },
-        _ => None,
+        _ => (None, false),
     };
+    if machine_shortcut {
+        return false;
+    }
     !matches!(
         format.map(str::to_ascii_lowercase).as_deref(),
         Some("json") | Some("raw") | Some("sarif")
@@ -504,15 +555,22 @@ async fn handle_skills_command(
         SkillsCommand::Scan {
             path,
             format,
-            report,
-            timeout,
-            ..
-        } => handle_skills_scan_command(vec![path], format, report, timeout, scanner_config).await,
-        SkillsCommand::ScanConfig {
-            format,
+            json,
+            sarif,
             report,
             timeout,
         } => {
+            let format = resolve_format(format, json, sarif);
+            handle_skills_scan_command(vec![path], format, report, timeout, scanner_config).await
+        }
+        SkillsCommand::ScanConfig {
+            format,
+            json,
+            sarif,
+            report,
+            timeout,
+        } => {
+            let format = resolve_format(format, json, sarif);
             let candidates = skills::default_discovery_roots();
             let existing: Vec<std::path::PathBuf> =
                 candidates.iter().filter(|p| p.exists()).cloned().collect();
