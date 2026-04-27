@@ -115,6 +115,24 @@ pub mod performance {
 // ============================================================================
 
 pub fn print_result(result: &ScanResult, format: &str, detailed: bool) {
+    // Skill scans go through their own renderer for terminal/text formats —
+    // the live-MCP renderer's "Tools/Resources" framing collapses to garbage
+    // ("Tools scanned: 0", "Unknown MCP Server") on a skill result whose
+    // primary content is `prompts`. JSON / SARIF / raw stay shape-identical
+    // regardless of source so machine consumers see the same fields.
+    if is_skill_scan(result) {
+        match format.to_lowercase().as_str() {
+            "json" => print_json_result(result),
+            "raw" => print_raw_json_result(result),
+            "sarif" => print_sarif_result(result),
+            "text" | "table" => print_skill_table_result(result, detailed),
+            _ => {
+                eprintln!("Unknown format: {format}. Using skill table format.");
+                print_skill_table_result(result, detailed);
+            }
+        }
+        return;
+    }
     match format.to_lowercase().as_str() {
         "json" => print_json_result(result),
         "table" => print_table_result(result, detailed),
@@ -126,6 +144,283 @@ pub fn print_result(result: &ScanResult, format: &str, detailed: bool) {
             print_table_result(result, detailed);
         }
     }
+}
+
+/// True when this `ScanResult` came from `ramparts skills scan` /
+/// `skills scan-config`. The handler stamps the URL with the
+/// `skills:` scheme so renderers can branch on it.
+fn is_skill_scan(result: &ScanResult) -> bool {
+    result.url.starts_with("skills:")
+}
+
+/// Skill-aware terminal renderer. Replaces the live-MCP framing
+/// (tools / resources / "Unknown MCP Server") with per-skill grouping
+/// (skill name + source path + findings + severity counts).
+fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
+    use crate::security::SecurityIssue;
+    use crate::types::YaraScanResult;
+
+    println!("Ramparts Agent Skill Scan");
+
+    // Strip the `skills:` prefix so the displayed path looks normal.
+    // Multi-root scans produce `skills:[a,b](N files)` — show that
+    // verbatim minus the prefix.
+    let display_url = result.url.strip_prefix("skills:").unwrap_or(&result.url);
+    println!("Path: {}", display_url.blue());
+    println!("Status: {}", format_status(&result.status));
+    println!("Response Time: {}ms", result.response_time_ms);
+    println!(
+        "Timestamp: {}",
+        result.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+
+    if !result.errors.is_empty() {
+        println!("\n{}", "Errors".bold().red());
+        for e in &result.errors {
+            println!("  • {e}");
+        }
+    }
+
+    let prompt_count = result.prompts.len();
+
+    // Findings per-skill: yara_results target_name + prompt-issue prompt_name.
+    let yara_findings: Vec<&YaraScanResult> = result
+        .yara_results
+        .iter()
+        .filter(|y| y.target_type.as_str() == "prompt")
+        .collect();
+
+    let prompt_issues: &[SecurityIssue] = result
+        .security_issues
+        .as_ref()
+        .map_or(&[][..], |s| s.prompt_issues.as_slice());
+
+    let mut total_findings = 0_usize;
+    let mut sev_counts = std::collections::BTreeMap::<String, usize>::new();
+
+    /// Cross-skill findings have semantics that bind to multiple skill
+    /// files at once (collision across paths, etc.). Rendering them
+    /// under a single skill would either duplicate (every colliding
+    /// file shows the same finding) or confuse (only one of N
+    /// colliding files shows it). Carve them out for a dedicated
+    /// section after the per-skill loop.
+    fn is_cross_skill_rule(rule_name: &str) -> bool {
+        matches!(rule_name, "SkillNameCollision")
+    }
+
+    for prompt in &result.prompts {
+        let yara_for_skill: Vec<&&YaraScanResult> = yara_findings
+            .iter()
+            .filter(|y| y.target_name == prompt.name)
+            .filter(|y| !is_cross_skill_rule(&y.rule_name))
+            .collect();
+        let llm_for_skill: Vec<&SecurityIssue> = prompt_issues
+            .iter()
+            .filter(|i| i.prompt_name.as_deref() == Some(&prompt.name))
+            .collect();
+
+        let count = yara_for_skill.len() + llm_for_skill.len();
+        total_findings += count;
+
+        let head = if count == 0 {
+            format!("  {} {}", "✅".green(), prompt.name.bold())
+        } else {
+            format!(
+                "  {} {} ({} finding{})",
+                "⚠️".yellow(),
+                prompt.name.bold(),
+                count,
+                if count == 1 { "" } else { "s" },
+            )
+        };
+        println!("\n{head}");
+
+        // Best-effort source path: heuristic findings carry the path
+        // in `context = "source: <path>"`. Show it under the skill name
+        // so the user can navigate to the file.
+        if let Some(src) = yara_for_skill
+            .iter()
+            .find_map(|y| y.context.strip_prefix("source: "))
+        {
+            println!("    {} {}", "source:".dimmed(), src.dimmed());
+        }
+
+        for y in &yara_for_skill {
+            let sev = y
+                .rule_metadata
+                .as_ref()
+                .and_then(|m| m.severity.as_deref())
+                .unwrap_or("INFO")
+                .to_uppercase();
+            *sev_counts.entry(sev.clone()).or_insert(0) += 1;
+            let sev_disp = match sev.as_str() {
+                "CRITICAL" => sev.red().bold(),
+                "HIGH" => sev.yellow().bold(),
+                "MEDIUM" => sev.yellow(),
+                "LOW" => sev.cyan(),
+                _ => sev.normal(),
+            };
+            let owasp = if y.owasp_tags.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [OWASP: {}]",
+                    y.owasp_tags
+                        .iter()
+                        .map(|t| t.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            println!("    [{sev_disp}] {}{owasp}", y.rule_name.bold());
+            if let Some(desc) = y
+                .rule_metadata
+                .as_ref()
+                .and_then(|m| m.description.as_deref())
+            {
+                // Wrap long descriptions; one-paragraph indent so they
+                // sit visually under the rule line.
+                for line in wrap_for_terminal(desc, 90) {
+                    println!("        {line}");
+                }
+            }
+        }
+
+        for issue in &llm_for_skill {
+            let sev = issue.severity.to_uppercase();
+            *sev_counts.entry(sev.clone()).or_insert(0) += 1;
+            let sev_disp = match sev.as_str() {
+                "CRITICAL" => sev.red().bold(),
+                "HIGH" => sev.yellow().bold(),
+                "MEDIUM" => sev.yellow(),
+                "LOW" => sev.cyan(),
+                _ => sev.normal(),
+            };
+            let owasp = if issue.owasp_tags.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [OWASP: {}]",
+                    issue
+                        .owasp_tags
+                        .iter()
+                        .map(|t| t.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            // SecurityIssueType doesn't implement Display, so use Debug
+            // (the variant names like `PromptInjection` are already
+            // user-readable).
+            println!(
+                "    [{sev_disp}] {}{owasp} (LLM)",
+                format!("{:?}", issue.issue_type).bold()
+            );
+            for line in wrap_for_terminal(&issue.message, 90) {
+                println!("        {line}");
+            }
+        }
+    }
+
+    // Cross-skill section — findings that bind to multiple skills,
+    // not any single one (currently just SkillNameCollision; add
+    // future cross-skill rules to `is_cross_skill_rule`).
+    let cross_findings: Vec<&YaraScanResult> = result
+        .yara_results
+        .iter()
+        .filter(|y| y.target_type.as_str() == "prompt" && is_cross_skill_rule(&y.rule_name))
+        .collect();
+    if !cross_findings.is_empty() {
+        println!("\n{}", "Cross-Skill Findings".bold());
+        for y in &cross_findings {
+            let sev = y
+                .rule_metadata
+                .as_ref()
+                .and_then(|m| m.severity.as_deref())
+                .unwrap_or("INFO")
+                .to_uppercase();
+            *sev_counts.entry(sev.clone()).or_insert(0) += 1;
+            total_findings += 1;
+            let sev_disp = match sev.as_str() {
+                "CRITICAL" => sev.red().bold(),
+                "HIGH" => sev.yellow().bold(),
+                "MEDIUM" => sev.yellow(),
+                "LOW" => sev.cyan(),
+                _ => sev.normal(),
+            };
+            let owasp = if y.owasp_tags.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [OWASP: {}]",
+                    y.owasp_tags
+                        .iter()
+                        .map(|t| t.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            println!("  [{sev_disp}] {}{owasp}", y.rule_name.bold());
+            if let Some(desc) = y
+                .rule_metadata
+                .as_ref()
+                .and_then(|m| m.description.as_deref())
+            {
+                for line in wrap_for_terminal(desc, 90) {
+                    println!("      {line}");
+                }
+            }
+        }
+    }
+
+    // Summary line.
+    println!("\n{}", "Summary".bold());
+    println!("  • Skills scanned: {prompt_count}");
+    println!("  • Total findings: {total_findings}");
+    if !sev_counts.is_empty() {
+        let breakdown = sev_counts
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  • Severity:       {breakdown}");
+    }
+
+    // YARA pre-scan summary if present (informational — confirms which
+    // rules ran).
+    if let Some(summary) = result
+        .yara_results
+        .iter()
+        .find(|y| y.rule_name == "YARA_PRE_SCAN_SUMMARY")
+    {
+        if let Some(rules) = &summary.rules_executed {
+            println!("  • YARA rules:    {} executed", rules.len());
+        }
+    }
+}
+
+/// Wrap `text` to lines of at most `width` chars, breaking on word
+/// boundaries. Single-purpose helper for the skill renderer; not
+/// internationalized (skill content is overwhelmingly English in
+/// practice and we don't want a `unicode-segmentation` dep here).
+fn wrap_for_terminal(text: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 fn print_sarif_result(result: &ScanResult) {
