@@ -270,8 +270,11 @@ enum SkillsCommand {
         timeout: Option<u64>,
     },
 
-    /// Discover and scan skills from well-known locations
-    /// (`~/.claude/commands`, `./.claude/commands`).
+    /// Discover and scan skills from well-known locations across supported
+    /// IDE/agent ecosystems (Claude Code, Cursor, Codex, Windsurf, Gemini,
+    /// OpenAI). Walks `~/<dotdir>/{commands,skills}` and the same paths
+    /// under the current workspace. Set `RAMPARTS_SKILL_ROOTS` (comma-
+    /// separated, `~`-expanded) to add extra roots without rebuilding.
     ScanConfig {
         /// Output format (text, table, json, raw, sarif)
         #[arg(long, value_name = "FORMAT")]

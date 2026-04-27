@@ -186,10 +186,26 @@ ramparts skills scan ./.claude/commands --format sarif > skills.sarif
 ```
 
 The parser handles YAML frontmatter (`description`, `argument-hint`,
-`name`) plus a markdown body, treats each skill as an MCP prompt, and
-runs LLM analysis + YARA + OWASP tagging over it. The output flows
-through the same renderers you use for MCP server scans, so SARIF /
-JSON / terminal output works identically.
+`name`, `allowed-tools` in both inline-string and YAML-list shapes)
+plus a markdown body, treats each skill as an MCP prompt, and runs
+LLM analysis + YARA + OWASP tagging over it. On top of that, it
+emits structural findings the regex/LLM pipeline can't see:
+
+- `OverbroadAllowedTools` — bare `Bash`, `Bash(*)`, `Bash(*:*)`, etc.
+- `DataExfiltrationGrant` — `WebFetch` / `WebSearch` / `Fetch` /
+  `Browse` grants that let the skill talk to the network
+- `VagueSkillTrigger` — substantive body with a missing or one-word
+  `description` (easy to mis-invoke)
+- `SkillSensitiveFileReference` — Claude Code `@<path>` references
+  pointing at SSH/AWS/GnuPG/kube/docker credentials, `.env`,
+  `.netrc`, certificates, etc.
+
+`scan-config` walks `~/<dotdir>/{commands,skills}` and the same paths
+under the current workspace for every supported ecosystem (Claude
+Code, Cursor, Codex, Windsurf, Gemini, OpenAI). Add extra roots
+without rebuilding via `RAMPARTS_SKILL_ROOTS=path1,path2,...`. The
+output flows through the same renderers you use for MCP server scans,
+so SARIF / JSON / terminal output works identically.
 
 📖 **[CLI reference](cli.md#skills-command)** for the full flag list and
 supported skill formats.

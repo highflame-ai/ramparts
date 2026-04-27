@@ -99,7 +99,9 @@ ramparts scan-config --root ./ide-configs
 # Scan a single skill file or every *.md skill under a directory
 ramparts skills scan ./.claude/commands
 
-# Discover skills from well-known locations (~/.claude/commands, ./.claude/commands)
+# Discover skills across supported ecosystems (Claude Code, Cursor,
+# Codex, Windsurf, Gemini) at the user and workspace level. Add extra
+# roots with RAMPARTS_SKILL_ROOTS=path1,path2.
 ramparts skills scan-config
 
 # SARIF output for code-scanning ingestion

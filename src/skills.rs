@@ -431,16 +431,58 @@ fn parse_grant_token(token: &str) -> Option<ParsedGrant<'_>> {
 }
 
 /// True when a parsed grant grants unrestricted access to its tool —
-/// either no restriction at all, an empty restriction, or a wildcard.
+/// either no restriction at all, an empty restriction, or a wildcard
+/// pattern that admits any prefix and any arguments.
+///
+/// `*:*` is the sneakiest of the three: it looks like a bounded
+/// `prefix:args` restriction but every part is a wildcard, so a literal
+/// reading admits any command-line. We strip whitespace, split on `:`,
+/// and treat the restriction as unrestricted iff every segment is `*`
+/// or empty. That covers `*`, `* : *`, `*:*`, `*::*`, etc.
 fn is_unrestricted(grant: &ParsedGrant<'_>) -> bool {
     match grant.restriction.as_deref() {
         None => true,
         Some("") => true,
         Some(r) => {
             let collapsed: String = r.split_whitespace().collect();
-            collapsed == "*" || collapsed.is_empty()
+            if collapsed.is_empty() || collapsed == "*" {
+                return true;
+            }
+            collapsed.split(':').all(|seg| seg.is_empty() || seg == "*")
         }
     }
+}
+
+/// Split an `allowed-tools` string into individual grant tokens,
+/// honoring parenthesized restrictions. The naive `split([',', '\n'])`
+/// breaks tokens like `Bash(echo a, b)` mid-paren — both halves then
+/// fail to parse as their original tool, and a real unrestricted grant
+/// slips through. This walker tracks paren depth and only treats commas
+/// or newlines at depth 0 as token boundaries. Negative depth (a stray
+/// closer) is clamped to zero so malformed input still terminates.
+fn split_grant_tokens(grant: &str) -> Vec<&str> {
+    let mut tokens: Vec<&str> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0;
+    for (i, c) in grant.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            ',' | '\n' if depth == 0 => {
+                tokens.push(&grant[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if start <= grant.len() {
+        tokens.push(&grant[start..]);
+    }
+    tokens
 }
 
 /// Detect overbroad `allowed-tools` grants. Splits the grant string on
@@ -466,7 +508,7 @@ fn analyze_allowed_tools(skill_name: &str, path: &Path, grant: &str) -> Vec<Yara
         ));
     };
 
-    for raw in grant.split([',', '\n']) {
+    for raw in split_grant_tokens(grant) {
         let Some(parsed) = parse_grant_token(raw) else {
             continue;
         };
@@ -1422,6 +1464,93 @@ mod tests {
             .heuristic_findings
             .iter()
             .all(|f| f.rule_name != "SkillSensitiveFileReference"));
+    }
+
+    #[test]
+    fn comma_in_paren_restriction_does_not_break_tokenizer() {
+        // `Bash(echo a, b)` contains a comma INSIDE the restriction. A
+        // naive split on commas would shred the token mid-paren and
+        // miss the unrestricted-Bash signal.
+        let raw = "---\ndescription: stub\nallowed-tools: Bash(echo a, b), Read\n---\nbody\n";
+        let parsed = parse_skill_content(&PathBuf::from("commaparen.md"), raw).expect("parse");
+        // The Bash grant has a non-wildcard restriction (`echo a, b`),
+        // so it should NOT fire OverbroadAllowedTools — but more
+        // importantly, the parser should produce a single ParsedGrant
+        // with that restriction intact rather than three half-tokens.
+        // We verify by parsing the grant directly.
+        let toks = split_grant_tokens("Bash(echo a, b), Read");
+        assert_eq!(toks.len(), 2, "got toks={toks:?}");
+        assert!(toks[0].contains("Bash(echo a, b)"));
+        assert!(toks[1].contains("Read"));
+        // No false-positive findings — the comma-inside-paren grant is
+        // bounded enough not to fire.
+        assert!(parsed
+            .heuristic_findings
+            .iter()
+            .all(|f| f.rule_name != "OverbroadAllowedTools"));
+    }
+
+    #[test]
+    fn unrestricted_bash_grant_with_inner_comma_still_fires() {
+        // Variant: unrestricted Bash via `Bash(*)`, with a separate grant
+        // that has a comma inside its restriction. Must not lose the
+        // OverbroadAllowedTools finding for the wildcard grant.
+        let raw = "---\nallowed-tools: Bash(*), WebFetch(https://a.example.com/x,y)\n---\nbody\n";
+        let parsed = parse_skill_content(&PathBuf::from("mixed.md"), raw).expect("parse");
+        let rules: Vec<_> = parsed
+            .heuristic_findings
+            .iter()
+            .map(|f| f.rule_name.as_str())
+            .collect();
+        assert!(
+            rules.contains(&"OverbroadAllowedTools"),
+            "expected OverbroadAllowedTools, got {rules:?}"
+        );
+        assert!(
+            rules.contains(&"DataExfiltrationGrant"),
+            "expected DataExfiltrationGrant, got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn star_colon_star_restriction_is_unrestricted() {
+        // `Bash(*:*)` looks like a bounded prefix:args restriction but
+        // every segment is a wildcard, so it admits any command-line.
+        // The same applies to `* : *` (whitespace) and `*::*` (empty
+        // segment in the middle).
+        for grant in ["Bash(*:*)", "Bash(* : *)", "Bash(*::*)"] {
+            let parsed = parse_grant_token(grant).unwrap();
+            assert!(
+                is_unrestricted(&parsed),
+                "expected `{grant}` to be unrestricted"
+            );
+        }
+        // Sanity: a real bounded grant is still bounded.
+        let bounded = parse_grant_token("Bash(git status:*)").unwrap();
+        assert!(!is_unrestricted(&bounded));
+    }
+
+    #[test]
+    fn star_colon_star_grant_fires_overbroad() {
+        let raw = "---\nallowed-tools: Bash(*:*)\n---\nbody\n";
+        let parsed = parse_skill_content(&PathBuf::from("starcolon.md"), raw).expect("parse");
+        assert!(parsed
+            .heuristic_findings
+            .iter()
+            .any(|f| f.rule_name == "OverbroadAllowedTools"));
+    }
+
+    #[test]
+    fn split_grant_tokens_handles_paren_depth() {
+        // Sanity-check the splitter directly on a few shapes.
+        assert_eq!(
+            split_grant_tokens("Bash(a, b), Read, Write"),
+            vec!["Bash(a, b)", " Read", " Write"]
+        );
+        // Newlines also count as separators.
+        assert_eq!(split_grant_tokens("Bash\nRead"), vec!["Bash", "Read"]);
+        // Stray closing paren — clamp to zero, don't blow up.
+        assert_eq!(split_grant_tokens("Bash), Read"), vec!["Bash)", " Read"]);
     }
 
     #[test]

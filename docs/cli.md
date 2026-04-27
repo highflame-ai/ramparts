@@ -265,10 +265,25 @@ ramparts skills scan ./.claude/commands --format sarif > skills.sarif
 
 ### `skills scan-config`
 
-Discover and scan skills from well-known locations:
+Discover and scan skills from well-known locations across supported
+IDE/agent ecosystems. Both the per-user (`$HOME`) and per-workspace
+(`$CWD`) variants of each ecosystem are walked:
 
-- `~/.claude/commands/` — Claude Code user-level slash commands
-- `./.claude/commands/` — workspace-level slash commands
+- `.claude/commands/`, `.claude/skills/` — Claude Code
+- `.cursor/commands/`, `.cursor/skills/` — Cursor
+- `.codex/commands/`, `.codex/skills/` — OpenAI Codex
+- `.windsurf/commands/` — Windsurf
+- `.gemini/commands/` — Gemini
+- `.openai/commands/` — generic OpenAI agent skills
+
+Add extra roots without rebuilding via the `RAMPARTS_SKILL_ROOTS`
+environment variable (comma-separated paths; leading `~/` is expanded
+to `$HOME`):
+
+```bash
+export RAMPARTS_SKILL_ROOTS="~/work/agent-skills,/srv/shared-skills"
+ramparts skills scan-config
+```
 
 **Options** (same as `scan`):
 ```bash
@@ -313,6 +328,22 @@ skills are:
   stated description
 - **MCP03 — Excessive Agency**: skills that assert elevated privileges
 - **MCP06 / MCP09**: secrets / PII / sensitive-data exposure
+
+In addition to the YARA pre-scan and LLM analysis, the parser emits
+structural findings the regex/LLM pipeline can't see:
+
+- **OverbroadAllowedTools** (MCP03): an `allowed-tools` grant gives
+  unrestricted code execution — bare `Bash`, `Bash(*)`, `Bash(*:*)`,
+  bare `*`, `rm:*`, `sudo:*`, etc.
+- **DataExfiltrationGrant** (MCP06 + MCP09): a `WebFetch` /
+  `WebSearch` / `Fetch` / `Browse` grant — flagged informationally so
+  the operator knows the skill talks to the network.
+- **VagueSkillTrigger** (MCP02 + MCP03): a substantive skill body
+  with a missing or one-word `description` — easy to mis-invoke.
+- **SkillSensitiveFileReference** (MCP06 + MCP09): the body uses
+  Claude Code's `@<path>` syntax to inline a sensitive file
+  (SSH/AWS/GnuPG/kube/docker credentials, `.env`, `.netrc`,
+  `.npmrc`, `.pypirc`, certificates) into the prompt context.
 
 ## Replay Command
 
