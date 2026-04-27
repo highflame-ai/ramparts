@@ -510,13 +510,13 @@ async fn handle_skills_command(
             report,
             timeout,
         } => {
-            let roots = skills::default_discovery_roots();
+            let candidates = skills::default_discovery_roots();
             let existing: Vec<std::path::PathBuf> =
-                roots.into_iter().filter(|p| p.exists()).collect();
+                candidates.iter().filter(|p| p.exists()).cloned().collect();
             if existing.is_empty() {
                 error!(
                     "No skill discovery roots found. Looked at: {}",
-                    skills::default_discovery_roots()
+                    candidates
                         .iter()
                         .map(|p| p.display().to_string())
                         .collect::<Vec<_>>()
@@ -590,17 +590,38 @@ async fn handle_skills_scan_command(
     // YARA pre-scan over the discovered skill prompts. We use the
     // middleware-chain plumbing the live scanners share so OWASP tagging
     // and result formatting behave identically.
+    //
+    // Note: we deliberately don't run post-scan YARA or the cross-origin
+    // scanner here. Post-scan rules are stateful summaries the live MCP
+    // path emits over a richer scan_data; cross-origin needs URLs that
+    // skills don't have. Pre-scan covers the prompt-injection / autonomy
+    // / capability-inflation rules ported from upstream.
     #[cfg(feature = "yara-x-scanning")]
     {
         use scanner::ScanPhase;
         let mut scan_data = scanner::ScanData::new();
-        scan_data.prompts = result.prompts.clone();
-        if let Ok(yara) = scanner::YaraScanner::new("rules", ScanPhase::PreScan) {
-            let mut chain = scanner::ScannerChain::new();
-            chain.add(Box::new(yara));
-            chain.run_pre_scan(&mut scan_data);
-            result.yara_results.extend(scan_data.yara_results);
+        // Move the prompts into scan_data to avoid cloning the body of
+        // every skill (large skill repos can have hundreds of files);
+        // we move them back out after the YARA pass so the LLM analyzer
+        // and the final renderer see the same prompt set.
+        scan_data.prompts = std::mem::take(&mut result.prompts);
+        match scanner::YaraScanner::new("rules", ScanPhase::PreScan) {
+            Ok(yara) => {
+                let mut chain = scanner::ScannerChain::new();
+                chain.add(Box::new(yara));
+                chain.run_pre_scan(&mut scan_data);
+                result
+                    .yara_results
+                    .extend(std::mem::take(&mut scan_data.yara_results));
+            }
+            Err(e) => {
+                // Surface this loudly: a missing or unreadable rules
+                // directory means half the scanner's coverage silently
+                // doesn't run, which would mask findings.
+                warn!("Skipping YARA pre-scan for skills (rules dir unreadable): {e}");
+            }
         }
+        result.prompts = std::mem::take(&mut scan_data.prompts);
     }
 
     // Run the existing security analyzer over the prompt set. We reuse the
