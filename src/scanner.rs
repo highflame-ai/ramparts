@@ -2190,7 +2190,7 @@ pub(crate) struct ScanData {
 
 // Scan data implementation
 impl ScanData {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             server_info: None,
             tools: Vec::new(),

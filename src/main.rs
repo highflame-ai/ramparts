@@ -18,6 +18,7 @@ mod sarif;
 mod scanner;
 mod security;
 mod server;
+mod skills;
 mod taxonomy;
 mod tls;
 
@@ -229,6 +230,61 @@ enum Commands {
         #[arg(long, value_name = "FORMAT")]
         format: Option<String>,
     },
+
+    /// Scan AI agent skills (Claude Code commands, etc.) for security issues.
+    ///
+    /// Skills are markdown files containing prompt instructions an agent
+    /// loads and executes by name. ramparts parses each skill's frontmatter
+    /// and body, treats it as an MCP prompt, and runs the same security
+    /// pipeline (LLM analysis, YARA, OWASP tagging) used for live MCP
+    /// servers. No network calls — pure static analysis on disk.
+    Skills(SkillsArgs),
+}
+
+/// Arguments for the `skills` subcommand. Wrapped in its own struct so the
+/// nested subcommand can have its own flags without ballooning `Commands`.
+#[derive(clap::Args, Debug)]
+struct SkillsArgs {
+    #[command(subcommand)]
+    command: SkillsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillsCommand {
+    /// Scan a single skill file or every `*.md` skill under a directory.
+    Scan {
+        /// Path to a skill file or a directory containing skill files.
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
+
+        /// Output format (text, table, json, raw, sarif)
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
+
+        /// Generate a detailed markdown report
+        #[arg(long)]
+        report: bool,
+
+        /// Overall scan timeout in seconds
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+    },
+
+    /// Discover and scan skills from well-known locations
+    /// (`~/.claude/commands`, `./.claude/commands`).
+    ScanConfig {
+        /// Output format (text, table, json, raw, sarif)
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
+
+        /// Generate a detailed markdown report
+        #[arg(long)]
+        report: bool,
+
+        /// Overall scan timeout in seconds
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+    },
 }
 
 #[tokio::main]
@@ -273,6 +329,11 @@ fn should_display_banner(command: &Commands) -> bool {
         Commands::Scan { format, .. }
         | Commands::ScanConfig { format, .. }
         | Commands::Replay { format, .. } => format.as_deref(),
+        Commands::Skills(args) => match &args.command {
+            SkillsCommand::Scan { format, .. } | SkillsCommand::ScanConfig { format, .. } => {
+                format.as_deref()
+            }
+        },
         _ => None,
     };
     !matches!(
@@ -427,7 +488,162 @@ async fn execute_command(
         Commands::McpSse { host, port } => handle_mcp_sse_command(host, port).await,
         Commands::McpHttp { host, port } => handle_mcp_http_command(host, port).await,
         Commands::Replay { input, format } => handle_replay_command(input, format, &scanner_config),
+        Commands::Skills(args) => handle_skills_command(args, &scanner_config).await,
     }
+}
+
+/// Dispatcher for the `skills` namespace.
+async fn handle_skills_command(
+    args: SkillsArgs,
+    scanner_config: &ScannerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        SkillsCommand::Scan {
+            path,
+            format,
+            report,
+            timeout,
+            ..
+        } => handle_skills_scan_command(vec![path], format, report, timeout, scanner_config).await,
+        SkillsCommand::ScanConfig {
+            format,
+            report,
+            timeout,
+        } => {
+            let roots = skills::default_discovery_roots();
+            let existing: Vec<std::path::PathBuf> =
+                roots.into_iter().filter(|p| p.exists()).collect();
+            if existing.is_empty() {
+                error!(
+                    "No skill discovery roots found. Looked at: {}",
+                    skills::default_discovery_roots()
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                std::process::exit(1);
+            }
+            handle_skills_scan_command(existing, format, report, timeout, scanner_config).await
+        }
+    }
+}
+
+/// Convert one or more skill paths into a synthetic `ScanResult` and run
+/// the existing prompt-security pipeline over it.
+///
+/// Skills are routed through `MCPPrompt` (frontmatter description + body
+/// concatenated into `description`) so every downstream check — LLM
+/// analysis, YARA pre/post scan, OWASP taxonomy tagging, terminal /
+/// JSON / SARIF rendering — runs without any new plumbing.
+async fn handle_skills_scan_command(
+    roots: Vec<std::path::PathBuf>,
+    format: Option<String>,
+    report: bool,
+    timeout: Option<u64>,
+    scanner_config: &ScannerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output_format = format.unwrap_or(scanner_config.scanner.format.clone());
+
+    // Collect skill files from every root. A root may be a single file or
+    // a directory we walk recursively.
+    let mut skill_paths: Vec<std::path::PathBuf> = Vec::new();
+    for root in &roots {
+        if root.is_file() {
+            skill_paths.push(root.clone());
+        } else if root.is_dir() {
+            match skills::discover_skills_in_root(root) {
+                Ok(found) => skill_paths.extend(found),
+                Err(e) => warn!("Skipping skill root {}: {e}", root.display()),
+            }
+        } else {
+            warn!("Skill path not found: {}", root.display());
+        }
+    }
+
+    if skill_paths.is_empty() {
+        error!("No skill files found in: {:?}", roots);
+        std::process::exit(1);
+    }
+
+    debug!("Found {} skill file(s) to scan", skill_paths.len());
+
+    let prompts: Vec<types::MCPPrompt> = skill_paths
+        .iter()
+        .filter_map(|p| skills::parse_skill_file(p))
+        .collect();
+
+    if prompts.is_empty() {
+        error!("All discovered skill files failed to parse");
+        std::process::exit(1);
+    }
+
+    let scan_timer = utils::Timer::start();
+    let display_url = if roots.len() == 1 {
+        format!("skills:{}", roots[0].display())
+    } else {
+        format!("skills:{}", skill_paths.len())
+    };
+    let mut result = types::ScanResult::new(display_url);
+    result.prompts = prompts;
+
+    // YARA pre-scan over the discovered skill prompts. We use the
+    // middleware-chain plumbing the live scanners share so OWASP tagging
+    // and result formatting behave identically.
+    #[cfg(feature = "yara-x-scanning")]
+    {
+        use scanner::ScanPhase;
+        let mut scan_data = scanner::ScanData::new();
+        scan_data.prompts = result.prompts.clone();
+        if let Ok(yara) = scanner::YaraScanner::new("rules", ScanPhase::PreScan) {
+            let mut chain = scanner::ScannerChain::new();
+            chain.add(Box::new(yara));
+            chain.run_pre_scan(&mut scan_data);
+            result.yara_results.extend(scan_data.yara_results);
+        }
+    }
+
+    // Run the existing security analyzer over the prompt set. We reuse the
+    // batch analyzer so LLM batching, OWASP tagging, and result accounting
+    // all behave the same as for live MCP scans.
+    let security_scanner = if scanner_config.security.enabled {
+        security::SecurityScanner::with_config(scanner_config.clone())
+    } else {
+        security::SecurityScanner::default()
+    };
+    let mut security_result = security::SecurityScanResult::new();
+
+    // LLM analysis — applies the prompt batch scanner to skill bodies.
+    // Bounded by the user-supplied timeout when set; otherwise the default
+    // from config.
+    let scan_timeout =
+        std::time::Duration::from_secs(timeout.unwrap_or(scanner_config.scanner.scan_timeout));
+    match tokio::time::timeout(
+        scan_timeout,
+        security_scanner.scan_prompts_batch(&result.prompts, scanner_config.scanner.detailed),
+    )
+    .await
+    {
+        Ok(Ok(prompt_issues)) => security_result.add_prompt_issues(prompt_issues),
+        Ok(Err(e)) => warn!("Skill LLM analysis failed: {e}"),
+        Err(_) => warn!(
+            "Skill LLM analysis timed out after {}s",
+            scan_timeout.as_secs()
+        ),
+    }
+    result.security_issues = Some(security_result);
+    result.response_time_ms = scan_timer.elapsed_ms();
+
+    utils::print_result(&result, &output_format, scanner_config.scanner.detailed);
+
+    if report {
+        match utils::write_markdown_report(&[result]) {
+            Ok(filename) => println!("\n📄 Detailed report generated: {filename}"),
+            Err(e) => warn!("Failed to generate report: {e}"),
+        }
+    }
+
+    Ok(())
 }
 
 /// Read a previously-emitted scan result JSON file and re-emit it through
