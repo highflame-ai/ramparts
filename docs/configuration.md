@@ -291,6 +291,28 @@ export RAMPARTS_LOGGING_LEVEL="debug"
 export RAMPARTS_SCANNER_ENABLE_YARA="false"
 ```
 
+### 3. Skill Discovery Roots
+
+`ramparts skills scan-config` walks `~/<dotdir>/{commands,skills}` and
+the same paths under the current workspace for the supported
+ecosystems (`.claude`, `.cursor`, `.codex`, `.windsurf`, `.gemini`,
+`.openai`). Operators can add extra roots without rebuilding via the
+**`RAMPARTS_SKILL_ROOTS`** environment variable:
+
+```bash
+# Comma-separated list of paths; leading `~/` is expanded to $HOME.
+# Other tilde forms (~user/) are not expanded — use absolute paths.
+export RAMPARTS_SKILL_ROOTS="~/work/agent-skills,/srv/shared-skills"
+ramparts skills scan-config
+```
+
+The env-var roots are walked in addition to the default per-ecosystem
+locations (not instead of them). The trust model is the same as
+`ramparts skills scan <PATH>`: anyone who can set the env var can
+point the scanner at any directory the running user can read.
+Duplicate paths across env-var entries and defaults are deduped at
+scan time by canonical path, so overlapping entries are harmless.
+
 ## YARA-X Configuration
 
 ### Enabling/Disabling YARA
