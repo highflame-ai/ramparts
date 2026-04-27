@@ -699,6 +699,11 @@ async fn handle_skills_scan_command(
     // from config.
     let scan_timeout =
         std::time::Duration::from_secs(timeout.unwrap_or(scanner_config.scanner.scan_timeout));
+    // On LLM failure or timeout we record the error on the ScanResult (in
+    // addition to logging) so the scan transitions out of `Success`, the
+    // SARIF / JSON / terminal renderers surface the failure, and the
+    // process exit code reflects an incomplete scan. Silently completing
+    // with zero findings would be misleading for a security tool.
     match tokio::time::timeout(
         scan_timeout,
         security_scanner.scan_prompts_batch(&result.prompts, scanner_config.scanner.detailed),
@@ -706,11 +711,19 @@ async fn handle_skills_scan_command(
     .await
     {
         Ok(Ok(prompt_issues)) => security_result.add_prompt_issues(prompt_issues),
-        Ok(Err(e)) => warn!("Skill LLM analysis failed: {e}"),
-        Err(_) => warn!(
-            "Skill LLM analysis timed out after {}s",
-            scan_timeout.as_secs()
-        ),
+        Ok(Err(e)) => {
+            let msg = format!("Skill LLM analysis failed: {e}");
+            warn!("{msg}");
+            result.add_error(msg);
+        }
+        Err(_) => {
+            let msg = format!(
+                "Skill LLM analysis timed out after {}s",
+                scan_timeout.as_secs()
+            );
+            warn!("{msg}");
+            result.add_error(msg);
+        }
     }
     result.security_issues = Some(security_result);
     result.response_time_ms = scan_timer.elapsed_ms();
