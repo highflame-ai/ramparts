@@ -971,11 +971,10 @@ impl MCPScanner {
 
         debug!("Scanning {}", url);
 
-        // Check if this is a STDIO URL and route appropriately
+        // STDIO URLs route through `scan_stdio_url` -> `scan_stdio_server`,
+        // which sets `response_time_ms` itself. Don't overwrite it here.
         if url.starts_with("stdio:") {
-            let mut stdio_result = self.scan_stdio_url(url, options).await?;
-            stdio_result.response_time_ms = scan_timer.elapsed_ms();
-            return Ok(stdio_result);
+            return self.scan_stdio_url(url, options).await;
         }
 
         // Normalize URL with error context for HTTP URLs
@@ -1166,8 +1165,7 @@ impl MCPScanner {
                     // Update result with any post-scan changes
                     result.yara_results.clone_from(&scan_data.yara_results);
 
-                    result.response_time_ms = scan_timer.elapsed_ms();
-                    debug!("Scan completed in {}ms", result.response_time_ms);
+                    debug!("Scan completed in {}ms", scan_timer.elapsed_ms());
                 }
             }
             Err(e) => {
@@ -1177,6 +1175,9 @@ impl MCPScanner {
             }
         }
 
+        // Record total scan duration on both the success and failure paths so
+        // failed scans no longer report `0ms`.
+        result.response_time_ms = scan_timer.elapsed_ms();
         Ok(result)
     }
 
