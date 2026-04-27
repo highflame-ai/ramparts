@@ -120,10 +120,19 @@ pub fn print_result(result: &ScanResult, format: &str, detailed: bool) {
         "table" => print_table_result(result, detailed),
         "text" => print_text_result(result),
         "raw" => print_raw_json_result(result),
+        "sarif" => print_sarif_result(result),
         _ => {
             eprintln!("Unknown format: {format}. Using table format.");
             print_table_result(result, detailed);
         }
+    }
+}
+
+fn print_sarif_result(result: &ScanResult) {
+    let log = crate::sarif::scan_result_to_sarif(result);
+    match serde_json::to_string_pretty(&log) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("Error serializing SARIF: {e}"),
     }
 }
 
@@ -912,6 +921,15 @@ fn print_table_result(result: &ScanResult, detailed: bool) {
                     println!("  Rule: {} (MEDIUM)", yara_result.rule_name);
                 }
 
+                if !yara_result.owasp_tags.is_empty() {
+                    let ids: Vec<&str> = yara_result
+                        .owasp_tags
+                        .iter()
+                        .map(|t| t.id.as_str())
+                        .collect();
+                    println!("  OWASP MCP Top 10: {}", ids.join(", "));
+                }
+
                 if let Some(matched_text) = &yara_result.matched_text {
                     println!("  Matched: {matched_text}");
                 }
@@ -1248,10 +1266,19 @@ pub fn print_multi_server_results(results: &[ScanResult], format: &str, detailed
         "table" => print_multi_server_tree(results, detailed),
         "text" => print_multi_server_text(results),
         "raw" => print_multi_server_raw_json(results),
+        "sarif" => print_multi_server_sarif(results),
         _ => {
             eprintln!("Unknown format: {format}. Using tree view format.");
             print_multi_server_tree(results, detailed);
         }
+    }
+}
+
+fn print_multi_server_sarif(results: &[ScanResult]) {
+    let log = crate::sarif::scan_results_to_sarif(results);
+    match serde_json::to_string_pretty(&log) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("Error serializing SARIF: {e}"),
     }
 }
 

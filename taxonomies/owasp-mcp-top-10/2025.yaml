@@ -1,0 +1,71 @@
+# OWASP MCP Top 10 (2025 — draft)
+#
+# This file is the canonical, versioned definition of the threat taxonomy
+# Ramparts uses to tag findings. The official OWASP MCP Top 10 is still
+# being ratified; this file ships the working list Ramparts maps against
+# today and is pinned to its version key. When the official list lands,
+# add a new file (e.g. `2026.yaml`) and migrate rule mappings explicitly
+# rather than editing this file in place.
+version: "2025-draft"
+title: "OWASP MCP Top 10 (2025 draft)"
+url: "https://owasp.org/www-project-mcp-top-10/"
+items:
+  - id: MCP01
+    name: Prompt Injection
+    description: >-
+      Tools, prompts, or resources contain instructions that attempt to
+      override the user's intent or coerce the agent into unsafe actions.
+      Includes both direct injection in tool descriptions and indirect
+      injection via fetched data.
+  - id: MCP02
+    name: Tool Poisoning
+    description: >-
+      A previously-approved tool's name, description, or input schema has
+      been silently modified to introduce hidden behavior or expand its
+      effective capability. Hashed-pinning detection (see ramparts#97)
+      maps to this category.
+  - id: MCP03
+    name: Excessive Agency
+    description: >-
+      The MCP server exposes capabilities (write, exec, system control)
+      far beyond what the agent's task requires, increasing blast radius
+      of any successful prompt injection or tool poisoning.
+  - id: MCP04
+    name: Insecure Tool Output Handling
+    description: >-
+      Tool outputs (paths, filenames, returned data) are not properly
+      validated or sanitized, enabling path traversal, file disclosure,
+      or downstream injection in agents that consume the output.
+  - id: MCP05
+    name: Cross-Origin Tool Confusion
+    description: >-
+      Tools, resources, or prompts span multiple unrelated domains/origins
+      in a single agent context, enabling cross-origin escalation, data
+      exfiltration via mismatched-origin tool chains, or schema spoofing.
+  - id: MCP06
+    name: Credential and Secret Leakage
+    description: >-
+      Tools handle, return, or are configured with secrets (API keys,
+      tokens, passwords, private keys) without proper redaction or scope
+      restriction.
+  - id: MCP07
+    name: Command and SQL Injection
+    description: >-
+      Tool input schemas accept free-form strings that are passed directly
+      to system commands, shells, or SQL queries without sanitization.
+  - id: MCP08
+    name: Authentication and Authorization Bypass
+    description: >-
+      Tools that access protected resources without enforcing authentication,
+      or tools that allow privilege escalation via parameter manipulation.
+  - id: MCP09
+    name: Sensitive Data Exposure
+    description: >-
+      Tools or resources expose PII, internal data, or other sensitive
+      information beyond what the calling agent or downstream user needs.
+  - id: MCP10
+    name: Supply Chain
+    description: >-
+      Risks introduced by the MCP server itself: untrusted package source,
+      unpinned versions, environment-variable leakage in the launch
+      command, or risky shell/interpreter invocations.

@@ -1,4 +1,5 @@
 use crate::security::SecurityScanResult;
+use crate::taxonomy::OwaspTag;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,11 @@ pub struct YaraScanResult {
     pub context: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_metadata: Option<YaraRuleMetadata>,
+    /// OWASP MCP Top 10 categories this finding maps to. Populated from the
+    /// rule name via `taxonomy::tags_for_yara_rule`. Empty when no mapping
+    /// exists yet for the rule — the finding is still reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owasp_tags: Vec<OwaspTag>,
     // Execution summary fields (when target_type is "summary")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
@@ -504,6 +510,7 @@ mod tests {
             matched_text: Some("matched content".to_string()),
             context: "test context".to_string(),
             rule_metadata: None,
+            owasp_tags: Vec::new(),
             phase: Some("pre-scan".to_string()),
             rules_executed: Some(vec![
                 "secrets_leakage:SecretsLeakage".to_string(),

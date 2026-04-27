@@ -670,6 +670,7 @@ impl YaraScanner {
             matched_text: None,
             context: generate_context_message(T::item_type(), &match_info.rule_name),
             rule_metadata: match_info.metadata.clone(),
+            owasp_tags: crate::taxonomy::tags_for_yara_rule(&match_info.rule_name),
             phase: None,
             rules_executed: None,
             security_issues_detected: None,
@@ -757,6 +758,7 @@ impl Scanner for YaraScanner {
                         stats.pre_scan_count, total_items
                     ),
                     rule_metadata: None,
+                    owasp_tags: Vec::new(),
                     phase: Some("pre-scan".to_string()),
                     rules_executed: if stats.pre_scan_rules.is_empty() {
                         None
@@ -860,6 +862,7 @@ impl Scanner for YaraScanner {
                         stats.post_scan_count, total_items
                     ),
                     rule_metadata: None,
+                    owasp_tags: Vec::new(),
                     phase: Some("post-scan".to_string()),
                     rules_executed: if stats.post_scan_rules.is_empty() {
                         None
@@ -1368,10 +1371,28 @@ impl MCPScanner {
     }
 
     /// Scan MCP servers from IDE configuration files
-    /// Scan configuration files grouped by IDE  
+    /// Scan configuration files grouped by IDE
     pub async fn scan_config_by_ide(&self, options: ScanOptions) -> Result<Vec<ScanResult>> {
-        let config_manager = MCPConfigManager::new();
+        self.scan_config_by_ide_inner(MCPConfigManager::new(), options)
+            .await
+    }
 
+    /// Scan MCP servers discovered by walking a user-supplied root directory
+    /// (e.g. a checked-in repo of IDE configs). See ramparts#51.
+    pub async fn scan_config_in_root(
+        &self,
+        root: &Path,
+        options: ScanOptions,
+    ) -> Result<Vec<ScanResult>> {
+        self.scan_config_by_ide_inner(MCPConfigManager::with_root(root), options)
+            .await
+    }
+
+    async fn scan_config_by_ide_inner(
+        &self,
+        config_manager: MCPConfigManager,
+        options: ScanOptions,
+    ) -> Result<Vec<ScanResult>> {
         if !config_manager.has_config_files() {
             return Err(anyhow!("No MCP IDE configuration files found"));
         }
@@ -1514,6 +1535,7 @@ impl MCPScanner {
                             matched_text: None,
                             context: generate_context_message("server", &m.rule_name),
                             rule_metadata: m.metadata.clone(),
+                            owasp_tags: crate::taxonomy::tags_for_yara_rule(&m.rule_name),
                             phase: Some("pre-config".to_string()),
                             rules_executed: None,
                             security_issues_detected: None,
@@ -1554,6 +1576,7 @@ impl MCPScanner {
                                 confidence: Some("MEDIUM".to_string()),
                                 tags: vec!["baseline".to_string()],
                             }),
+                            owasp_tags: crate::taxonomy::tags_for_yara_rule("MCPConfigChanged"),
                             phase: Some("pre-config".to_string()),
                             rules_executed: None,
                             security_issues_detected: None,

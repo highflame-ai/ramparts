@@ -1,0 +1,159 @@
+//! OWASP MCP Top 10 taxonomy mapping.
+//!
+//! Tags ramparts findings with their OWASP MCP Top 10 category so consumers
+//! (terminal output, JSON, SARIF, the markdown report) can group and
+//! prioritize findings against a recognized framework.
+//!
+//! The taxonomy itself lives in `taxonomies/owasp-mcp-top-10/<version>.yaml`.
+//! Mappings from finding identifiers to taxonomy IDs are intentionally kept
+//! in code (rather than per-rule YAML metadata) for now so we have one file
+//! to audit when the OWASP list is refreshed. See ramparts#101.
+//!
+//! When the OWASP MCP Top 10 publishes a stable revision, add a new YAML
+//! file with the new version key and update the constants below; we never
+//! mutate published mappings in place so existing tagged findings remain
+//! interpretable.
+
+use crate::security::SecurityIssueType;
+use serde::{Deserialize, Serialize};
+
+/// The current taxonomy version Ramparts emits. Bumped explicitly when we
+/// adopt a new OWASP MCP Top 10 revision so consumers can treat the change
+/// as a deliberate upgrade.
+pub const CURRENT_TAXONOMY_VERSION: &str = "2025-draft";
+
+/// A reference to a single OWASP MCP Top 10 entry. Designed to be cheap to
+/// clone and friendly to serde so it can be embedded directly in finding
+/// types and propagate into JSON / SARIF / markdown outputs without any
+/// extra plumbing. We use `String` rather than `&'static str` so the type
+/// implements `Deserialize` (consumers may round-trip our JSON output back
+/// through serde); the strings are short and the per-finding clone cost is
+/// negligible relative to the rest of a scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwaspTag {
+    pub id: String,
+    pub version: String,
+}
+
+impl OwaspTag {
+    pub fn new(id: &'static str) -> Self {
+        Self {
+            id: id.to_string(),
+            version: CURRENT_TAXONOMY_VERSION.to_string(),
+        }
+    }
+}
+
+/// Map an LLM-detected `SecurityIssueType` to the OWASP MCP Top 10 entries
+/// it belongs to. A single issue can map to multiple categories; e.g.
+/// `SecretsLeakage` is both credential leakage (MCP06) and a sensitive-data
+/// exposure (MCP09).
+pub fn tags_for_security_issue(issue: SecurityIssueType) -> Vec<OwaspTag> {
+    use SecurityIssueType::*;
+    match issue {
+        ToolPoisoning => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
+        SQLInjection | CommandInjection => vec![OwaspTag::new("MCP07")],
+        PathTraversal => vec![OwaspTag::new("MCP04")],
+        AuthBypass => vec![OwaspTag::new("MCP08")],
+        PromptInjection => vec![OwaspTag::new("MCP01")],
+        Jailbreak => vec![OwaspTag::new("MCP01"), OwaspTag::new("MCP03")],
+        PIILeakage => vec![OwaspTag::new("MCP09")],
+        SecretsLeakage => vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")],
+    }
+}
+
+/// Map a YARA rule name (the value returned by yara-x's `Rule::identifier`)
+/// to OWASP MCP Top 10 entries. Rule names not listed here are returned as
+/// an empty Vec rather than an error — better to have a finding without
+/// taxonomy tags than to drop the finding because we forgot to map a new
+/// rule. Untagged findings are also useful telemetry: they tell us which
+/// rules need taxonomy entries added.
+pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
+    match rule_name {
+        // secrets_leakage.yar
+        "SecretsLeakage" | "EnvironmentVariableLeakage" => {
+            vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
+        }
+        "SSHKeyExposure" | "PEMFileAccess" => vec![OwaspTag::new("MCP06")],
+
+        // command_injection.yar
+        "CommandInjection" => vec![OwaspTag::new("MCP07")],
+
+        // sql_injection.yar
+        "SQLInjection" => vec![OwaspTag::new("MCP07")],
+
+        // path_traversal.yar
+        "PathTraversalVulnerability" => vec![OwaspTag::new("MCP04")],
+
+        // mcp_config_risk.yar
+        "MCPConfigRisk" => vec![OwaspTag::new("MCP10"), OwaspTag::new("MCP07")],
+
+        // Synthetic rule emitted by the baseline-diff check when a previously
+        // approved server's command/args/env fingerprint changes.
+        "MCPConfigChanged" => vec![OwaspTag::new("MCP02")],
+
+        // cross_origin_escalation.yar + the in-process cross-origin scanner
+        "CrossOriginEscalation"
+        | "CrossDomainContamination"
+        | "DomainOutlier"
+        | "MixedSecuritySchemes" => vec![OwaspTag::new("MCP05")],
+
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_security_issue_type_has_at_least_one_tag() {
+        use SecurityIssueType::*;
+        let all = [
+            ToolPoisoning,
+            SQLInjection,
+            CommandInjection,
+            PathTraversal,
+            AuthBypass,
+            PromptInjection,
+            Jailbreak,
+            PIILeakage,
+            SecretsLeakage,
+        ];
+        for issue in all {
+            assert!(
+                !tags_for_security_issue(issue).is_empty(),
+                "SecurityIssueType::{issue:?} has no OWASP tags — every \
+                 detection class should map to at least one Top 10 entry"
+            );
+        }
+    }
+
+    #[test]
+    fn known_yara_rules_have_tags() {
+        for name in [
+            "SecretsLeakage",
+            "EnvironmentVariableLeakage",
+            "SSHKeyExposure",
+            "PEMFileAccess",
+            "CommandInjection",
+            "SQLInjection",
+            "PathTraversalVulnerability",
+            "MCPConfigRisk",
+            "CrossOriginEscalation",
+            "CrossDomainContamination",
+            "DomainOutlier",
+            "MixedSecuritySchemes",
+        ] {
+            assert!(
+                !tags_for_yara_rule(name).is_empty(),
+                "YARA rule {name} should be tagged"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_yara_rule_returns_empty_not_panic() {
+        assert!(tags_for_yara_rule("totally-made-up-rule").is_empty());
+    }
+}

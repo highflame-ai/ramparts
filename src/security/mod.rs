@@ -174,6 +174,12 @@ pub struct SecurityIssue {
     pub details: Option<String>,
     pub severity: String,
     pub message: String,
+    /// OWASP MCP Top 10 categories this issue maps to. Derived from
+    /// `issue_type` via `taxonomy::tags_for_security_issue`. Always populated
+    /// at construction (every `SecurityIssueType` has at least one entry —
+    /// enforced by a unit test in `taxonomy.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owasp_tags: Vec<crate::taxonomy::OwaspTag>,
 }
 
 impl SecurityIssue {
@@ -188,6 +194,7 @@ impl SecurityIssue {
             details: None,
             severity: issue_type.default_severity().to_string(),
             message,
+            owasp_tags: crate::taxonomy::tags_for_security_issue(issue_type),
         }
     }
 }

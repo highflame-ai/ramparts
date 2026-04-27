@@ -13,9 +13,11 @@ mod core;
 mod integration_tests;
 mod mcp_client;
 mod mcp_server;
+mod sarif;
 mod scanner;
 mod security;
 mod server;
+mod taxonomy;
 mod tls;
 
 mod types;
@@ -146,6 +148,13 @@ enum Commands {
         /// Per-HTTP-request timeout in seconds. Overrides `scanner.http_timeout` from config.yaml.
         #[arg(long, value_name = "SECONDS")]
         http_timeout: Option<u64>,
+
+        /// Walk this directory (e.g. a checked-in repo of IDE configs) for MCP
+        /// configuration files instead of looking at the user's home/IDE
+        /// locations. Recursive; symlinks are not followed; common build
+        /// directories like .git, node_modules, target are skipped.
+        #[arg(long, value_name = "PATH")]
+        root: Option<std::path::PathBuf>,
     },
 
     /// Generate a default config.yaml file
@@ -202,8 +211,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cli = Cli::parse();
-    // Do not print banner when running as stdio MCP server to avoid corrupting JSON-RPC stdout
-    if !matches!(cli.command, Commands::McpStdio) {
+    // Do not print the banner when:
+    //   - running as stdio MCP server (would corrupt JSON-RPC stdout), or
+    //   - emitting a machine-readable scan format (json/raw/sarif), since
+    //     downstream tools like `jq`, GitHub code-scanning's SARIF
+    //     uploader, etc. parse our stdout and choke on free-form text.
+    if should_display_banner(&cli.command) {
         display_banner();
     }
 
@@ -215,6 +228,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     execute_command(cli, scanner_config, scanner).await?;
 
     Ok(())
+}
+
+/// Whether to print the welcome banner for the current command. Suppresses
+/// it for the stdio MCP server (would corrupt JSON-RPC framing) and for
+/// scan commands that produce machine-readable output.
+fn should_display_banner(command: &Commands) -> bool {
+    if matches!(command, Commands::McpStdio) {
+        return false;
+    }
+    let format = match command {
+        Commands::Scan { format, .. } | Commands::ScanConfig { format, .. } => format.as_deref(),
+        _ => None,
+    };
+    !matches!(
+        format.map(str::to_ascii_lowercase).as_deref(),
+        Some("json") | Some("raw") | Some("sarif")
+    )
 }
 
 /// Loads the scanner configuration, using defaults if loading fails
@@ -336,6 +366,7 @@ async fn execute_command(
             report,
             timeout,
             http_timeout,
+            root,
         } => {
             handle_scan_config_command(
                 auth_headers,
@@ -343,6 +374,7 @@ async fn execute_command(
                 report,
                 timeout,
                 http_timeout,
+                root,
                 &scanner_config,
                 scanner,
             )
@@ -423,6 +455,7 @@ async fn handle_scan_config_command(
     report: bool,
     timeout: Option<u64>,
     http_timeout: Option<u64>,
+    root: Option<std::path::PathBuf>,
     scanner_config: &ScannerConfig,
     scanner: Option<MCPScanner>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -442,7 +475,12 @@ async fn handle_scan_config_command(
         .as_ref()
         .expect("Scanner should be initialized for scan-config command");
 
-    match scanner.scan_config_by_ide(options).await {
+    let scan_outcome = match root.as_deref() {
+        Some(root_path) => scanner.scan_config_in_root(root_path, options).await,
+        None => scanner.scan_config_by_ide(options).await,
+    };
+
+    match scan_outcome {
         Ok(results) => {
             utils::print_multi_server_results(
                 &results,
