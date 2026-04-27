@@ -9,7 +9,9 @@ use crate::types::{
     LlmPrompt, MCPPrompt, MCPResource, MCPServerInfo, MCPTool, ScanOptions, ScanResult, ScanStatus,
     YaraScanResult,
 };
-use crate::utils::{error_utils, performance::track_performance, Timer};
+use crate::utils::{
+    error_utils, error_utils::format_error_chain, performance::track_performance, Timer,
+};
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use std::collections::HashMap;
@@ -927,7 +929,7 @@ impl MCPScanner {
             .timeout(Duration::from_secs(http_timeout))
             .user_agent(protocol::USER_AGENT)
             .build()
-            .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
+            .map_err(|e| anyhow!("Failed to create HTTP client: {}", format_error_chain(&e)))?;
 
         // Set up middleware chain with dynamic YARA capabilities
         let mut middleware_chain = ScannerChain::new();
@@ -960,17 +962,19 @@ impl MCPScanner {
             client,
             http_timeout,
             middleware_chain,
-            mcp_client: McpClient::new(),
+            mcp_client: McpClient::with_http_timeout(http_timeout),
         })
     }
 
     /// Scan a single MCP server
     pub async fn scan_single(&self, url: &str, options: ScanOptions) -> Result<ScanResult> {
+        let scan_timer = Timer::start();
         let mut result = ScanResult::new(url.to_string());
 
         debug!("Scanning {}", url);
 
-        // Check if this is a STDIO URL and route appropriately
+        // STDIO URLs route through `scan_stdio_url` -> `scan_stdio_server`,
+        // which sets `response_time_ms` itself. Don't overwrite it here.
         if url.starts_with("stdio:") {
             return self.scan_stdio_url(url, options).await;
         }
@@ -1163,8 +1167,7 @@ impl MCPScanner {
                     // Update result with any post-scan changes
                     result.yara_results.clone_from(&scan_data.yara_results);
 
-                    result.response_time_ms = Timer::start().elapsed_ms(); // Track actual scan time
-                    debug!("Scan completed in {}ms", result.response_time_ms);
+                    debug!("Scan completed in {}ms", scan_timer.elapsed_ms());
                 }
             }
             Err(e) => {
@@ -1174,6 +1177,9 @@ impl MCPScanner {
             }
         }
 
+        // Record total scan duration on both the success and failure paths so
+        // failed scans no longer report `0ms`.
+        result.response_time_ms = scan_timer.elapsed_ms();
         Ok(result)
     }
 
@@ -1198,9 +1204,13 @@ impl MCPScanner {
             Vec::new()
         };
 
-        // Create a temporary server config for the STDIO URL
+        // Create a temporary server config for the STDIO URL. Leaving `name`
+        // unset is intentional: the synthetic `STDIO-<command>` placeholder
+        // pollutes `to_display_url` output with a useless suffix. We restore
+        // the original `stdio_url` on the result below so the user sees the
+        // exact string they typed.
         let server_config = MCPServerConfig {
-            name: Some(format!("STDIO-{command}")),
+            name: None,
             url: None,
             command: Some(command.to_string()),
             args: Some(args),
@@ -1210,8 +1220,9 @@ impl MCPScanner {
             options: None,
         };
 
-        // Use the existing STDIO server scanning method
-        self.scan_stdio_server(&server_config, options).await
+        let mut result = self.scan_stdio_server(&server_config, options).await?;
+        result.url = stdio_url.to_string();
+        Ok(result)
     }
 
     /// Scan a STDIO MCP server using subprocess transport
@@ -1220,6 +1231,7 @@ impl MCPScanner {
         server_config: &MCPServerConfig,
         options: ScanOptions,
     ) -> Result<ScanResult> {
+        let scan_timer = Timer::start();
         let command = server_config
             .command
             .as_ref()
@@ -1232,21 +1244,33 @@ impl MCPScanner {
 
         let mut result = ScanResult::new(display_url.clone());
 
-        // Connect to the STDIO server using the MCP client
-        let session = self
-            .mcp_client
-            .connect_subprocess(command, args, server_config.env.as_ref())
-            .await
-            .map_err(|e| anyhow!("Failed to connect to STDIO server {}: {}", command, e))?;
-
-        // Perform the same MCP scanning pattern as HTTP servers
+        // Wrap the entire connect-and-scan pipeline in `options.timeout` so a
+        // hung subprocess (no MCP handshake response, deadlocked tool, etc.)
+        // can't make the CLI hang forever — same overall budget the HTTP path
+        // gets in `scan_single`.
         let scan_result = track_performance("STDIO MCP server scan", || async {
-            self.perform_scan_with_session(&session, &options).await
+            match timeout(Duration::from_secs(options.timeout), async {
+                let session = self
+                    .mcp_client
+                    .connect_subprocess(command, args, server_config.env.as_ref())
+                    .await
+                    .map_err(|e| anyhow!("Failed to connect to STDIO server {}: {}", command, e))?;
+                let scan_data = self.perform_scan_with_session(&session, &options).await?;
+                Ok::<_, anyhow::Error>((session, scan_data))
+            })
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_) => Err(anyhow!(
+                    "STDIO scan operation timed out after {}s",
+                    options.timeout
+                )),
+            }
         })
         .await;
 
         match scan_result {
-            Ok(mut scan_data) => {
+            Ok((session, mut scan_data)) => {
                 // Apply the same middleware chain as HTTP scanning
                 self.middleware_chain.run_pre_scan(&mut scan_data);
 
@@ -1338,6 +1362,7 @@ impl MCPScanner {
             }
         }
 
+        result.response_time_ms = scan_timer.elapsed_ms();
         Ok(result)
     }
 
@@ -2065,7 +2090,7 @@ impl Clone for MCPScanner {
             client: self.client.clone(),
             http_timeout: self.http_timeout,
             middleware_chain: self.middleware_chain.clone(),
-            mcp_client: McpClient::new(),
+            mcp_client: self.mcp_client.clone(),
         }
     }
 }

@@ -1,7 +1,8 @@
 /// MCP client implementation using the official Rust MCP SDK
 ///
-/// This module provides full MCP protocol support using the official rmcp SDK with
-/// all available transport types: subprocess, SSE, and streamable HTTP.
+/// This module provides full MCP protocol support using the official rmcp SDK
+/// for subprocess and streamable HTTP transports. Streamable HTTP transparently
+/// handles SSE responses, so a separate SSE transport is no longer needed.
 use crate::cache::ToolCache;
 use crate::types::{MCPPrompt, MCPPromptArgument, MCPResource, MCPServerInfo, MCPSession, MCPTool};
 use anyhow::{anyhow, Result};
@@ -13,7 +14,7 @@ use serde_json::{json, Value};
 
 use rmcp::{
     service::RunningService,
-    transport::{SseClientTransport, StreamableHttpClientTransport, TokioChildProcess},
+    transport::{StreamableHttpClientTransport, TokioChildProcess},
     RoleClient, ServiceExt,
 };
 use std::collections::HashMap;
@@ -22,6 +23,11 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+/// Default per-HTTP-request timeout when none is provided. Kept identical to
+/// the previous hardcoded value so existing behavior doesn't change for
+/// callers that haven't started forwarding the configured `http_timeout`.
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+
 /// MCP client using the official Rust MCP SDK with full transport support
 #[derive(Clone)]
 pub struct McpClient {
@@ -29,6 +35,9 @@ pub struct McpClient {
     services: Arc<Mutex<HashMap<String, RunningService<RoleClient, ()>>>>,
     /// Tool cache with TTL support
     tool_cache: ToolCache,
+    /// Per-HTTP-request timeout applied to every reqwest client this McpClient
+    /// builds. Sourced from `ScanOptions::http_timeout`.
+    http_timeout_secs: u64,
 }
 
 #[allow(dead_code)] // Future feature - will be used when cache is integrated
@@ -37,6 +46,16 @@ impl McpClient {
         Self {
             services: Arc::new(Mutex::new(HashMap::new())),
             tool_cache: ToolCache::default(), // 1 hour default TTL
+            http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
+        }
+    }
+
+    /// Create a new MCP client with the given per-HTTP-request timeout.
+    pub fn with_http_timeout(http_timeout_secs: u64) -> Self {
+        Self {
+            services: Arc::new(Mutex::new(HashMap::new())),
+            tool_cache: ToolCache::default(),
+            http_timeout_secs,
         }
     }
 
@@ -45,6 +64,7 @@ impl McpClient {
         Self {
             services: Arc::new(Mutex::new(HashMap::new())),
             tool_cache: ToolCache::new(cache_ttl_seconds),
+            http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
         }
     }
 
@@ -88,9 +108,14 @@ impl McpClient {
 
         HttpClient::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(self.http_timeout_secs))
             .build()
-            .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to build HTTP client: {}",
+                    crate::utils::error_utils::format_error_chain(&e)
+                )
+            })
     }
 
     /// Try to connect using streamable HTTP transport
@@ -101,18 +126,15 @@ impl McpClient {
     ) -> Result<MCPSession> {
         debug!("Attempting streamable HTTP connection to: {}", url);
 
-        // Create streamable HTTP transport using centralized HTTP client factory
-        let transport = if auth_headers.is_some() {
-            let client = self.create_http_client(auth_headers)?;
-            let config =
-                rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig {
-                    uri: url.into(),
-                    ..Default::default()
-                };
-            StreamableHttpClientTransport::with_client(client, config)
-        } else {
-            StreamableHttpClientTransport::from_uri(url)
-        };
+        // Create streamable HTTP transport. The reqwest client carries any
+        // auth/custom headers via `default_headers`; if no auth headers are
+        // provided we still build a default client for consistency.
+        let client = self.create_http_client(auth_headers)?;
+        let config =
+            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                url,
+            );
+        let transport = StreamableHttpClientTransport::with_client(client, config);
 
         // Create the MCP service
         let service = ()
@@ -156,95 +178,6 @@ impl McpClient {
                     map.insert(
                         "transport".to_string(),
                         serde_json::Value::String("streamable-http".to_string()),
-                    );
-                    map
-                },
-            }
-        };
-
-        // Store the service for later use
-        {
-            let mut services = self.services.lock().await;
-            services.insert(url.to_string(), service);
-        }
-
-        let session = MCPSession {
-            server_info: Some(server_info),
-            endpoint_url: url.to_string(),
-            auth_headers: auth_headers.cloned(),
-            session_id: None, // rmcp transports handle sessions internally
-        };
-
-        Ok(session)
-    }
-
-    /// Try to connect using SSE transport
-    async fn try_sse_connection(
-        &self,
-        url: &str,
-        auth_headers: Option<&HashMap<String, String>>,
-    ) -> Result<MCPSession> {
-        debug!("Attempting SSE connection to: {}", url);
-
-        // Create SSE transport using centralized HTTP client factory
-        let transport = if auth_headers.is_some() {
-            debug!("Creating SSE client with auth headers");
-            let client = self.create_http_client(auth_headers)?;
-            let config = rmcp::transport::sse_client::SseClientConfig {
-                sse_endpoint: url.into(),
-                ..Default::default()
-            };
-            SseClientTransport::start_with_client(client, config)
-                .await
-                .map_err(|e| anyhow!("Failed to create SSE transport with auth: {}", e))?
-        } else {
-            SseClientTransport::start(url)
-                .await
-                .map_err(|e| anyhow!("Failed to create SSE transport: {}", e))?
-        };
-
-        // Create the MCP service
-        let service = ()
-            .serve(transport)
-            .await
-            .map_err(|e| anyhow!("Failed to create MCP service via SSE: {}", e))?;
-
-        // Get server information
-        let peer_info = service.peer().peer_info();
-        let server_info = if let Some(init_result) = peer_info {
-            MCPServerInfo {
-                name: init_result.server_info.name.to_string(),
-                version: init_result.server_info.version.to_string(),
-                description: None,
-                capabilities: vec![
-                    "tools".to_string(),
-                    "resources".to_string(),
-                    "prompts".to_string(),
-                ],
-                metadata: {
-                    let mut map = HashMap::new();
-                    map.insert(
-                        "transport".to_string(),
-                        serde_json::Value::String("sse".to_string()),
-                    );
-                    map
-                },
-            }
-        } else {
-            MCPServerInfo {
-                name: "SSE MCP Server".to_string(),
-                version: "Unknown".to_string(),
-                description: Some("Connected via SSE".to_string()),
-                capabilities: vec![
-                    "tools".to_string(),
-                    "resources".to_string(),
-                    "prompts".to_string(),
-                ],
-                metadata: {
-                    let mut map = HashMap::new();
-                    map.insert(
-                        "transport".to_string(),
-                        serde_json::Value::String("sse".to_string()),
                     );
                     map
                 },
@@ -639,25 +572,8 @@ impl McpClient {
             }
         }
 
-        // Step 3: Try rmcp SSE transport (final fallback)
-        match self.try_sse_connection(url, auth_headers.as_ref()).await {
-            Ok(session) => {
-                debug!("rmcp SSE connection established, validating...");
-                if self.validate_session(&session).await {
-                    debug!("rmcp SSE session fully validated - using it");
-                    return Ok(session);
-                } else {
-                    debug!("rmcp SSE session has API issues");
-                    if best_session.is_none() {
-                        best_session = Some(session);
-                    }
-                }
-            }
-            Err(e) => {
-                debug!("rmcp SSE connection failed: {}", e);
-                last_error = Some(e);
-            }
-        }
+        // Note: rmcp 1.x streamable HTTP transparently handles SSE responses,
+        // so a separate SSE fallback step is no longer needed.
 
         // Return best available session or error
         if let Some(session) = best_session.or(partial_session) {
