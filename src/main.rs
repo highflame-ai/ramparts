@@ -191,6 +191,15 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install the aws-lc-rs CryptoProvider as the process-wide default for
+    // rustls 0.23. reqwest 0.13's `rustls` feature relies on a default
+    // provider being available before any HTTPS client is built; in some
+    // environments the implicit auto-init races or fails, surfacing as the
+    // opaque `reqwest::Error("builder error")` from `Client::builder().build()`.
+    // Doing this explicitly and ignoring the `Err` (returned only when
+    // something else already installed a provider) makes startup deterministic.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
     // Do not print banner when running as stdio MCP server to avoid corrupting JSON-RPC stdout
     if !matches!(cli.command, Commands::McpStdio) {
