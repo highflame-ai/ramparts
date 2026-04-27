@@ -966,13 +966,16 @@ impl MCPScanner {
 
     /// Scan a single MCP server
     pub async fn scan_single(&self, url: &str, options: ScanOptions) -> Result<ScanResult> {
+        let scan_timer = Timer::start();
         let mut result = ScanResult::new(url.to_string());
 
         debug!("Scanning {}", url);
 
         // Check if this is a STDIO URL and route appropriately
         if url.starts_with("stdio:") {
-            return self.scan_stdio_url(url, options).await;
+            let mut stdio_result = self.scan_stdio_url(url, options).await?;
+            stdio_result.response_time_ms = scan_timer.elapsed_ms();
+            return Ok(stdio_result);
         }
 
         // Normalize URL with error context for HTTP URLs
@@ -1163,7 +1166,7 @@ impl MCPScanner {
                     // Update result with any post-scan changes
                     result.yara_results.clone_from(&scan_data.yara_results);
 
-                    result.response_time_ms = Timer::start().elapsed_ms(); // Track actual scan time
+                    result.response_time_ms = scan_timer.elapsed_ms();
                     debug!("Scan completed in {}ms", result.response_time_ms);
                 }
             }
@@ -1198,9 +1201,13 @@ impl MCPScanner {
             Vec::new()
         };
 
-        // Create a temporary server config for the STDIO URL
+        // Create a temporary server config for the STDIO URL. Leaving `name`
+        // unset is intentional: the synthetic `STDIO-<command>` placeholder
+        // pollutes `to_display_url` output with a useless suffix. We restore
+        // the original `stdio_url` on the result below so the user sees the
+        // exact string they typed.
         let server_config = MCPServerConfig {
-            name: Some(format!("STDIO-{command}")),
+            name: None,
             url: None,
             command: Some(command.to_string()),
             args: Some(args),
@@ -1210,8 +1217,9 @@ impl MCPScanner {
             options: None,
         };
 
-        // Use the existing STDIO server scanning method
-        self.scan_stdio_server(&server_config, options).await
+        let mut result = self.scan_stdio_server(&server_config, options).await?;
+        result.url = stdio_url.to_string();
+        Ok(result)
     }
 
     /// Scan a STDIO MCP server using subprocess transport
@@ -1220,6 +1228,7 @@ impl MCPScanner {
         server_config: &MCPServerConfig,
         options: ScanOptions,
     ) -> Result<ScanResult> {
+        let scan_timer = Timer::start();
         let command = server_config
             .command
             .as_ref()
@@ -1338,6 +1347,7 @@ impl MCPScanner {
             }
         }
 
+        result.response_time_ms = scan_timer.elapsed_ms();
         Ok(result)
     }
 
