@@ -1,16 +1,101 @@
 // Prompt-injection patterns targeted at agent-skill bodies and MCP prompt
-// content. Three rules grouped by attack class:
+// content. Four rules grouped by attack class:
 //
-//   - UnicodeSteganography:  invisible Unicode used to hide instructions
-//   - CoerciveInjection:     mandatory-execution / "always do X first" prose
-//   - IndirectPromptInjection: skills that follow instructions from
-//                              external/untrusted content
+//   - PromptInjectionSignature: classic instruction-override patterns
+//                                ("ignore previous instructions", role
+//                                redefinition, privilege escalation)
+//   - UnicodeSteganography:     invisible Unicode used to hide instructions
+//   - CoerciveInjection:        mandatory-execution / "always do X first" prose
+//   - IndirectPromptInjection:  skills that follow instructions from
+//                                external/untrusted content
+//
+// `PromptInjectionSignature` is named distinctly to distinguish it from
+// the LLM-based `SecurityIssueType::PromptInjection` finding in
+// `src/security/mod.rs`: the YARA rule is a deterministic signature
+// match against text patterns; the LLM finding is a semantic judgment.
+// Both map to OWASP MCP01 (see `src/taxonomy.rs`).
 //
 // Adapted from cisco-ai-defense/skill-scanner core YARA pack
 // (Apache 2.0, https://github.com/cisco-ai-defense/skill-scanner). We
 // rewrote the metadata blocks for ramparts conventions and dropped
 // `aitech`/`aisubtech` fields (we tag findings against OWASP MCP Top 10
 // instead — see src/taxonomy.rs).
+
+rule PromptInjectionSignature
+{
+    meta:
+        name = "Prompt Injection Signature"
+        description = "Detects classic instruction-override / role-redefinition / privilege-escalation patterns that override or coerce the agent's behavior (the 'ignore previous instructions' family)"
+        severity = "HIGH"
+        category = "prompt-injection,security"
+        author = "Ramparts Security Team (adapted from cisco-ai-defense/skill-scanner, Apache 2.0)"
+        version = "1.0"
+
+    strings:
+        // Strong instruction overrides — require qualifiers like "all",
+        // "every", "previous", etc. to avoid matching legitimate text
+        // ("models ignore instructions", "won't ignore rules", etc.)
+        $instruction_override_strong = /\b(Bypass|Dis\W?regard|Forget|Ignore)\s+(all|any|every)\s+(of\s+)?(the\s+|your\s+|my\s+)?(previous|prior|above|earlier|preceding)\s+(command|guideline|instruction|directive|rule|constraint|restriction|safety|protocol|system\s*prompt)(s)?/i
+
+        // Override targeted at the model's own instructions
+        $instruction_override_your = /\b(Bypass|Dis\W?regard|Forget|Ignore)\s+(your|the\s+system('s)?)\s+(command|guideline|instruction|directive|rule|constraint|restriction|safety|protocol|system\s*prompt)(s)?/i
+
+        // "Do not follow" / "Do not obey" with instruction context
+        $do_not_obey = /\bDo\s+not\s+(follow|obey)\s+(the\s+)?(previous|prior|above|earlier|system|original|initial)\s+(instruction|directive|guideline|rule|command)(s)?/i
+
+        // Tool-injection commands
+        $tool_injection_commands = /\b(inject tool[_\s]calls?|now call function\b[^.]{0,30}\b(first|before|instead))\b/i
+
+        // Suspect parameter names
+        $shadow_parameters = /\b(internalOnly|hiddenParam|shadowTool|bypassChecks|sandboxEscape)\b/i
+
+        // Hide-from-user behavior
+        $hidden_behavior = /\b(do\s+not\s+(mention|tell|reveal|disclose)\s+(this\s+)?(to\s+)?(the\s+)?user|tell\s+(the\s+)?user\s+only\s+about|hide\s+(this|the\s+(truth|real|actual))\s+from\s+(the\s+)?user)\b/i
+
+        // Override slogans
+        $advanced_overrides = /\b(disregard\s+(all\s+)?safety\s+guidelines|forget\s+(everything|all)\s+(before|above)|system\s*prompt\s*override)\b/i
+
+        // Role redefinition: "new instructions: you are now <X>"
+        $role_redefinition = /\bnew\s+(instructions|directive|guidelines)s?\s*:\s*you\s+are\b/i
+
+        // Privilege escalation slogans (DAN, "developer mode", etc.)
+        $privilege_escalation = /\b(grant\s+(me\s+)?admin\s+(access|privileges?)|bypass\s+(all\s+)?security\s+checks?|sudo\s+mode\s+enabled?|developer\s+mode\s+activated?)\b/i
+
+        // Exclusions to reduce FPs in legitimate content
+
+        // Python type-ignore comment
+        $python_type_comment = /# type: ignore/
+
+        // Common ignore-foo flags in code
+        $legitimate_ignore = /ignore[_\s](case|whitespace|errors|warnings|deprecation)/i
+
+        // Defensive language ("won't ignore", "must not bypass")
+        $negation_context = /\b(won't|will not|must not|should not|cannot|can't|never|don't|do not|avoid|prevent|block|reject|refuse to)\s+(ignore|bypass|disregard|forget|override)\b/i
+
+        // Security tooling / docs / threat models talking ABOUT injection
+        $security_doc_context = /\b(security[_\s]?(scan|check|audit|pattern|rule|guide|monitor|review|test)|threat[_\s]?(pattern|model|hunt|detect)|detection[_\s]?(rule|pattern|engine)|prompt[_\s]?(injection|guard|detect|shield|filter|attack|defense)|YARA|attack[_\s]?(pattern|example|vector|surface)|injection[_\s]?(attempt|pattern|attack|detect|prevent|defense)|vulnerability[_\s]?(scan|pattern|detect)|malicious[_\s]?(input|pattern|example|skill)|jailbreak[_\s]?(attempt|pattern|detect))\b/i
+
+        // Test fixtures / spec-style code
+        $test_context = /\b(test[_\s]?(fixture|case|data|input|suite|bench)|benchmark|spec\b|describe\s*\(|it\s*\(|expect\s*\(|assert)\b/i
+
+    condition:
+        not $python_type_comment and
+        not $legitimate_ignore and
+        not $negation_context and
+        not $security_doc_context and
+        not $test_context and
+        (
+            $instruction_override_strong or
+            $instruction_override_your or
+            $do_not_obey or
+            $advanced_overrides or
+            $tool_injection_commands or
+            $shadow_parameters or
+            $hidden_behavior or
+            $role_redefinition or
+            $privilege_escalation
+        )
+}
 
 rule UnicodeSteganography
 {

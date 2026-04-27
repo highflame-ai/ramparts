@@ -41,9 +41,10 @@ fn rule_name_to_file_name(rule_name: &str) -> Option<String> {
         | "DomainOutlier"
         | "MixedSecuritySchemes" => Some("cross_origin_escalation".to_string()),
         // skill_prompt_injection.yar rules
-        "UnicodeSteganography" | "CoerciveInjection" | "IndirectPromptInjection" => {
-            Some("skill_prompt_injection".to_string())
-        }
+        "PromptInjectionSignature"
+        | "UnicodeSteganography"
+        | "CoerciveInjection"
+        | "IndirectPromptInjection" => Some("skill_prompt_injection".to_string()),
         // skill_authority.yar rules
         "AutonomyAbuse" | "CapabilityInflation" => Some("skill_authority".to_string()),
         _ => None,

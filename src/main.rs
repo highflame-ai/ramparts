@@ -546,14 +546,30 @@ async fn handle_skills_scan_command(
     let output_format = format.unwrap_or(scanner_config.scanner.format.clone());
 
     // Collect skill files from every root. A root may be a single file or
-    // a directory we walk recursively.
+    // a directory we walk recursively. We dedupe by canonical path so a
+    // user passing overlapping roots (e.g. `~/.claude/commands` AND
+    // `~/.claude`) doesn't scan the same skill twice.
     let mut skill_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    let push_unique =
+        |p: std::path::PathBuf,
+         skill_paths: &mut Vec<std::path::PathBuf>,
+         seen: &mut std::collections::HashSet<std::path::PathBuf>| {
+            let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if seen.insert(key) {
+                skill_paths.push(p);
+            }
+        };
     for root in &roots {
         if root.is_file() {
-            skill_paths.push(root.clone());
+            push_unique(root.clone(), &mut skill_paths, &mut seen);
         } else if root.is_dir() {
             match skills::discover_skills_in_root(root) {
-                Ok(found) => skill_paths.extend(found),
+                Ok(found) => {
+                    for p in found {
+                        push_unique(p, &mut skill_paths, &mut seen);
+                    }
+                }
                 Err(e) => warn!("Skipping skill root {}: {e}", root.display()),
             }
         } else {
@@ -579,10 +595,20 @@ async fn handle_skills_scan_command(
     }
 
     let scan_timer = utils::Timer::start();
-    let display_url = if roots.len() == 1 {
-        format!("skills:{}", roots[0].display())
-    } else {
-        format!("skills:{}", skill_paths.len())
+    // Display URL pattern matches the rest of ramparts: `<scheme>:<target>`
+    // where the target is meaningful enough to identify the scan in
+    // SARIF / JSON output. Single-root scans use the path verbatim;
+    // multi-root scans summarize roots + total file count.
+    let display_url = match roots.as_slice() {
+        [single] => format!("skills:{}", single.display()),
+        many => {
+            let joined = many
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("skills:[{}]({} files)", joined, skill_paths.len())
+        }
     };
     let mut result = types::ScanResult::new(display_url);
     result.prompts = prompts;
