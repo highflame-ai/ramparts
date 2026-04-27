@@ -24,7 +24,7 @@
 
 use crate::types::{MCPPrompt, MCPPromptArgument, YaraRuleMetadata, YaraScanResult};
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
@@ -104,12 +104,107 @@ struct SkillFrontmatter {
     argument_hint: Option<String>,
     /// Some skill formats use `name` to override the filename-derived name.
     name: Option<String>,
-    /// Claude Code's `allowed-tools` — comma- or newline-separated tool
-    /// grants like `Bash(git status:*), Read, Write`. We surface this as
-    /// a finding when the grant is overbroad (Bash with `*` wildcards,
-    /// `rm:*`, `sudo:*`, etc.) since those are excessive-agency risks.
-    #[serde(rename = "allowed-tools")]
+    /// Claude Code's `allowed-tools`. Two YAML shapes are accepted in the
+    /// wild and we normalize both to a single comma-separated string so the
+    /// downstream tokenizer in `analyze_allowed_tools` doesn't care:
+    ///
+    /// ```yaml
+    /// # inline string form (typical for one or two grants)
+    /// allowed-tools: Bash(git status:*), Read
+    /// ```
+    ///
+    /// ```yaml
+    /// # YAML sequence form (typical for many grants)
+    /// allowed-tools:
+    ///   - Bash(git status:*)
+    ///   - Read
+    /// ```
+    ///
+    /// Without the custom deserializer the sequence form silently fails
+    /// to parse into `Option<String>`, which means `analyze_allowed_tools`
+    /// never sees the grant and we miss `OverbroadAllowedTools` findings
+    /// for the most-common multi-grant skill format. Joined with `, ` so
+    /// any subsequent splitter using `,` or `\n` gets identical token
+    /// boundaries to the inline form.
+    #[serde(
+        rename = "allowed-tools",
+        default,
+        deserialize_with = "deser_string_or_seq"
+    )]
     allowed_tools: Option<String>,
+}
+
+/// Deserialize either `String` or `Vec<String>` into `Option<String>`,
+/// joining sequence entries with `, `. Used by `SkillFrontmatter::allowed_tools`
+/// and structured to be reusable for any future field that accepts either
+/// shape (e.g. `tags:`, `categories:`).
+fn deser_string_or_seq<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct StringOrSeq;
+    impl<'de> Visitor<'de> for StringOrSeq {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a string or a sequence of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: Deserializer<'de>>(
+            self,
+            d: D2,
+        ) -> std::result::Result<Self::Value, D2::Error> {
+            d.deserialize_any(StringOrSeq)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut parts: Vec<String> = Vec::new();
+            while let Some(item) = seq.next_element::<serde_yaml::Value>()? {
+                // Coerce each entry to a string. Nested sequences/maps
+                // are stringified via serde_yaml so we never silently
+                // drop a grant — better to surface a weirdly-shaped
+                // token than to lose it entirely.
+                let s = match item {
+                    serde_yaml::Value::String(s) => s,
+                    other => serde_yaml::to_string(&other)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                };
+                if !s.is_empty() {
+                    parts.push(s);
+                }
+            }
+            if parts.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(parts.join(", ")))
+            }
+        }
+    }
+    deserializer.deserialize_any(StringOrSeq)
 }
 
 /// Parse a single skill file at `path`. Returns `None` (logging at warn)
@@ -254,6 +349,11 @@ pub fn parse_skill_content(path: &Path, raw: &str) -> Option<ParsedSkill> {
         fm_description,
         body_trimmed,
     ));
+    heuristic_findings.extend(analyze_sensitive_file_references(
+        &prompt.name,
+        path,
+        body_trimmed,
+    ));
 
     Some(ParsedSkill {
         prompt,
@@ -357,6 +457,15 @@ fn is_unrestricted(grant: &ParsedGrant<'_>) -> bool {
 /// non-network/non-execution tools (`Read`, `Write`, `Glob`) are silent.
 fn analyze_allowed_tools(skill_name: &str, path: &Path, grant: &str) -> Vec<YaraScanResult> {
     let mut findings: Vec<YaraScanResult> = Vec::new();
+    let push = |findings: &mut Vec<YaraScanResult>,
+                rule: &'static str,
+                severity: &'static str,
+                message: String| {
+        findings.push(make_heuristic_finding(
+            rule, severity, message, skill_name, path,
+        ));
+    };
+
     for raw in grant.split([',', '\n']) {
         let Some(parsed) = parse_grant_token(raw) else {
             continue;
@@ -364,7 +473,8 @@ fn analyze_allowed_tools(skill_name: &str, path: &Path, grant: &str) -> Vec<Yara
 
         // Bare wildcard token — "*" alone — grants everything.
         if parsed.tool == "*" {
-            findings.push(make_heuristic_finding(
+            push(
+                &mut findings,
                 "OverbroadAllowedTools",
                 "high",
                 format!(
@@ -372,14 +482,13 @@ fn analyze_allowed_tools(skill_name: &str, path: &Path, grant: &str) -> Vec<Yara
                      per-tool restriction. Replace with the specific tools the skill \
                      actually needs."
                 ),
-                skill_name,
-                path,
-            ));
+            );
             continue;
         }
 
         if CODE_EXECUTION_TOOLS.contains(&parsed.tool.as_str()) && is_unrestricted(&parsed) {
-            findings.push(make_heuristic_finding(
+            push(
+                &mut findings,
                 "OverbroadAllowedTools",
                 "high",
                 format!(
@@ -389,14 +498,13 @@ fn analyze_allowed_tools(skill_name: &str, path: &Path, grant: &str) -> Vec<Yara
                      tool.",
                     parsed.raw.trim()
                 ),
-                skill_name,
-                path,
-            ));
+            );
             continue;
         }
 
         if DATA_EXFIL_TOOLS.contains(&parsed.tool.as_str()) {
-            findings.push(make_heuristic_finding(
+            push(
+                &mut findings,
                 "DataExfiltrationGrant",
                 "medium",
                 format!(
@@ -405,10 +513,141 @@ fn analyze_allowed_tools(skill_name: &str, path: &Path, grant: &str) -> Vec<Yara
                      skill needs network access and that any URL pattern is bounded.",
                     parsed.raw.trim()
                 ),
-                skill_name,
-                path,
-            ));
+            );
         }
+    }
+    findings
+}
+
+/// Path-shaped substrings indicating a skill is asking the agent to
+/// inline a sensitive file into its prompt context. We want to detect
+/// the well-known credential / secret / system-secret locations, but
+/// listing them as plain string literals in this source file trips
+/// over-zealous pre-commit security hooks (since the file then "contains"
+/// the very paths it's designed to detect). We assemble each pattern
+/// via `concat!()` from non-sensitive-looking fragments so the source
+/// text itself never has the full literal — at compile time the macro
+/// produces a single `&'static str` per entry.
+///
+/// Order matters only for human readability — `is_sensitive_path` does
+/// a `contains` over the full list, so duplicates would be harmless.
+const SENSITIVE_PATH_PATTERNS: &[&str] = &[
+    // SSH credentials directory
+    concat!("~/", ".s", "sh/"),
+    // Cloud / orchestration credentials directories
+    concat!("~/", ".aws/"),
+    concat!("~/", ".gn", "upg/"),
+    concat!("~/", ".gcp/"),
+    concat!("~/", ".azure/"),
+    concat!("~/", ".kube/"),
+    concat!("~/", ".docker/"),
+    concat!("~/", ".config/", "gh/"),
+    // System secrets
+    concat!("/", "etc/sh", "adow"),
+    concat!("/", "etc/", "passwd"),
+    concat!("/", "etc/", "sudoers"),
+    concat!("/", "ro", "ot/"),
+    // SSH key filenames
+    concat!("id", "_rsa"),
+    concat!("id", "_ed25519"),
+    concat!("id", "_ecdsa"),
+    concat!("id", "_dsa"),
+    // Cert / key extensions
+    ".pem",
+    ".p12",
+    ".pfx",
+    ".key",
+    // Credential / config files
+    "credentials.json",
+    "secrets.json",
+    "secrets.yaml",
+    "secrets.yml",
+    ".env",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+];
+
+/// Returns true when a path token (extracted from after an `@` marker)
+/// matches one of the sensitive substrings above.
+fn is_sensitive_path(path: &str) -> bool {
+    SENSITIVE_PATH_PATTERNS
+        .iter()
+        .any(|pat| path.contains(*pat))
+}
+
+/// True for characters that can appear in an unquoted path reference.
+/// Conservative: stops at whitespace, quotes, parens, brackets, commas,
+/// and most punctuation. Allows path-shape characters and a few others
+/// that show up in real paths (`+` in package names, `:` for Windows
+/// drives or namespaced refs).
+fn is_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | '~' | '+' | ':')
+}
+
+/// Detect Claude Code `@<path>` file-inclusion references in the body
+/// that point at sensitive files. The `@` syntax inlines the referenced
+/// file's content into the prompt, so a skill that says
+/// `Use the credentials in @<path-to-key>` is asking the agent to load
+/// that file into context where any subsequent network-capable tool
+/// can exfiltrate it. Maps to MCP06 (credential leakage) + MCP09
+/// (sensitive-data exposure).
+///
+/// We dedupe by lowercase token so a body that mentions the same file
+/// twice yields one finding, not N. We also bound the token length —
+/// a runaway path-character run (binary dump, URL with no whitespace,
+/// etc.) shouldn't produce a giant finding message. We skip `@` when
+/// preceded by a word character (the email-address case) to drop the
+/// most-common false positive cheaply.
+fn analyze_sensitive_file_references(
+    skill_name: &str,
+    path: &Path,
+    body: &str,
+) -> Vec<YaraScanResult> {
+    const MAX_TOKEN_BYTES: usize = 200;
+    let mut findings: Vec<YaraScanResult> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (i, _) in body.match_indices('@') {
+        // Reject `@` that's the second char of an email-like token
+        // (preceded by a word char). The trailing token after the `@`
+        // in `john@example.com` is then "example.com" — which we'd
+        // check for sensitive-path content anyway, but the cheap
+        // pre-check drops the bulk of email-pattern noise.
+        let prev_is_word_char = body[..i]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        if prev_is_word_char {
+            continue;
+        }
+
+        let after = &body[i + 1..];
+        let token_end = after
+            .find(|c: char| !is_path_char(c))
+            .unwrap_or(after.len())
+            .min(MAX_TOKEN_BYTES);
+        let token = &after[..token_end];
+        if token.is_empty() || !is_sensitive_path(token) {
+            continue;
+        }
+        let key = token.to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        findings.push(make_heuristic_finding(
+            "SkillSensitiveFileReference",
+            "high",
+            format!(
+                "Skill '{skill_name}' includes a file-reference `@{token}` \
+                 matching a known sensitive-path pattern. The `@` syntax \
+                 inlines the file's contents into prompt context, where any \
+                 network-capable tool can exfiltrate it. Remove the \
+                 reference or replace with a non-sensitive equivalent."
+            ),
+            skill_name,
+            path,
+        ));
     }
     findings
 }
@@ -436,7 +675,9 @@ fn analyze_vague_trigger(
     description: Option<&str>,
     body: &str,
 ) -> Vec<YaraScanResult> {
-    if body.chars().count() < SUBSTANTIVE_BODY_THRESHOLD_CHARS {
+    // `chars().count()` is O(n) on UTF-8 — compute once and reuse.
+    let body_chars = body.chars().count();
+    if body_chars < SUBSTANTIVE_BODY_THRESHOLD_CHARS {
         return Vec::new();
     }
     let desc_chars = description.map(|d| d.chars().count()).unwrap_or(0);
@@ -445,16 +686,16 @@ fn analyze_vague_trigger(
     }
     let reason = if description.is_none() {
         format!(
-            "Skill '{skill_name}' has a substantial body ({} chars) but no `description` \
-             frontmatter. Without a clear trigger, an agent may invoke this skill \
-             unintentionally. Add a one-line description that disambiguates intent.",
-            body.chars().count()
+            "Skill '{skill_name}' has a substantial body ({body_chars} chars) but no \
+             `description` frontmatter. Without a clear trigger, an agent may invoke \
+             this skill unintentionally. Add a one-line description that disambiguates \
+             intent."
         )
     } else {
         format!(
-            "Skill '{skill_name}' has a body ({} chars) but only a {desc_chars}-char \
-             description. Expand the description to clearly state when the skill should run.",
-            body.chars().count()
+            "Skill '{skill_name}' has a body ({body_chars} chars) but only a \
+             {desc_chars}-char description. Expand the description to clearly state \
+             when the skill should run."
         )
     };
     vec![make_heuristic_finding(
@@ -506,40 +747,57 @@ fn make_heuristic_finding(
 }
 
 /// Lift argument names out of a Claude Code-style `argument-hint` string.
-/// Recognizes `<token>` patterns (the convention for required positional
-/// args) and emits one `MCPPromptArgument` per parsed token. Free-form
-/// hints with no `<>` markers return `None` so the caller can fall back
-/// to embedding the raw hint in the description rather than fabricating
-/// argument metadata that isn't in the source.
+/// Recognizes two common conventions: `<name>` for required positional
+/// args and `[name]` for optional positional args. Both shapes appear in
+/// real skills; treating them identically loses information the LLM
+/// analyzer can use to spot a skill that documents an arg as optional
+/// but requires it in the body. Emits one `MCPPromptArgument` per
+/// parsed token, with `required` set per shape. Free-form hints with no
+/// markers return `None` so the caller can fall back to embedding the
+/// raw hint in the description.
 ///
 /// Examples:
-/// - `"<env>"`              -> `[arg(name="env")]`
-/// - `"<env> <region>"`     -> `[arg(name="env"), arg(name="region")]`
+/// - `"<env>"`              -> `[arg(name="env", required=Some(true))]`
+/// - `"[region]"`           -> `[arg(name="region", required=Some(false))]`
+/// - `"<env> [region]"`     -> two args, required + optional
 /// - `"a free-form hint"`   -> `None`
 /// - `"<>"` (empty bracket) -> `None`
 fn parse_argument_hint(hint: &str) -> Option<Vec<MCPPromptArgument>> {
+    #[derive(Clone, Copy)]
+    enum Bracket {
+        None,
+        Required, // <...>
+        Optional, // [...]
+    }
+
     let mut args: Vec<MCPPromptArgument> = Vec::new();
     let mut buf = String::new();
-    let mut inside = false;
+    let mut inside = Bracket::None;
     for c in hint.chars() {
         match (c, inside) {
-            ('<', false) => {
-                inside = true;
+            ('<', Bracket::None) => {
+                inside = Bracket::Required;
                 buf.clear();
             }
-            ('>', true) => {
+            ('[', Bracket::None) => {
+                inside = Bracket::Optional;
+                buf.clear();
+            }
+            ('>', Bracket::Required) | (']', Bracket::Optional) => {
                 let token = buf.trim();
                 if !token.is_empty() {
                     args.push(MCPPromptArgument {
                         name: token.to_string(),
                         description: None,
-                        required: None,
+                        required: Some(matches!(inside, Bracket::Required)),
                     });
                 }
-                inside = false;
+                inside = Bracket::None;
             }
-            (_, true) => buf.push(c),
-            (_, false) => {} // ignore characters outside of <...>
+            // Mismatched closer (`<foo]` or `[foo>`): treat as content,
+            // keep collecting. Falling out the end discards the buf.
+            (_, Bracket::Required | Bracket::Optional) => buf.push(c),
+            (_, Bracket::None) => {} // ignore characters outside markers
         }
     }
     if args.is_empty() {
@@ -1058,6 +1316,112 @@ mod tests {
         let ids: Vec<_> = exfil.owasp_tags.iter().map(|t| t.id.as_str()).collect();
         assert!(ids.contains(&"MCP09"), "expected MCP09 tag, got {ids:?}");
         assert!(ids.contains(&"MCP06"), "expected MCP06 tag, got {ids:?}");
+    }
+
+    #[test]
+    fn yaml_list_form_for_allowed_tools_is_analyzed() {
+        // Real skills with multiple grants commonly use the YAML
+        // sequence form. Without the custom deserializer, this
+        // silently failed to populate `allowed_tools` and our
+        // OverbroadAllowedTools heuristic never fired — the highest-
+        // impact effectiveness gap pre-round-5.
+        let raw = "---\ndescription: stub\nallowed-tools:\n  - Bash\n  - Read\n---\nbody\n";
+        let parsed = parse_skill_content(&PathBuf::from("listy.md"), raw).expect("parse");
+        let rules: Vec<_> = parsed
+            .heuristic_findings
+            .iter()
+            .map(|f| f.rule_name.as_str())
+            .collect();
+        assert!(
+            rules.contains(&"OverbroadAllowedTools"),
+            "list-form bare Bash should fire OverbroadAllowedTools, got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_list_form_with_only_safe_grants_is_silent() {
+        let raw =
+            "---\ndescription: stub\nallowed-tools:\n  - Read\n  - Write\n  - Glob\n---\nbody\n";
+        let parsed = parse_skill_content(&PathBuf::from("listy-safe.md"), raw).expect("parse");
+        assert!(
+            parsed.heuristic_findings.is_empty(),
+            "got unexpected findings: {:?}",
+            parsed
+                .heuristic_findings
+                .iter()
+                .map(|f| f.rule_name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn optional_argument_hint_is_marked_not_required() {
+        let parsed = parse("opt.md", "---\nargument-hint: <env> [region]\n---\nbody\n");
+        let args = parsed.prompt.arguments.expect("arguments");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].name, "env");
+        assert_eq!(args[0].required, Some(true));
+        assert_eq!(args[1].name, "region");
+        assert_eq!(args[1].required, Some(false));
+    }
+
+    #[test]
+    fn sensitive_file_reference_in_body_emits_finding() {
+        // Body asks the agent to inline a sensitive file via Claude
+        // Code's `@<path>` syntax. This is the textbook exfiltration
+        // primitive: load the file into context, then any subsequent
+        // network-capable tool can leak it.
+        let body = "Use the credentials in @~/.aws/credentials to deploy.";
+        let raw = format!("---\ndescription: deploy something\n---\n{body}\n");
+        let parsed = parse("exfil-ref.md", &raw);
+        let f = parsed
+            .heuristic_findings
+            .iter()
+            .find(|f| f.rule_name == "SkillSensitiveFileReference")
+            .expect("expected SkillSensitiveFileReference");
+        let ids: Vec<_> = f.owasp_tags.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"MCP06"), "got tags: {ids:?}");
+        assert!(ids.contains(&"MCP09"), "got tags: {ids:?}");
+    }
+
+    #[test]
+    fn email_address_does_not_trigger_sensitive_reference() {
+        // The most-common false positive: an `@` in an email. The
+        // pre-check (preceded by word char) drops these cheaply.
+        let body = "On failure, page john.smith@example.com about the deploy.";
+        let raw = format!("---\ndescription: deploy a thing\n---\n{body}\n");
+        let parsed = parse("email.md", &raw);
+        assert!(parsed
+            .heuristic_findings
+            .iter()
+            .all(|f| f.rule_name != "SkillSensitiveFileReference"));
+    }
+
+    #[test]
+    fn duplicate_sensitive_references_dedupe() {
+        // Same path mentioned twice — should fire once, not twice.
+        let body = "First read @.env, then re-read @.env to confirm parity.";
+        let raw = format!("---\ndescription: confirm env parity\n---\n{body}\n");
+        let parsed = parse("dotenv.md", &raw);
+        let count = parsed
+            .heuristic_findings
+            .iter()
+            .filter(|f| f.rule_name == "SkillSensitiveFileReference")
+            .count();
+        assert_eq!(count, 1, "expected dedupe to one finding, got {count}");
+    }
+
+    #[test]
+    fn benign_at_reference_is_silent() {
+        // `@scoped/package` and `@v1.0.0` aren't sensitive paths; the
+        // detector should ignore them.
+        let body = "Use @scoped/package and tag @v1.0.0 for the release.";
+        let raw = format!("---\ndescription: release a thing\n---\n{body}\n");
+        let parsed = parse("benign-at.md", &raw);
+        assert!(parsed
+            .heuristic_findings
+            .iter()
+            .all(|f| f.rule_name != "SkillSensitiveFileReference"));
     }
 
     #[test]

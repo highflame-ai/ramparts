@@ -122,6 +122,7 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         "OverbroadAllowedTools" => vec![OwaspTag::new("MCP03")],
         "VagueSkillTrigger" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
         "DataExfiltrationGrant" => vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")],
+        "SkillSensitiveFileReference" => vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")],
 
         _ => Vec::new(),
     }
