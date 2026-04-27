@@ -110,10 +110,17 @@ rand = "0.9"
 
 # Pulled in transitively via reqwest 0.13 / hyper-rustls; we declare it
 # directly so we can install the process-wide CryptoProvider explicitly at
-# startup. Without an explicit install, rustls 0.23 + aws-lc-rs auto-init
-# fails on some environments (notably some macOS configurations) and
-# `reqwest::Client::builder().build()` returns an opaque `"builder error"`.
+# startup AND build a `ClientConfig` whose root cert store is the bundled
+# Mozilla CA list (see `webpki-roots` below). Without that, reqwest 0.13's
+# default `rustls` feature pulls in `rustls-platform-verifier`, which has
+# been observed to fail with "No CA certificates were loaded from the
+# system" on some macOS configurations.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+
+# Mozilla's CA bundle, ahead-of-time. We use this instead of the OS trust
+# store so HTTPS connectivity is reproducible across environments and not
+# subject to platform-verifier's "no CAs loaded" failure mode.
+webpki-roots = "1"
 
 # Bring in common as path dependency
 ramparts-common = { path = "common" }

@@ -109,6 +109,7 @@ impl McpClient {
         HttpClient::builder()
             .default_headers(headers)
             .timeout(std::time::Duration::from_secs(self.http_timeout_secs))
+            .use_preconfigured_tls((*crate::tls::default_tls_config()).clone())
             .build()
             .map_err(|e| {
                 anyhow!(

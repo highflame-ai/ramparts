@@ -16,6 +16,7 @@ mod mcp_server;
 mod scanner;
 mod security;
 mod server;
+mod tls;
 
 mod types;
 mod utils;
