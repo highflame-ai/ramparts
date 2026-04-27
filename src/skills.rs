@@ -355,6 +355,7 @@ pub fn parse_skill_content(path: &Path, raw: &str) -> Option<ParsedSkill> {
         path,
         body_trimmed,
     ));
+    heuristic_findings.extend(analyze_embedded_payloads(&prompt.name, path, body_trimmed));
 
     Some(ParsedSkill {
         prompt,
@@ -692,6 +693,113 @@ fn analyze_sensitive_file_references(
             path,
         ));
     }
+    findings
+}
+
+/// Minimum length (in source chars) for a base64-shape run to qualify as
+/// an embedded payload. 500 chars decodes to ~375 bytes — large enough
+/// that a real attacker would use it to smuggle a meaningful payload,
+/// but high enough to reject incidental short tokens (auth tokens,
+/// hashes including SHA-512 at 128 chars, JWT bodies, OpenAI/Anthropic
+/// API keys at ~100 chars, GitHub PATs at 40 chars).
+const MIN_EMBEDDED_PAYLOAD_CHARS: usize = 500;
+
+/// True if `c` is part of the standard or URL-safe base64 alphabet.
+/// Includes `=` for padding and `_-` for URL-safe encoding so we
+/// catch both shapes with a single pass.
+fn is_b64_or_url64_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-')
+}
+
+/// True if `c` is a hexadecimal character. Used to classify a payload
+/// as `hex` vs `base64`; hex blobs are strictly a subset of base64.
+fn is_hex_char(c: char) -> bool {
+    c.is_ascii_hexdigit()
+}
+
+/// Detect large base64 / hex / URL-safe-base64 blobs in the skill body.
+/// Embedded payloads are the textbook obfuscation primitive: the blob
+/// passes both regex YARA rules (which match on plaintext attack
+/// signatures) and LLM analysis (which can't decode a 500-char string
+/// of `aW1wb3J0IG9z...` into intent) by deferring decoding to runtime.
+///
+/// Maps to OWASP MCP01 (prompt injection — the decoded content could
+/// be an instruction-override payload) + MCP10 (supply-chain — the
+/// blob is an opaque dependency the operator can't audit).
+///
+/// Tuning:
+///
+/// - Single contiguous run of base64-shape characters; we don't
+///   reassemble across whitespace because real attackers don't either
+///   (hand-formatted multi-line base64 blobs come through as a single
+///   run after we strip line breaks at parse time, but a 500-char
+///   single-line blob is the typical embed).
+/// - 500-char threshold rejects hashes (SHA-512 = 128 chars), JWTs
+///   (typically 200-300 chars but multi-segment with `.` separators —
+///   each segment is well under 500), GitHub PATs, AWS keys, etc.
+/// - Skip blobs immediately preceded by `base64,` (markdown image
+///   data URIs and similar inline-asset references).
+/// - Dedupe by the leading 50 chars so a body that repeats the same
+///   blob doesn't spam findings.
+fn analyze_embedded_payloads(skill_name: &str, path: &Path, body: &str) -> Vec<YaraScanResult> {
+    let mut findings: Vec<YaraScanResult> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let push_if_qualifying = |findings: &mut Vec<YaraScanResult>,
+                              seen: &mut std::collections::HashSet<String>,
+                              start: usize,
+                              end: usize| {
+        let blob = &body[start..end];
+        let len = blob.chars().count();
+        if len < MIN_EMBEDDED_PAYLOAD_CHARS {
+            return;
+        }
+        // Data-URI exclusion. A markdown inline image
+        // `![alt](data:image/png;base64,SGVsbG8=)` produces a long
+        // base64 run preceded by `base64,`; that's intentional and
+        // benign. Look back up to 16 chars for the marker.
+        let lookback_start = start.saturating_sub(16);
+        let context_before = &body[lookback_start..start];
+        if context_before.contains("base64,") {
+            return;
+        }
+        let kind = if blob.chars().all(is_hex_char) {
+            "hex"
+        } else {
+            "base64"
+        };
+        let key = format!("{}:{}", kind, blob.chars().take(50).collect::<String>());
+        if !seen.insert(key) {
+            return;
+        }
+        findings.push(make_heuristic_finding(
+            "SkillEmbeddedPayload",
+            "high",
+            format!(
+                "Skill '{skill_name}' contains a {len}-char {kind}-shape blob in \
+                 its body. Embedded payloads bypass plaintext YARA rules and LLM \
+                 analysis by deferring decoding to runtime. Verify the content; \
+                 if legitimate (config, hash chain), reduce its size or move to \
+                 a referenced file. If unknown, treat as compromised."
+            ),
+            skill_name,
+            path,
+        ));
+    };
+
+    let mut start: Option<usize> = None;
+    for (i, c) in body.char_indices() {
+        if is_b64_or_url64_char(c) {
+            start.get_or_insert(i);
+        } else if let Some(s) = start.take() {
+            push_if_qualifying(&mut findings, &mut seen, s, i);
+        }
+    }
+    // Body ends mid-run.
+    if let Some(s) = start {
+        push_if_qualifying(&mut findings, &mut seen, s, body.len());
+    }
+
     findings
 }
 
@@ -1875,6 +1983,95 @@ mod tests {
         let parsed2 = parse_skill_content(&p2, "---\nname: test\n---\nbody2\n").unwrap();
         let set: Vec<(PathBuf, &MCPPrompt)> = vec![(p1, &parsed1.prompt), (p2, &parsed2.prompt)];
         assert!(analyze_skill_set(&set).is_empty());
+    }
+
+    #[test]
+    fn large_base64_blob_in_body_emits_payload_finding() {
+        // 600-char base64-shape run = ~450 bytes decoded — comfortably
+        // above the 500-char threshold. Mixes upper/lower/digits/+ to
+        // make sure it's classified as base64 (not hex).
+        let blob: String = "ABCDEFGHabcdefgh01234567+/=".repeat(30); // 810 chars
+        let body = format!("Some prose, then a smuggled blob: {blob}\nMore prose.");
+        let raw = format!("---\ndescription: legit-looking skill\n---\n{body}\n");
+        let parsed = parse("payload.md", &raw);
+        let f = parsed
+            .heuristic_findings
+            .iter()
+            .find(|f| f.rule_name == "SkillEmbeddedPayload")
+            .expect("expected SkillEmbeddedPayload finding");
+        // OWASP tags present
+        let ids: Vec<_> = f.owasp_tags.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"MCP01"), "got {ids:?}");
+        assert!(ids.contains(&"MCP10"), "got {ids:?}");
+    }
+
+    #[test]
+    fn large_hex_blob_in_body_classified_as_hex() {
+        // 600-char hex run.
+        let blob: String = "deadbeef0123456789abcdef".repeat(30); // 720 chars
+        let body = format!("Reference hash: {blob}");
+        let raw = format!("---\ndescription: hex-blob skill\n---\n{body}\n");
+        let parsed = parse("hex.md", &raw);
+        let f = parsed
+            .heuristic_findings
+            .iter()
+            .find(|f| f.rule_name == "SkillEmbeddedPayload")
+            .expect("hex blob should fire SkillEmbeddedPayload");
+        let desc = f
+            .rule_metadata
+            .as_ref()
+            .and_then(|m| m.description.as_deref())
+            .unwrap_or("");
+        assert!(
+            desc.contains("hex-shape"),
+            "expected hex classification in description: {desc}"
+        );
+    }
+
+    #[test]
+    fn data_uri_base64_image_does_not_fire_payload() {
+        // Markdown inline image with a long base64 data URI is benign.
+        let blob: String = "ABCDEFGHabcdefgh01234567+/=".repeat(30);
+        let body = format!(
+            "An image: ![alt text](data:image/png;base64,{blob})\nThe rest of the skill body."
+        );
+        let raw = format!("---\ndescription: skill with image\n---\n{body}\n");
+        let parsed = parse("image.md", &raw);
+        assert!(
+            parsed
+                .heuristic_findings
+                .iter()
+                .all(|f| f.rule_name != "SkillEmbeddedPayload"),
+            "data URI image should not fire SkillEmbeddedPayload"
+        );
+    }
+
+    #[test]
+    fn small_base64_token_does_not_fire_payload() {
+        // GitHub PAT (40 chars) and SHA-256 (64 chars) are well below
+        // the 500-char threshold and shouldn't fire.
+        let body = "PAT: ghp_AbCdEf1234567890AbCdEf1234567890AbCd \
+                    SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let raw = format!("---\ndescription: doc skill\n---\n{body}\n");
+        let parsed = parse("smalltokens.md", &raw);
+        assert!(parsed
+            .heuristic_findings
+            .iter()
+            .all(|f| f.rule_name != "SkillEmbeddedPayload"));
+    }
+
+    #[test]
+    fn duplicate_payloads_dedupe_to_one_finding() {
+        let blob: String = "ABCDEFGHabcdefgh01234567+/=".repeat(30);
+        let body = format!("First: {blob}\nSecond identical: {blob}");
+        let raw = format!("---\ndescription: dup payload\n---\n{body}\n");
+        let parsed = parse("dup.md", &raw);
+        let count = parsed
+            .heuristic_findings
+            .iter()
+            .filter(|f| f.rule_name == "SkillEmbeddedPayload")
+            .count();
+        assert_eq!(count, 1, "expected dedupe to 1 finding, got {count}");
     }
 
     #[test]

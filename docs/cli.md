@@ -354,6 +354,12 @@ structural findings the regex/LLM pipeline can't see:
   in the agent's router — an attacker who can write a workspace-
   level skill with the same name as a trusted user-level skill can
   silently replace it. Cross-skill check; runs once per scan.
+- **SkillEmbeddedPayload** (MCP01 + MCP10): the body contains a
+  500-character-or-longer base64-shape (or hex-shape) blob. Embedded
+  payloads bypass plaintext YARA rules and LLM analysis by deferring
+  decoding to runtime — the LLM sees `aW1wb3J0IG9z...` and shrugs.
+  Markdown image data URIs (`data:image/...;base64,...`) are
+  excluded.
 
 Three skill-targeted YARA rules complement the structural heuristics
 above by scanning the body content itself:
