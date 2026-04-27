@@ -103,6 +103,16 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         | "DomainOutlier"
         | "MixedSecuritySchemes" => vec![OwaspTag::new("MCP05")],
 
+        // skill_prompt_injection.yar — three rules covering invisible-unicode
+        // hiding, mandatory-execution coercion, and indirect prompt injection
+        // via untrusted external content.
+        "UnicodeSteganography" | "IndirectPromptInjection" => vec![OwaspTag::new("MCP01")],
+        "CoerciveInjection" => vec![OwaspTag::new("MCP01"), OwaspTag::new("MCP02")],
+
+        // skill_authority.yar — autonomy bypass + capability inflation.
+        "AutonomyAbuse" => vec![OwaspTag::new("MCP03")],
+        "CapabilityInflation" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
+
         _ => Vec::new(),
     }
 }
@@ -149,6 +159,11 @@ mod tests {
             "CrossDomainContamination",
             "DomainOutlier",
             "MixedSecuritySchemes",
+            "UnicodeSteganography",
+            "CoerciveInjection",
+            "IndirectPromptInjection",
+            "AutonomyAbuse",
+            "CapabilityInflation",
         ] {
             assert!(
                 !tags_for_yara_rule(name).is_empty(),

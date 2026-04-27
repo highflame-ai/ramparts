@@ -40,7 +40,12 @@ fn rule_name_to_file_name(rule_name: &str) -> Option<String> {
         | "CrossDomainContamination"
         | "DomainOutlier"
         | "MixedSecuritySchemes" => Some("cross_origin_escalation".to_string()),
-        // Add more mappings as needed
+        // skill_prompt_injection.yar rules
+        "UnicodeSteganography" | "CoerciveInjection" | "IndirectPromptInjection" => {
+            Some("skill_prompt_injection".to_string())
+        }
+        // skill_authority.yar rules
+        "AutonomyAbuse" | "CapabilityInflation" => Some("skill_authority".to_string()),
         _ => None,
     }
 }
@@ -647,14 +652,18 @@ impl YaraScanner {
         results
     }
 
-    /// Format an item for YARA scanning with specialized logic per type
+    /// Format an item for YARA scanning. We feed YARA the same descriptive
+    /// text the LLM analyzer sees (`format_for_analysis`) so rules that
+    /// pattern-match on tool/prompt/skill bodies actually have content to
+    /// match against. Previously this returned just `"PROMPT: <name>"`,
+    /// which meant body-pattern rules (the new skill rules in particular,
+    /// but also `command_injection.yar` against prompts) silently never
+    /// fired because there was nothing to scan beyond the name.
     fn format_item_for_yara_scan<T>(item: &T) -> String
     where
         T: crate::security::BatchScannableItem,
     {
-        // For YARA scanning, we want a simple format without numbering
-        // to avoid confusion and focus on the actual content
-        format!("{}: {}", T::item_type().to_uppercase(), item.name())
+        item.format_for_analysis(0)
     }
 
     /// Create a YARA scan result with original rule metadata
