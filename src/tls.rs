@@ -15,15 +15,20 @@
 //! simple HTTP path, the rmcp streamable HTTP path, and the scanner's own
 //! reqwest client.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 
-/// Build a fresh `rustls::ClientConfig` whose root store is the bundled
-/// Mozilla CA list. The returned `ClientConfig` is `Arc`-wrapped so multiple
-/// reqwest builders can share it without recomputing the root store.
-pub fn default_tls_config() -> Arc<ClientConfig> {
+/// Built-once, shared-many `rustls::ClientConfig` whose root store is the
+/// bundled Mozilla CA list. Memoized via `LazyLock` so the (non-trivial)
+/// `RootCertStore` construction runs exactly once per process even when
+/// many reqwest builders ask for the config.
+///
+/// `LazyLock` over `OnceLock`/`once_cell` because we already use `LazyLock`
+/// elsewhere in the crate (`config::CONFIG_PATHS_CACHE`) and it's in the
+/// standard library — no extra dep.
+static DEFAULT_TLS_CONFIG: LazyLock<Arc<ClientConfig>> = LazyLock::new(|| {
     let mut roots = RootCertStore::empty();
     // webpki-roots ships a `&'static [TrustAnchor<'static>]`; cloning each
     // entry is cheap and the resulting `RootCertStore` owns its data.
@@ -33,4 +38,11 @@ pub fn default_tls_config() -> Arc<ClientConfig> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     Arc::new(config)
+});
+
+/// Returns the shared `rustls::ClientConfig` (see `DEFAULT_TLS_CONFIG`).
+/// The returned `Arc` is cheap to clone — the underlying config and root
+/// store are constructed exactly once.
+pub fn default_tls_config() -> Arc<ClientConfig> {
+    Arc::clone(&DEFAULT_TLS_CONFIG)
 }
