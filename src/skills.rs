@@ -218,7 +218,16 @@ pub fn parse_skill_content(path: &Path, raw: &str) -> Option<ParsedSkill> {
             parts.push(format!("Argument hint: {h}"));
         }
     }
-    let description = Some(parts.join("\n\n"));
+    // `None` rather than `Some("")` when there's nothing to describe — the
+    // LLM analyzer treats a missing description differently from an empty
+    // one (the prompt template renders "No description" instead of an
+    // empty field). Only happens when arguments were parsed from a hint
+    // but description and body are both empty.
+    let description = if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    };
     // Source-path provenance lives on heuristic findings (via the
     // `context` field on `YaraScanResult`) rather than inside the
     // analyzed `description`. Putting absolute paths into text the
@@ -252,48 +261,153 @@ pub fn parse_skill_content(path: &Path, raw: &str) -> Option<ParsedSkill> {
     })
 }
 
-/// Tokens in `allowed-tools` that grant unrestricted shell/filesystem access
-/// when granted blanket. Hits here become an `OverbroadAllowedTools`
-/// finding that maps to OWASP MCP03 (excessive agency). We deliberately
-/// cast a narrow net — the goal is "this skill quietly asked for the keys
-/// to the kingdom," not "this skill uses any tool we don't know about."
-const DANGEROUS_GRANT_PATTERNS: &[&str] = &[
-    "bash(*)", "bash:*", "shell(*)", "shell:*", "rm:*", "rm(*)", "sudo:*", "sudo(*)", "exec:*",
-    "exec(*)", "eval:*", "eval(*)", "*",
+/// Tools that, when granted without a restriction, give the agent
+/// arbitrary code execution on the user's machine. A bare `Bash` grant is
+/// just as dangerous as `Bash(*)` — Claude Code interprets a tool name
+/// without parens as unrestricted. Tightly bounded grants like
+/// `Bash(git status:*)` are silent.
+const CODE_EXECUTION_TOOLS: &[&str] = &[
+    "bash", "shell", "sh", "zsh", "exec", "eval", "run", "rm", "sudo",
 ];
 
-/// Detect overbroad `allowed-tools` grants. The frontmatter is treated as
-/// a comma- or newline-separated list of tokens like `Bash(git status:*),
-/// Read, Write`. We normalize each token (lowercase, strip whitespace) and
-/// flag matches against `DANGEROUS_GRANT_PATTERNS`.
+/// Tools that let a skill exfiltrate data over the network. Even a
+/// well-bounded `WebFetch(https://example.com/*)` skill can reflect
+/// arbitrary content into the URL's path — but the operator should at
+/// least be aware the skill is talking to the network, so we flag any
+/// grant of these as an informational `DataExfiltrationGrant`. Maps to
+/// MCP09 (sensitive-data exposure) + MCP06 (credential leakage).
+const DATA_EXFIL_TOOLS: &[&str] = &["webfetch", "websearch", "fetch", "browse"];
+
+/// A single token from an `allowed-tools` field, parsed into the tool
+/// name and (optional) restriction clause. Three syntactic forms in the
+/// wild:
+///
+/// - `Bash` — bare tool name, no restriction → unrestricted grant
+/// - `Bash(git status:*)` — parenthesized restriction
+/// - `Bash:git status:*` — colon-separated restriction (older syntax)
+///
+/// `restriction` is `None` only for the bare-name form. An empty string
+/// or `*` restriction is treated as "no restriction" by the policy below.
+struct ParsedGrant<'a> {
+    raw: &'a str,
+    tool: String,
+    restriction: Option<String>,
+}
+
+/// Parse a single `allowed-tools` token. Robust to leading/trailing
+/// whitespace and to the two restriction syntaxes Claude Code accepts.
+/// Returns `None` for empty or whitespace-only tokens.
+fn parse_grant_token(token: &str) -> Option<ParsedGrant<'_>> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Parenthesized form: "Bash(git status:*)". We split on the first '(';
+    // the closing ')' is best-effort — malformed grants like "Bash(foo"
+    // still parse with restriction = "foo".
+    if let Some((tool_raw, rest)) = trimmed.split_once('(') {
+        let restriction = rest.trim_end_matches(')').trim().to_string();
+        return Some(ParsedGrant {
+            raw: token,
+            tool: tool_raw.trim().to_ascii_lowercase(),
+            restriction: Some(restriction),
+        });
+    }
+    // Colon form: "Bash:git status:*". Tool is the segment before the
+    // first colon; the rest (re-joined) is the restriction.
+    if let Some((tool_raw, rest)) = trimmed.split_once(':') {
+        return Some(ParsedGrant {
+            raw: token,
+            tool: tool_raw.trim().to_ascii_lowercase(),
+            restriction: Some(rest.trim().to_string()),
+        });
+    }
+    // Bare form: "Bash". No restriction.
+    Some(ParsedGrant {
+        raw: token,
+        tool: trimmed.to_ascii_lowercase(),
+        restriction: None,
+    })
+}
+
+/// True when a parsed grant grants unrestricted access to its tool —
+/// either no restriction at all, an empty restriction, or a wildcard.
+fn is_unrestricted(grant: &ParsedGrant<'_>) -> bool {
+    match grant.restriction.as_deref() {
+        None => true,
+        Some("") => true,
+        Some(r) => {
+            let collapsed: String = r.split_whitespace().collect();
+            collapsed == "*" || collapsed.is_empty()
+        }
+    }
+}
+
+/// Detect overbroad `allowed-tools` grants. Splits the grant string on
+/// commas/newlines, parses each token via `parse_grant_token`, and emits
+/// findings based on the tool class:
+///
+/// - **CODE_EXECUTION_TOOLS** with no/wildcard restriction → high-severity
+///   `OverbroadAllowedTools` (MCP03 — excessive agency).
+/// - A bare `*` token (grants every tool) → same high-severity finding.
+/// - **DATA_EXFIL_TOOLS** at any restriction level → medium-severity
+///   `DataExfiltrationGrant` (MCP09 + MCP06).
+///
+/// Tightly-bounded code-execution grants (`Bash(git status:*)`) and
+/// non-network/non-execution tools (`Read`, `Write`, `Glob`) are silent.
 fn analyze_allowed_tools(skill_name: &str, path: &Path, grant: &str) -> Vec<YaraScanResult> {
     let mut findings: Vec<YaraScanResult> = Vec::new();
-    let tokens = grant
-        .split([',', '\n'])
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty());
-    for token in tokens {
-        let normalized = token.to_ascii_lowercase();
-        let normalized_collapsed: String = normalized.split_whitespace().collect();
-        if DANGEROUS_GRANT_PATTERNS
-            .iter()
-            .any(|p| normalized == *p || normalized_collapsed == *p)
-        {
+    for raw in grant.split([',', '\n']) {
+        let Some(parsed) = parse_grant_token(raw) else {
+            continue;
+        };
+
+        // Bare wildcard token — "*" alone — grants everything.
+        if parsed.tool == "*" {
             findings.push(make_heuristic_finding(
                 "OverbroadAllowedTools",
                 "high",
                 format!(
-                    "Skill '{skill_name}' grants tool '{token}' which permits unrestricted \
-                     command execution. Restrict to specific subcommands (e.g. \
-                     `Bash(git status:*)`) or remove the wildcard."
+                    "Skill '{skill_name}' grants `*` (all tools). This bypasses every \
+                     per-tool restriction. Replace with the specific tools the skill \
+                     actually needs."
                 ),
                 skill_name,
                 path,
             ));
-            // One finding per unique pattern keeps the report readable; bail
-            // after the first hit on a token rather than emitting one per
-            // matching pattern entry.
             continue;
+        }
+
+        if CODE_EXECUTION_TOOLS.contains(&parsed.tool.as_str()) && is_unrestricted(&parsed) {
+            findings.push(make_heuristic_finding(
+                "OverbroadAllowedTools",
+                "high",
+                format!(
+                    "Skill '{skill_name}' grants tool `{}` without a restriction, which \
+                     permits arbitrary command execution. Restrict to specific \
+                     subcommands (e.g. `Bash(git status:*)`) or replace with a bounded \
+                     tool.",
+                    parsed.raw.trim()
+                ),
+                skill_name,
+                path,
+            ));
+            continue;
+        }
+
+        if DATA_EXFIL_TOOLS.contains(&parsed.tool.as_str()) {
+            findings.push(make_heuristic_finding(
+                "DataExfiltrationGrant",
+                "medium",
+                format!(
+                    "Skill '{skill_name}' grants `{}` — a network-egress tool that can \
+                     send skill input or local file content to remote URLs. Confirm the \
+                     skill needs network access and that any URL pattern is bounded.",
+                    parsed.raw.trim()
+                ),
+                skill_name,
+                path,
+            ));
         }
     }
     findings
@@ -453,7 +567,14 @@ fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
     };
     if let Some(close_idx) = find_frontmatter_close(after_open) {
         let frontmatter = &after_open[..close_idx];
-        let body_start = close_idx + after_open[close_idx..].find('\n').map_or(0, |n| n + 1);
+        // Body starts after the `---` line. If the closing marker has a
+        // trailing newline we skip past it; if it's the last thing in the
+        // file (no trailing newline) we land exactly at end-of-string and
+        // body becomes "" rather than the marker itself.
+        let body_start = match after_open[close_idx..].find('\n') {
+            Some(n) => close_idx + n + 1,
+            None => after_open.len(),
+        };
         let body = &after_open[body_start..];
         return (Some(frontmatter), body);
     }
@@ -581,6 +702,12 @@ pub fn discover_skills_in_root(root: &Path) -> Result<Vec<PathBuf>> {
 pub fn default_discovery_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
+    // Env-var roots are operator-trusted: ramparts walks them as-is, so
+    // anyone who can set `RAMPARTS_SKILL_ROOTS` can point the scanner at
+    // any directory the running user can read. That's the same trust
+    // model as `--path`, but it's worth being explicit since env vars
+    // can be smuggled into less-obvious places (CI configs, IDE
+    // launchers, shell parents).
     if let Ok(extra) = std::env::var(SKILL_ROOTS_ENV) {
         for entry in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             roots.push(expand_tilde(entry));
@@ -781,6 +908,35 @@ mod tests {
     }
 
     #[test]
+    fn closing_frontmatter_marker_without_trailing_newline_yields_empty_body() {
+        // Edge case: a file that ends exactly at the closing `---` with
+        // no trailing newline. Earlier implementations included the
+        // closing marker itself in the body string, producing skills
+        // whose description was literally "---".
+        let path = PathBuf::from("trim.md");
+        let raw = "---\ndescription: hi\n---";
+        let parsed = parse_skill_content(&path, raw).unwrap();
+        let desc = parsed.prompt.description.expect("description");
+        assert_eq!(desc, "hi");
+        assert!(!desc.contains("---"), "marker leaked into body: {desc}");
+    }
+
+    #[test]
+    fn argument_only_skill_has_none_description_not_empty_string() {
+        // Args parsed, but description and body are both empty. The
+        // prompt should report `description: None` rather than `Some("")`
+        // so the LLM analyzer's template renders "No description"
+        // instead of a blank field.
+        let parsed = parse("args-only.md", "---\nargument-hint: <name>\n---\n");
+        assert!(
+            parsed.prompt.description.is_none(),
+            "expected None, got {:?}",
+            parsed.prompt.description
+        );
+        assert_eq!(parsed.prompt.arguments.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
     fn dangerous_allowed_tools_grant_emits_finding() {
         let parsed = parse(
             "danger.md",
@@ -798,6 +954,52 @@ mod tests {
     }
 
     #[test]
+    fn bare_bash_grant_is_treated_as_unrestricted() {
+        // The most-common dangerous grant in real skills: `Bash` with no
+        // parens. Claude Code interprets a bare tool name as unrestricted,
+        // so we must treat it the same as `Bash(*)`.
+        let parsed = parse(
+            "bare.md",
+            "---\ndescription: stub\nallowed-tools: Bash, Read\n---\nbody\n",
+        );
+        let overbroad = parsed
+            .heuristic_findings
+            .iter()
+            .find(|f| f.rule_name == "OverbroadAllowedTools")
+            .expect("bare Bash should fire OverbroadAllowedTools");
+        let desc = overbroad
+            .rule_metadata
+            .as_ref()
+            .and_then(|m| m.description.as_deref())
+            .unwrap_or("");
+        assert!(
+            desc.contains("Bash"),
+            "finding description should reference the offending tool: {desc}"
+        );
+    }
+
+    #[test]
+    fn star_grant_alone_fires_overbroad() {
+        let parsed = parse(
+            "wide-open.md",
+            "---\ndescription: stub\nallowed-tools: \"*\"\n---\nbody\n",
+        );
+        assert!(parsed
+            .heuristic_findings
+            .iter()
+            .any(|f| f.rule_name == "OverbroadAllowedTools"));
+    }
+
+    #[test]
+    fn colon_form_grant_with_wildcard_fires_overbroad() {
+        let parsed = parse("colon.md", "---\nallowed-tools: bash:*\n---\nbody\n");
+        assert!(parsed
+            .heuristic_findings
+            .iter()
+            .any(|f| f.rule_name == "OverbroadAllowedTools"));
+    }
+
+    #[test]
     fn safe_allowed_tools_grant_emits_no_finding() {
         let parsed = parse(
             "safe.md",
@@ -807,6 +1009,82 @@ mod tests {
             .heuristic_findings
             .iter()
             .all(|f| f.rule_name != "OverbroadAllowedTools"));
+    }
+
+    #[test]
+    fn read_write_alone_are_not_flagged() {
+        // Bare `Read` / `Write` / `Glob` are bounded by their own
+        // semantics (filesystem-only) and shouldn't be treated like
+        // bare `Bash`. This test guards against an over-eager future
+        // tightening of CODE_EXECUTION_TOOLS.
+        let parsed = parse(
+            "fs-only.md",
+            "---\ndescription: read some files\nallowed-tools: Read, Write, Glob, Grep\n---\nbody\n",
+        );
+        assert!(
+            parsed.heuristic_findings.is_empty(),
+            "expected no findings, got {:?}",
+            parsed
+                .heuristic_findings
+                .iter()
+                .map(|f| f.rule_name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn webfetch_grant_emits_data_exfiltration_finding() {
+        let parsed = parse(
+            "exfil.md",
+            "---\ndescription: fetch a thing\nallowed-tools: WebFetch\n---\nbody\n",
+        );
+        assert!(parsed
+            .heuristic_findings
+            .iter()
+            .any(|f| f.rule_name == "DataExfiltrationGrant"));
+    }
+
+    #[test]
+    fn data_exfiltration_grant_carries_owasp_tags() {
+        let parsed = parse(
+            "exfil.md",
+            "---\ndescription: web stuff\nallowed-tools: WebFetch(https://example.com/*)\n---\nbody\n",
+        );
+        let exfil = parsed
+            .heuristic_findings
+            .iter()
+            .find(|f| f.rule_name == "DataExfiltrationGrant")
+            .expect("DataExfiltrationGrant finding");
+        let ids: Vec<_> = exfil.owasp_tags.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"MCP09"), "expected MCP09 tag, got {ids:?}");
+        assert!(ids.contains(&"MCP06"), "expected MCP06 tag, got {ids:?}");
+    }
+
+    #[test]
+    fn parse_grant_token_handles_three_syntaxes() {
+        // Bare
+        let g = parse_grant_token("Bash").unwrap();
+        assert_eq!(g.tool, "bash");
+        assert!(g.restriction.is_none());
+        assert!(is_unrestricted(&g));
+
+        // Parenthesized
+        let g = parse_grant_token("Bash(git status:*)").unwrap();
+        assert_eq!(g.tool, "bash");
+        assert_eq!(g.restriction.as_deref(), Some("git status:*"));
+        assert!(!is_unrestricted(&g));
+
+        // Colon form
+        let g = parse_grant_token("Bash:foo").unwrap();
+        assert_eq!(g.tool, "bash");
+        assert_eq!(g.restriction.as_deref(), Some("foo"));
+
+        // Empty paren -> wildcard-equivalent
+        let g = parse_grant_token("Bash()").unwrap();
+        assert!(is_unrestricted(&g));
+
+        // Whitespace only -> None
+        assert!(parse_grant_token("   ").is_none());
     }
 
     #[test]

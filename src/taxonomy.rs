@@ -118,9 +118,10 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
 
         // Synthetic findings emitted by the skill parser (src/skills.rs)
         // for structural risks the YARA passes can't see (frontmatter
-        // grants, missing triggers).
+        // grants, missing triggers, network-egress tool grants).
         "OverbroadAllowedTools" => vec![OwaspTag::new("MCP03")],
         "VagueSkillTrigger" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
+        "DataExfiltrationGrant" => vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")],
 
         _ => Vec::new(),
     }
