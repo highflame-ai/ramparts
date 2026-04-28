@@ -14,6 +14,10 @@ ramparts server [options]
 # Scan from IDE configuration files
 ramparts scan-config [options]
 
+# Scan AI agent skills (Claude Code commands, etc.)
+ramparts skills scan <path>      [options]
+ramparts skills scan-config      [options]
+
 # Re-emit a previously-saved scan result in another format
 ramparts replay <path> [--format <FORMAT>]
 
@@ -28,6 +32,7 @@ ramparts mcp-sse   [--host HOST] [--port PORT]   # alias of mcp-http (rmcp 1.x f
 # Show help
 ramparts --help
 ramparts scan --help
+ramparts skills --help
 ```
 
 ## Global Options
@@ -209,6 +214,168 @@ Claude-Desktop-style `{"mcpServers": ...}` document saved at a VS Code path),
 ramparts falls through to the multi-format parser chain rather than silently
 treating it as empty. Files that contain no recognizable MCP server entries
 appear in the discovery summary with `0 servers` and are skipped.
+
+## Skills Command
+
+Scan AI agent skills (Claude Code custom slash commands, Cursor skills,
+markdown skill repos) for security issues. Skills are markdown files
+containing prompt instructions an agent loads and executes by name —
+sharing a threat model with MCP prompts (untrusted instructions an agent
+may follow). Ramparts parses each skill's frontmatter and body, treats
+it as an MCP prompt, and runs the same security pipeline (LLM analysis,
+YARA pre/post scan, OWASP tagging, terminal/JSON/SARIF rendering) used
+for live MCP servers. No network calls — pure static analysis on disk.
+
+### Subcommands
+
+```bash
+ramparts skills scan <PATH>          [OPTIONS]
+ramparts skills scan-config          [OPTIONS]
+```
+
+### `skills scan`
+
+Scan a single skill file or every `*.md` skill under a directory.
+
+**Arguments**
+- `<PATH>` — path to a skill file or a directory containing skill files
+
+**Options**
+```bash
+Options:
+      --format <FORMAT>     Output format [default: from config.yaml]
+                            [possible values: text, table, json, raw, sarif]
+      --report              Generate detailed markdown report
+      --timeout <SECONDS>   Overall scan timeout
+  -h, --help                Print help information
+```
+
+**Examples**
+```bash
+# Single skill
+ramparts skills scan ./.claude/commands/deploy.md
+
+# Every *.md skill under a directory (recursive; symlinks not followed;
+# common build dirs like .git, node_modules, target are skipped)
+ramparts skills scan ./.claude/commands
+
+# SARIF output for GitHub Code Scanning
+ramparts skills scan ./.claude/commands --format sarif > skills.sarif
+```
+
+### `skills scan-config`
+
+Discover and scan skills from well-known locations across supported
+IDE/agent ecosystems. Both the per-user (`$HOME`) and per-workspace
+(`$CWD`) variants of each ecosystem are walked:
+
+- `.claude/commands/`, `.claude/skills/` — Claude Code
+- `.cursor/commands/`, `.cursor/skills/` — Cursor
+- `.codex/commands/`, `.codex/skills/` — OpenAI Codex
+- `.windsurf/commands/` — Windsurf
+- `.gemini/commands/` — Gemini
+- `.openai/commands/` — generic OpenAI agent skills
+
+Add extra roots without rebuilding via the `RAMPARTS_SKILL_ROOTS`
+environment variable (comma-separated paths; leading `~/` is expanded
+to `$HOME`):
+
+```bash
+export RAMPARTS_SKILL_ROOTS="~/work/agent-skills,/srv/shared-skills"
+ramparts skills scan-config
+```
+
+**Options** (same as `scan`):
+```bash
+Options:
+      --format <FORMAT>     Output format [default: from config.yaml]
+      --report              Generate detailed markdown report
+      --timeout <SECONDS>   Overall scan timeout
+```
+
+### Skill File Format
+
+Skill files are markdown with optional YAML frontmatter:
+
+```markdown
+---
+description: One-liner shown in the agent's command picker
+argument-hint: <env>
+---
+
+# Body of the skill
+
+The body is the prompt the agent executes when this skill is invoked.
+Ramparts treats this body as untrusted instructions and runs prompt-
+injection / sensitive-data-exposure / jailbreak checks over it.
+```
+
+The parser is permissive: missing or malformed frontmatter is treated as
+"no frontmatter" and the body is still scanned. The filename stem becomes
+the skill name unless the frontmatter sets `name`. Anything in
+`argument-hint` becomes the prompt's argument metadata for downstream
+tools.
+
+### What Skills Get Tagged
+
+Findings on skills propagate the same OWASP MCP Top 10 tags as live MCP
+prompt findings. The most common categories that fire on malicious
+skills are:
+
+- **MCP01 — Prompt Injection**: hidden instructions, "ignore previous
+  prompts" patterns, role-override attempts
+- **MCP02 — Tool Poisoning**: skills whose body conflicts with their
+  stated description
+- **MCP03 — Excessive Agency**: skills that assert elevated privileges
+- **MCP06 / MCP09**: secrets / PII / sensitive-data exposure
+
+In addition to the YARA pre-scan and LLM analysis, the parser emits
+structural findings the regex/LLM pipeline can't see:
+
+- **OverbroadAllowedTools** (MCP03): an `allowed-tools` grant gives
+  unrestricted code execution — bare `Bash`, `Bash(*)`, `Bash(*:*)`,
+  bare `*`, `rm:*`, `sudo:*`, etc.
+- **DataExfiltrationGrant** (MCP06 + MCP09): a `WebFetch` /
+  `WebSearch` / `Fetch` / `Browse` grant — flagged informationally so
+  the operator knows the skill talks to the network.
+- **VagueSkillTrigger** (MCP02 + MCP03): a substantive skill body
+  with a missing or one-word `description` — easy to mis-invoke.
+- **GenericSkillTrigger** (MCP02 + MCP03): the description is a
+  semantically vacuous trigger phrase (`"help"`, `"assistant"`,
+  `"a general purpose tool"`, `"do anything"`, ...) that causes the
+  agent's router to invoke the skill on unrelated requests —
+  trigger-hijack vector.
+- **SkillSensitiveFileReference** (MCP06 + MCP09): the body uses
+  Claude Code's `@<path>` syntax to inline a sensitive file
+  (SSH/AWS/GnuPG/kube/docker credentials, `.env`, `.netrc`,
+  `.npmrc`, `.pypirc`, certificates) into the prompt context.
+- **SkillNameCollision** (MCP02 + MCP03): two or more skill files
+  declare the same `name` (case-insensitive). One shadows the other
+  in the agent's router — an attacker who can write a workspace-
+  level skill with the same name as a trusted user-level skill can
+  silently replace it. Cross-skill check; runs once per scan.
+- **SkillEmbeddedPayload** (MCP01 + MCP10): the body contains a
+  500-character-or-longer base64-shape (or hex-shape) blob. Embedded
+  payloads bypass plaintext YARA rules and LLM analysis by deferring
+  decoding to runtime — the LLM sees `aW1wb3J0IG9z...` and shrugs.
+  Markdown image data URIs (`data:image/...;base64,...`) are
+  excluded.
+
+Three skill-targeted YARA rules complement the structural heuristics
+above by scanning the body content itself:
+
+- **SkillCredentialHarvesting** (MCP06 + MCP09): vendor-specific token
+  formats (`AKIA...`, `ghp_...`, `sk-ant-api...`, `sk-proj-...`,
+  `AIzaSy...`, `xox[abprs]-...`), inline PEM private-key blocks, and
+  active credential-theft verbs (`steal/grab/exfiltrate <credential>`).
+- **SkillToolChainingExfiltration** (MCP06 + MCP09): credential-file
+  read combined with network egress to known exfil destinations
+  (Discord webhooks, Telegram bot API, pastebin, ngrok / requestbin /
+  webhook.site tunnels) or attacker-named hosts.
+- **SkillSystemManipulation** (MCP03 + MCP04): destructive operations
+  and privilege escalation — `dd if=/dev/zero`, `wipefs`, `shred`,
+  recursive deletion of system roots, `chmod 777 /`, `sudo -i`,
+  `LD_PRELOAD=` hijack, PATH poisoning, writes to `/etc/sudoers`.
 
 ## Replay Command
 

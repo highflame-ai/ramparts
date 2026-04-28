@@ -32,7 +32,7 @@ MCP servers expose powerful capabilities—file systems, databases, APIs, and sy
 
 ### What Ramparts Does
 
-Ramparts provides **security scanning** of MCP servers by:
+Ramparts provides **security scanning** of the MCP ecosystem by:
 
 1. **Discovering Capabilities**: Scans all MCP endpoints to identify available tools, resources, and prompts
 2. **Multi-Transport Support**: Supports HTTP, SSE, stdio, and subprocess transports with intelligent fallback
@@ -40,7 +40,10 @@ Ramparts provides **security scanning** of MCP servers by:
 4. **Static Analysis**: Performs yara-based checks for common vulnerabilities
 5. **Cross-Origin Analysis**: Detects when tools span multiple domains, which could enable context hijacking or injection attacks
 6. **LLM-Powered Analysis**: Uses AI models to detect sophisticated security issues
-7. **Risk Assessment**: Categorizes findings by severity and provides actionable recommendations
+7. **Supply-Chain Coverage**: Queries OSV.dev for known vulnerabilities in npx/uvx-launched stdio MCP servers
+8. **Skill Scanning**: Same threat model, applied to agent skill markdown files (Claude Code commands, etc.) on disk
+9. **OWASP MCP Top 10 Tagging**: Every finding is mapped to a versioned OWASP MCP Top 10 entry — visible in terminal, JSON, SARIF, and markdown reports
+10. **Risk Assessment**: Categorizes findings by severity and provides actionable recommendations
 >
 > **💡 Jump directly to detailed Rampart features?**
 > [**📚 Detailed Features**](docs/features.md)
@@ -86,7 +89,29 @@ ramparts scan-config
 
 # With detailed report generation
 ramparts scan-config --report
+
+# Walk a checked-in repo of IDE configs (great for CI on a configs-only repo)
+ramparts scan-config --root ./ide-configs
 ```
+
+**Scan AI agent skills (Claude Code commands, etc.)**
+```bash
+# Scan a single skill file or every *.md skill under a directory
+ramparts skills scan ./.claude/commands
+
+# Discover skills across supported ecosystems (Claude Code, Cursor,
+# Codex, Windsurf, Gemini) at the user and workspace level. Add extra
+# roots with RAMPARTS_SKILL_ROOTS=path1,path2.
+ramparts skills scan-config
+
+# SARIF output for code-scanning ingestion
+ramparts skills scan ./.claude/commands --format sarif > skills.sarif
+```
+
+Skills are markdown files containing prompt instructions an agent loads and
+executes by name. Ramparts parses each skill's frontmatter and body and runs
+the same security pipeline (LLM analysis, YARA pre/post scan, OWASP MCP Top
+10 tagging) used for live MCP servers — pure static analysis on disk.
 
 > **💡 Did you know you can start Ramparts as a server?** Run `ramparts server` to get a REST API for continuous monitoring and CI/CD integration. See 📚 **[Ramparts Server Mode](docs/api.md)** 
 

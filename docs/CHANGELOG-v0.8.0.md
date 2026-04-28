@@ -54,6 +54,94 @@ The taxonomy is pinned to a versioned YAML file (`taxonomies/owasp-mcp-top-10/20
 | MCP09 | Sensitive Data Exposure | `PIILeakage`, secret findings |
 | MCP10 | Supply Chain | `MCPConfigRisk`, `VulnerableDependency` |
 
+### Agent skill scanning
+
+New `ramparts skills` subcommand for scanning AI agent skill files —
+markdown documents containing prompt instructions an agent loads and
+executes by name (Claude Code custom slash commands, Cursor agent
+skills, Codex / Windsurf / Gemini equivalents). Skills share a threat
+model with MCP prompts (untrusted instructions an agent may follow), so
+the existing security pipeline applies directly.
+
+```bash
+# Scan a single file or every *.md skill under a directory
+ramparts skills scan ./.claude/commands
+
+# Discover skills across supported ecosystems automatically
+ramparts skills scan-config
+
+# SARIF for code-scanning ingestion
+ramparts skills scan ./.claude/commands --format sarif > skills.sarif
+```
+
+`scan-config` walks `~/<dotdir>/{commands,skills}` and the same paths
+under the current workspace for every supported ecosystem (`.claude`,
+`.cursor`, `.codex`, `.windsurf`, `.gemini`, `.openai`). Add extra
+roots without rebuilding via the **`RAMPARTS_SKILL_ROOTS`** env var
+(comma-separated paths, leading `~/` expanded).
+
+**6 skill-targeted YARA rules** (parsed body content):
+
+- `PromptInjectionSignature` — instruction-override patterns ("ignore
+  all previous", role redefinition, hide-from-user behavior)
+- `UnicodeSteganography` — invisible / Tags-block / RTLO Unicode
+- `CoerciveInjection` — mandatory-execution language, tool poisoning
+- `IndirectPromptInjection` — delegating to untrusted external content
+- `AutonomyAbuse` — skip-confirmation, override-user, infinite retry,
+  self-modify, privilege-escalation
+- `CapabilityInflation` — keyword stuffing, "use this first", deceptive
+  certification claims, hidden activation triggers
+
+**3 additional skill-targeted YARA rules** (written for ramparts):
+
+- `SkillCredentialHarvesting` — vendor token formats (`AKIA...`,
+  `ghp_...`, `sk-ant-api...`, `sk-proj-...`, `AIzaSy...`,
+  `xox[abprs]-...`), inline PEM private-key blocks, active credential-
+  theft verbs
+- `SkillToolChainingExfiltration` — credential-file read + network
+  egress to known exfil destinations (Discord webhooks, Telegram,
+  pastebin, ngrok / requestbin / webhook.site tunnels)
+- `SkillSystemManipulation` — `dd if=/dev/zero`, `wipefs`, `shred`,
+  `rm -rf /etc`, `chmod 777 /`, `sudo -i`, `LD_PRELOAD=` hijack,
+  PATH poisoning
+
+**6 structural heuristics** (parser-emitted, things YARA can't see):
+
+- `OverbroadAllowedTools` — `allowed-tools` grant gives unrestricted
+  code execution (bare `Bash`, `Bash(*)`, `Bash(*:*)`, `*`)
+- `DataExfiltrationGrant` — `WebFetch` / `WebSearch` / `Fetch` /
+  `Browse` grant
+- `VagueSkillTrigger` — substantive body with missing / one-word
+  description
+- `GenericSkillTrigger` — description is a vacuous trigger phrase
+  (`"help"`, `"a general purpose assistant"`, `"do anything"`)
+- `SkillSensitiveFileReference` — Claude Code `@<path>` syntax inlines
+  a sensitive file (SSH/AWS/GnuPG/kube/docker creds, `.env`,
+  `.netrc`) into prompt context
+- `SkillNameCollision` — two or more skill files declare the same
+  `name` (cross-skill check, runs once per scan)
+- `SkillEmbeddedPayload` — body contains a 500+ char base64 / hex
+  blob (defers decoding to runtime to bypass YARA + LLM analysis;
+  data-URI image blobs are excluded)
+
+**Pre-existing rule tightening**: in the process of running the
+scanner against real internal skills, three pre-existing rules
+(`command_injection.yar`, `sql_injection.yar`, `secrets_leakage.yar`)
+were tightened to remove patterns that fired on technical
+documentation — markdown headings (`#`) being read as SQL comments,
+`docker exec` matching bare `exec`, `rm -rf node_modules` matching
+`rm -rf` without target check, `req.AccountID = claims.AccountID`
+matching the secret-assignment pattern. Real attack signatures are
+preserved; FPs on doc-heavy content are gone.
+
+Routed end-to-end through the existing pipeline: each skill becomes
+a synthetic `MCPPrompt` for the LLM analyzer, runs through the YARA
+pre-scan, gets OWASP MCP Top 10 tags, and renders identically to MCP
+prompt findings in terminal / JSON / SARIF / markdown reports.
+Skills with body > 2 MB are skipped; the directory walker honors the
+same conventions as `scan-config --root` (no symlinks, build-dir
+skip, depth cap 16).
+
 ### Supply-chain dependency scan via OSV.dev (#104)
 
 When a stdio MCP server is launched via `npx` (npm) or `uvx` (PyPI), ramparts now extracts the package name + version from the launch command and queries [OSV.dev](https://osv.dev) for known security advisories. Findings emit as `VulnerableDependency` entries, mapped to OWASP **MCP10 Supply Chain**.
@@ -175,10 +263,11 @@ Cleared RUSTSEC-2026-0097 (rand unsoundness) and the older yara-x advisory chain
 
 ## 📚 Documentation
 
-- `cli.md` — replaced the stale flag list (`--output`, `--detailed`, `--min-severity`, `--pretty` — none existed in the actual CLI) with the real flags, documented the new `--timeout` / `--http-timeout` / `--root` / `--only` / `--format sarif` / `replay` / `mcp-stdio|http|sse` surface, added a SARIF + GitHub Code Scanning integration example.
-- `features.md` — added subsections covering OWASP MCP Top 10 mapping, OSV.dev supply-chain check, SARIF, and replay mode.
-- `security-features.md` — added a "Vulnerable Dependencies (Supply Chain)" section under the threat catalog and a full OWASP MCP Top 10 mapping table.
-- `troubleshooting.md` — replaced the generic SSL advice with the specific "No CA certificates were loaded" error and noted that the bundled Mozilla CA list makes the host trust store no longer load-bearing.
+- `cli.md` — replaced the stale flag list (`--output`, `--detailed`, `--min-severity`, `--pretty` — none existed in the actual CLI) with the real flags, documented the new `--timeout` / `--http-timeout` / `--root` / `--only` / `--format sarif` / `replay` / `mcp-stdio|http|sse` surface, added a SARIF + GitHub Code Scanning integration example. New "Skills Command" section documents `ramparts skills scan` / `scan-config`, the supported skill formats, and the 16 skill-specific findings.
+- `features.md` — added subsections covering OWASP MCP Top 10 mapping, OSV.dev supply-chain check, SARIF, replay mode, and skill scanning.
+- `security-features.md` — added a "Vulnerable Dependencies (Supply Chain)" section under the threat catalog, a full OWASP MCP Top 10 mapping table, and a "Skill Scanning" section describing the 16 skill-specific findings.
+- `troubleshooting.md` — replaced the generic SSL advice with the specific "No CA certificates were loaded" error and noted that the bundled Mozilla CA list makes the host trust store no longer load-bearing. Added a "Skill Scanning Issues" section.
+- `configuration.md` — documented the `RAMPARTS_SKILL_ROOTS` env var.
 
 ## 🚀 Migration guide
 

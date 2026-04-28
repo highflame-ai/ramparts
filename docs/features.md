@@ -166,6 +166,50 @@ ramparts scan-config --format sarif > ramparts.sarif
 Each finding includes its OWASP MCP Top 10 ID as a SARIF tag and a
 numeric `security-severity` (0–10) so the right severity badge renders.
 
+### Skill Scanning
+
+Ramparts also scans **agent skills** — markdown files containing prompt
+instructions that an agent loads and executes by name (Claude Code's
+`.claude/commands/*.md`, Cursor agent skills, etc.). Same threat model
+as MCP prompts (untrusted instructions an agent may follow), so the
+existing security pipeline applies directly:
+
+```bash
+# Scan a directory of skills
+ramparts skills scan ./.claude/commands
+
+# Discover and scan from well-known locations (~/.claude/commands etc.)
+ramparts skills scan-config
+
+# SARIF output for code-scanning ingestion
+ramparts skills scan ./.claude/commands --format sarif > skills.sarif
+```
+
+The parser handles YAML frontmatter (`description`, `argument-hint`,
+`name`, `allowed-tools` in both inline-string and YAML-list shapes)
+plus a markdown body, treats each skill as an MCP prompt, and runs
+LLM analysis + YARA + OWASP tagging over it. On top of that, it
+emits structural findings the regex/LLM pipeline can't see:
+
+- `OverbroadAllowedTools` — bare `Bash`, `Bash(*)`, `Bash(*:*)`, etc.
+- `DataExfiltrationGrant` — `WebFetch` / `WebSearch` / `Fetch` /
+  `Browse` grants that let the skill talk to the network
+- `VagueSkillTrigger` — substantive body with a missing or one-word
+  `description` (easy to mis-invoke)
+- `SkillSensitiveFileReference` — Claude Code `@<path>` references
+  pointing at SSH/AWS/GnuPG/kube/docker credentials, `.env`,
+  `.netrc`, certificates, etc.
+
+`scan-config` walks `~/<dotdir>/{commands,skills}` and the same paths
+under the current workspace for every supported ecosystem (Claude
+Code, Cursor, Codex, Windsurf, Gemini, OpenAI). Add extra roots
+without rebuilding via `RAMPARTS_SKILL_ROOTS=path1,path2,...`. The
+output flows through the same renderers you use for MCP server scans,
+so SARIF / JSON / terminal output works identically.
+
+📖 **[CLI reference](cli.md#skills-command)** for the full flag list and
+supported skill formats.
+
 ### Replay Mode
 
 Scan once, render many times. The `replay` subcommand reads a previously

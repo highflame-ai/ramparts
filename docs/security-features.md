@@ -120,6 +120,92 @@ Jailbreak attacks involve sophisticated attempts to bypass AI safety measures an
 
 Ramparts looks for patterns that suggest tools might be designed to enable jailbreaking, including tools that could be chained together to bypass restrictions, tools that seem designed to manipulate AI behavior, and tools that might provide pathways around safety measures.
 
+### Skill Scanning (Agent Skill Files)
+
+Beyond live MCP servers, ramparts also scans **agent skills** —
+markdown files containing prompt instructions an agent loads and
+executes by name (Claude Code custom slash commands, Cursor agent
+skills, Codex / Windsurf / Gemini equivalents). Skills share a threat
+model with MCP prompts (untrusted instructions an agent may follow),
+so the existing security pipeline applies directly: each skill body
+becomes a synthetic `MCPPrompt` that runs through LLM analysis, the
+YARA pre-scan, OWASP MCP Top 10 tagging, and every renderer.
+
+```bash
+ramparts skills scan ./.claude/commands              # directory or file
+ramparts skills scan-config                          # auto-discover roots
+ramparts skills scan ./.claude/commands --format sarif > skills.sarif
+```
+
+In addition to running every existing rule against skill bodies,
+the parser emits **16 skill-specific findings** the live-MCP pipeline
+can't produce. These split into three groups:
+
+**Skill-targeted YARA rules over the body content (9 rules)**:
+
+- `PromptInjectionSignature`, `UnicodeSteganography`,
+  `CoerciveInjection`, `IndirectPromptInjection` — the four classic
+  prompt-injection classes adapted for skill prose.
+- `AutonomyAbuse` — skip-confirmation, override-user, infinite-retry,
+  self-modification, privilege-escalation language.
+- `CapabilityInflation` — keyword stuffing, "use this first" priority
+  manipulation, deceptive certification claims, hidden activation
+  triggers.
+- `SkillCredentialHarvesting` — vendor-specific token formats
+  (`AKIA...`, `ghp_...`, `sk-ant-api...`, `sk-proj-...`,
+  `AIzaSy...`, `xox[abprs]-...`), inline PEM private-key blocks,
+  active credential-theft verbs (`steal/exfiltrate <credential>`),
+  quoted env-var assignments with non-placeholder values.
+- `SkillToolChainingExfiltration` — credential-file read combined
+  with network egress to known exfil destinations (Discord webhooks,
+  Telegram bot API, pastebin, ngrok / requestbin / webhook.site
+  tunnels) or attacker-named hosts.
+- `SkillSystemManipulation` — disk-wiping (`dd if=/dev/zero`,
+  `wipefs`, `shred`), recursive deletion of system roots
+  (`rm -rf /etc`, `/usr`, `$HOME`), permission/ownership manipulation
+  (`chmod 777 /`, `chown root /`), critical-file writes
+  (`/etc/sudoers`, `/etc/shadow`), privilege escalation (`sudo -i`,
+  `runuser`, `doas`, `pkexec`), `LD_PRELOAD=` hijack, PATH poisoning.
+
+**Structural heuristics over the frontmatter (5 findings)**:
+
+- `OverbroadAllowedTools` (MCP03) — `allowed-tools:` grant gives
+  unrestricted code execution. Catches bare `Bash`, `Bash(*)`,
+  `Bash(*:*)`, `*` token, and the colon-form variants. Bounded
+  grants like `Bash(git status:*)` are silent.
+- `DataExfiltrationGrant` (MCP06+09) — `WebFetch` / `WebSearch` /
+  `Fetch` / `Browse` grant. Flagged informationally so the operator
+  knows the skill talks to the network.
+- `VagueSkillTrigger` (MCP02+03) — substantive skill body with a
+  missing or one-word `description` — easy to mis-invoke.
+- `GenericSkillTrigger` (MCP02+03) — description is a semantically
+  vacuous trigger phrase (`"help"`, `"a general purpose
+  assistant"`, `"do anything"`) that causes the agent's router to
+  invoke the skill on unrelated requests.
+- `SkillNameCollision` (MCP02+03) — two or more skill files declare
+  the same `name` (case-insensitive). One shadows the other in the
+  agent's router. Cross-skill check; runs once per scan.
+
+**Body-content heuristics (2 findings)**:
+
+- `SkillSensitiveFileReference` (MCP06+09) — Claude Code's
+  `@<path>` syntax inlines the referenced file's contents into
+  prompt context. Flags references to known sensitive paths (SSH /
+  AWS / GnuPG / kube / docker credentials, `.env`, `.netrc`,
+  `.npmrc`, `.pypirc`, certificates).
+- `SkillEmbeddedPayload` (MCP01+10) — body contains a 500+
+  character base64 / hex blob. Embedded payloads bypass plaintext
+  YARA rules and LLM analysis by deferring decoding to runtime.
+  Markdown image data URIs (`data:image/...;base64,...`) are
+  excluded.
+
+`scan-config` walks the per-user (`$HOME`) and per-workspace (CWD)
+variants of every supported ecosystem dotdir
+(`.claude`, `.cursor`, `.codex`, `.windsurf`, `.gemini`, `.openai`).
+Operators can supply additional roots via the
+**`RAMPARTS_SKILL_ROOTS`** environment variable (comma-separated
+paths, leading `~/` expanded).
+
 ### Vulnerable Dependencies (Supply Chain)
 
 When a stdio MCP server is launched via `npx` (npm) or `uvx` (PyPI),
