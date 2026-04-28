@@ -890,6 +890,11 @@ Example valid response: [{\"tool_name\": \"example\", \"found_issue\": true, \"i
             Err(e) => {
                 if let Some(s) = sp.as_mut() {
                     s.stop();
+                    // The spinners crate doesn't emit a trailing
+                    // newline on stop, so the next line of output
+                    // overprints the spinner's last frame. Force
+                    // one explicitly.
+                    println!();
                 }
                 error!("🚨 LLM API Request Failed:");
                 error!("   Endpoint: {}", endpoint);

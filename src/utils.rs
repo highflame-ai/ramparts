@@ -153,59 +153,45 @@ fn is_skill_scan(result: &ScanResult) -> bool {
     result.url.starts_with("skills:")
 }
 
-/// One-line `Ramparts: <version> (<commit>)` header for scan-result
-/// rendering. The banner already shows version + commit at startup,
-/// but the banner is suppressed for machine-readable formats and
-/// scrolls off the top for long human-readable scans. Putting it on
-/// the result itself means a copy-pasted scan output always carries
-/// the scanner build that produced it.
-///
-/// Old JSON scans replayed via `ramparts replay` may have empty
-/// `ramparts_version`/`ramparts_commit` fields (added later, with
-/// `#[serde(default)]`). Handle gracefully.
-fn format_ramparts_version(result: &ScanResult) -> String {
-    let version = if result.ramparts_version.is_empty() {
-        "(unknown)"
-    } else {
-        result.ramparts_version.as_str()
-    };
-    if result.ramparts_commit.is_empty() {
-        format!("Ramparts: {version}")
-    } else {
-        format!("Ramparts: {version} ({})", result.ramparts_commit)
-    }
-}
-
 /// Skill-aware terminal renderer. Replaces the live-MCP framing
 /// (tools / resources / "Unknown MCP Server") with per-skill grouping
 /// (skill name + source path + findings + severity counts).
+///
+/// Layout (Option C — verdict-first, compact chrome):
+///
+///   Path: <stripped of `skills:`>
+///   ✅ N skills, M findings (X HIGH, Y MEDIUM) · 1.2s
+///
+///   ⚠️ skill_a (2 findings)
+///        source: ...
+///        [HIGH] RuleName [OWASP: ...]
+///               wrapped description
+///
+///   ✅ skill_b
+///
+///   Cross-Skill Findings
+///      [MEDIUM] SkillNameCollision [OWASP: ...]
+///               ...
+///
+///   Tip: --json | --sarif | --report
 fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
     use crate::security::SecurityIssue;
     use crate::types::YaraScanResult;
 
-    println!("Ramparts Agent Skill Scan");
+    /// Cross-skill findings have semantics that bind to multiple skill
+    /// files at once (collision across paths, etc.). Rendering them
+    /// under a single skill would either duplicate (every colliding
+    /// file shows the same finding) or confuse (only one of N
+    /// colliding files shows it). Carve them out for a dedicated
+    /// section after the per-skill loop.
+    fn is_cross_skill_rule(rule_name: &str) -> bool {
+        matches!(rule_name, "SkillNameCollision")
+    }
 
     // Strip the `skills:` prefix so the displayed path looks normal.
     // Multi-root scans produce `skills:[a,b](N files)` — show that
     // verbatim minus the prefix.
     let display_url = result.url.strip_prefix("skills:").unwrap_or(&result.url);
-    println!("Path: {}", display_url.blue());
-    println!("{}", format_ramparts_version(result));
-    println!("Status: {}", format_status(&result.status));
-    println!("Response Time: {}ms", result.response_time_ms);
-    println!(
-        "Timestamp: {}",
-        result.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-
-    if !result.errors.is_empty() {
-        println!("\n{}", "Errors".bold().red());
-        for e in &result.errors {
-            println!("  • {e}");
-        }
-    }
-
-    let prompt_count = result.prompts.len();
 
     // Findings per-skill: yara_results target_name + prompt-issue prompt_name.
     let yara_findings: Vec<&YaraScanResult> = result
@@ -219,17 +205,86 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
         .as_ref()
         .map_or(&[][..], |s| s.prompt_issues.as_slice());
 
+    let cross_findings: Vec<&YaraScanResult> = yara_findings
+        .iter()
+        .copied()
+        .filter(|y| is_cross_skill_rule(&y.rule_name))
+        .collect();
+
+    // First pass: compute totals + per-severity breakdown for the
+    // verdict line. We render the verdict at the top so the user sees
+    // pass/fail immediately rather than after scrolling through
+    // per-skill rows.
     let mut total_findings = 0_usize;
     let mut sev_counts = std::collections::BTreeMap::<String, usize>::new();
+    let mut bump = |sev: &str| {
+        let s = sev.to_uppercase();
+        *sev_counts.entry(s).or_insert(0) += 1;
+        total_findings += 1;
+    };
+    for prompt in &result.prompts {
+        for y in yara_findings
+            .iter()
+            .filter(|y| y.target_name == prompt.name && !is_cross_skill_rule(&y.rule_name))
+        {
+            bump(
+                y.rule_metadata
+                    .as_ref()
+                    .and_then(|m| m.severity.as_deref())
+                    .unwrap_or("INFO"),
+            );
+        }
+        for issue in prompt_issues
+            .iter()
+            .filter(|i| i.prompt_name.as_deref() == Some(&prompt.name))
+        {
+            bump(&issue.severity);
+        }
+    }
+    for y in &cross_findings {
+        bump(
+            y.rule_metadata
+                .as_ref()
+                .and_then(|m| m.severity.as_deref())
+                .unwrap_or("INFO"),
+        );
+    }
 
-    /// Cross-skill findings have semantics that bind to multiple skill
-    /// files at once (collision across paths, etc.). Rendering them
-    /// under a single skill would either duplicate (every colliding
-    /// file shows the same finding) or confuse (only one of N
-    /// colliding files shows it). Carve them out for a dedicated
-    /// section after the per-skill loop.
-    fn is_cross_skill_rule(rule_name: &str) -> bool {
-        matches!(rule_name, "SkillNameCollision")
+    // Verdict line. ✅ when 0 findings, ⚠️ otherwise; ❌ when the scan
+    // itself failed (errors recorded). Severity breakdown only when
+    // there's at least one finding.
+    let prompt_count = result.prompts.len();
+    let secs = result.response_time_ms as f64 / 1000.0;
+    let icon = if !result.errors.is_empty() {
+        "❌"
+    } else if total_findings == 0 {
+        "✅"
+    } else {
+        "⚠️"
+    };
+    let breakdown = if sev_counts.is_empty() {
+        String::new()
+    } else {
+        // Render in fixed severity order so output is stable.
+        let order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"];
+        let parts: Vec<String> = order
+            .iter()
+            .filter_map(|k| sev_counts.get(*k).map(|v| format!("{v} {k}")))
+            .collect();
+        format!(" ({})", parts.join(", "))
+    };
+    println!("Path: {}", display_url.blue());
+    println!(
+        "{icon} {prompt_count} skill{} scanned, {total_findings} finding{}{breakdown} · {secs:.1}s",
+        if prompt_count == 1 { "" } else { "s" },
+        if total_findings == 1 { "" } else { "s" }
+    );
+
+    if !result.errors.is_empty() {
+        println!("\n{}", "Errors".bold().red());
+        for e in &result.errors {
+            println!("  • {e}");
+        }
     }
 
     for prompt in &result.prompts {
@@ -244,7 +299,6 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
             .collect();
 
         let count = yara_for_skill.len() + llm_for_skill.len();
-        total_findings += count;
 
         let head = if count == 0 {
             format!("  {} {}", "✅".green(), prompt.name.bold())
@@ -269,6 +323,10 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
             println!("    {} {}", "source:".dimmed(), src.dimmed());
         }
 
+        // Counts already accumulated in the upfront verdict pass;
+        // these loops only render. Severity colorization comes from
+        // the rule metadata (YARA findings) or the SecurityIssue
+        // (LLM findings).
         for y in &yara_for_skill {
             let sev = y
                 .rule_metadata
@@ -276,34 +334,14 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
                 .and_then(|m| m.severity.as_deref())
                 .unwrap_or("INFO")
                 .to_uppercase();
-            *sev_counts.entry(sev.clone()).or_insert(0) += 1;
-            let sev_disp = match sev.as_str() {
-                "CRITICAL" => sev.red().bold(),
-                "HIGH" => sev.yellow().bold(),
-                "MEDIUM" => sev.yellow(),
-                "LOW" => sev.cyan(),
-                _ => sev.normal(),
-            };
-            let owasp = if y.owasp_tags.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " [OWASP: {}]",
-                    y.owasp_tags
-                        .iter()
-                        .map(|t| t.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
+            let sev_disp = colored_severity(&sev);
+            let owasp = format_owasp_tags(&y.owasp_tags);
             println!("    [{sev_disp}] {}{owasp}", y.rule_name.bold());
             if let Some(desc) = y
                 .rule_metadata
                 .as_ref()
                 .and_then(|m| m.description.as_deref())
             {
-                // Wrap long descriptions; one-paragraph indent so they
-                // sit visually under the rule line.
                 for line in wrap_for_terminal(desc, 90) {
                     println!("        {line}");
                 }
@@ -312,27 +350,8 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
 
         for issue in &llm_for_skill {
             let sev = issue.severity.to_uppercase();
-            *sev_counts.entry(sev.clone()).or_insert(0) += 1;
-            let sev_disp = match sev.as_str() {
-                "CRITICAL" => sev.red().bold(),
-                "HIGH" => sev.yellow().bold(),
-                "MEDIUM" => sev.yellow(),
-                "LOW" => sev.cyan(),
-                _ => sev.normal(),
-            };
-            let owasp = if issue.owasp_tags.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " [OWASP: {}]",
-                    issue
-                        .owasp_tags
-                        .iter()
-                        .map(|t| t.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
+            let sev_disp = colored_severity(&sev);
+            let owasp = format_owasp_tags(&issue.owasp_tags);
             // SecurityIssueType doesn't implement Display, so use Debug
             // (the variant names like `PromptInjection` are already
             // user-readable).
@@ -349,11 +368,6 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
     // Cross-skill section — findings that bind to multiple skills,
     // not any single one (currently just SkillNameCollision; add
     // future cross-skill rules to `is_cross_skill_rule`).
-    let cross_findings: Vec<&YaraScanResult> = result
-        .yara_results
-        .iter()
-        .filter(|y| y.target_type.as_str() == "prompt" && is_cross_skill_rule(&y.rule_name))
-        .collect();
     if !cross_findings.is_empty() {
         println!("\n{}", "Cross-Skill Findings".bold());
         for y in &cross_findings {
@@ -363,27 +377,8 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
                 .and_then(|m| m.severity.as_deref())
                 .unwrap_or("INFO")
                 .to_uppercase();
-            *sev_counts.entry(sev.clone()).or_insert(0) += 1;
-            total_findings += 1;
-            let sev_disp = match sev.as_str() {
-                "CRITICAL" => sev.red().bold(),
-                "HIGH" => sev.yellow().bold(),
-                "MEDIUM" => sev.yellow(),
-                "LOW" => sev.cyan(),
-                _ => sev.normal(),
-            };
-            let owasp = if y.owasp_tags.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " [OWASP: {}]",
-                    y.owasp_tags
-                        .iter()
-                        .map(|t| t.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
+            let sev_disp = colored_severity(&sev);
+            let owasp = format_owasp_tags(&y.owasp_tags);
             println!("  [{sev_disp}] {}{owasp}", y.rule_name.bold());
             if let Some(desc) = y
                 .rule_metadata
@@ -397,30 +392,57 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
         }
     }
 
-    // Summary line.
-    println!("\n{}", "Summary".bold());
-    println!("  • Skills scanned: {prompt_count}");
-    println!("  • Total findings: {total_findings}");
-    if !sev_counts.is_empty() {
-        let breakdown = sev_counts
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  • Severity:       {breakdown}");
-    }
-
-    // YARA pre-scan summary if present (informational — confirms which
-    // rules ran).
-    if let Some(summary) = result
+    // Footer: discoverability hints + a one-line scan-completion
+    // marker. Output formats are surfaced here so the user knows how
+    // to pipe to CI / get richer detail without `--help`-spelunking.
+    let yara_rules = result
         .yara_results
         .iter()
         .find(|y| y.rule_name == "YARA_PRE_SCAN_SUMMARY")
-    {
-        if let Some(rules) = &summary.rules_executed {
-            println!("  • YARA rules:    {} executed", rules.len());
-        }
+        .and_then(|s| s.rules_executed.as_ref())
+        .map_or(0, std::vec::Vec::len);
+    println!();
+    println!(
+        "  {} {} YARA rule{} executed",
+        "·".dimmed(),
+        yara_rules,
+        if yara_rules == 1 { "" } else { "s" }
+    );
+    println!(
+        "  {} Tip: {}",
+        "·".dimmed(),
+        "--json | --sarif | --report".dimmed()
+    );
+}
+
+/// Map a severity label (`CRITICAL` / `HIGH` / `MEDIUM` / `LOW`) to
+/// a color-styled `ColoredString`. Pulled into a helper so the
+/// skill renderer's three rendering sites (per-skill YARA, per-skill
+/// LLM, cross-skill YARA) all colorize identically.
+fn colored_severity(sev: &str) -> colored::ColoredString {
+    match sev {
+        "CRITICAL" => sev.red().bold(),
+        "HIGH" => sev.yellow().bold(),
+        "MEDIUM" => sev.yellow(),
+        "LOW" => sev.cyan(),
+        _ => sev.normal(),
     }
+}
+
+/// Render `[OWASP: MCP06, MCP09]` if any tags are present, empty
+/// string otherwise. Same layout as the LLM-finding tag list — kept
+/// in one place so both sites use identical formatting.
+fn format_owasp_tags(tags: &[crate::taxonomy::OwaspTag]) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    format!(
+        " [OWASP: {}]",
+        tags.iter()
+            .map(|t| t.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Wrap `text` to lines of at most `width` chars, breaking on word
@@ -1006,9 +1028,12 @@ fn add_errors_info(
 fn print_table_result(result: &ScanResult, detailed: bool) {
     println!("Ramparts MCP Server Scan Result");
 
-    // Server Info
+    // Server Info. Version + commit are NOT printed here — the
+    // startup banner already shows them via `display_banner`. JSON /
+    // raw / SARIF outputs (which suppress the banner) carry the
+    // version on the `ScanResult` shape (`ramparts_version`,
+    // `ramparts_commit`).
     println!("URL: {}", result.url.blue());
-    println!("{}", format_ramparts_version(result));
     println!("Status: {}", format_status(&result.status));
     println!("Response Time: {}ms", result.response_time_ms);
     println!(
