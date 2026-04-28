@@ -66,36 +66,65 @@ xattr -d com.apple.quarantine /path/to/ramparts
 
 **Issue: Connection timeout**
 ```bash
-error: Connection timeout after 30 seconds
+error: Scan operation timed out
+# or
+error: STDIO scan operation timed out after 60s
 ```
 
 **Solutions:**
 ```bash
-# Increase timeout
+# Increase the overall scan budget and per-HTTP-request timeout
 ramparts scan <url> --timeout 120 --http-timeout 60
 
-# Check network connectivity
+# Check network connectivity directly
 curl -I <url>
 
-# Test with simple endpoint
-ramparts scan https://httpbin.org/json
+# Test against a known-good MCP endpoint
+ramparts scan "stdio:npx:-y:@modelcontextprotocol/server-everything"
 ```
 
-**Issue: SSL/TLS certificate errors**
+> **Note**: The `--timeout` flag bounds the *entire* scan (including LLM
+> security analysis); `--http-timeout` bounds individual HTTP requests
+> made during the scan. Both work for `scan` and `scan-config`, and both
+> apply to the stdio path too — a hung subprocess will be killed at
+> `--timeout` rather than hanging the CLI forever.
+
+**Issue: `Failed to create HTTP client: builder error`** (especially on a fresh
+EC2 instance, slim Linux image, or distroless container)
+
+This used to surface as the opaque `builder error: unexpected error: No CA
+certificates were loaded from the system` on hosts where
+`/etc/ssl/certs/ca-certificates.crt` is missing or empty (e.g. the
+`ca-certificates` package isn't installed). As of ramparts 0.7.0+ this is no
+longer reachable: ramparts ships [Mozilla's CA bundle](https://github.com/rustls/webpki-roots)
+embedded in the binary and hands reqwest a preconfigured rustls
+`ClientConfig` whose trust store is that bundle. There's no dependency on
+the host OS trust store anymore.
+
+If you're still seeing this on an older release:
 ```bash
-error: SSL certificate verify failed
+# Workaround until you upgrade
+sudo apt-get update && sudo apt-get install -y ca-certificates
+sudo update-ca-certificates
+
+# Or upgrade ramparts
+cargo install --force ramparts
+```
+
+**Issue: SSL/TLS certificate verification failure for a real host**
+```bash
+error: invalid peer certificate ...
 ```
 
 **Solutions:**
 ```bash
-# Update CA certificates (Ubuntu/Debian)
-sudo apt-get update && sudo apt-get install ca-certificates
+# Verify the certificate yourself first
+curl -I <url>
+openssl s_client -connect <host>:443 -servername <host> < /dev/null
 
-# Update CA certificates (macOS)
-brew install ca-certificates
-
-# For testing only (NOT recommended for production)
-export RUSTLS_VERIFY_CERT=false
+# If you're on a corporate network with MITM proxies, you'll need to
+# add the intermediate CA to the host trust store (ramparts uses the
+# embedded Mozilla bundle by default, which won't include private CAs).
 ```
 
 **Issue: HTTP 403 Forbidden**

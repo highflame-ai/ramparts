@@ -18,15 +18,45 @@ Ramparts looks for 11+ different types of security issues, from the obvious (lik
 
 Here's what it catches: **Tool Poisoning** when tools lie about what they do, **Path Traversal** attacks like `../../../etc/passwd`, **Command Injection** where user input could execute system commands, **SQL Injection** vulnerabilities, **Cross-Origin Escalation** when tools span multiple domains unsafely, **Secret Leakage** of API keys and tokens, **Authentication Bypass** issues, **Prompt Injection** that could fool AI safety measures, **PII Leakage**, **Privilege Escalation**, and **Data Exfiltration** risks.
 
-The cool thing is you can tune the scanning based on what you care about. If you only want to know about critical issues, just add `--min-severity HIGH` to your scan. Working in a regulated environment? Create custom rules for your specific compliance requirements.
+The cool thing is you can tune the scanning based on what you care about. If you only care about tool definitions in CI, scope the scan with `--only tools`. Working in a regulated environment? Create custom YARA rules for your specific compliance requirements (drop them in the `rules/` directory).
 
 ```bash
-# Only show me the serious stuff
-ramparts scan https://your-mcp-server.com --min-severity HIGH
+# Only scan tool definitions, skip prompts and resources
+ramparts scan https://your-mcp-server.com --only tools
 
-# Use our company's custom security rules
-ramparts scan https://your-mcp-server.com --config custom-rules.yaml
+# Bound the scan and per-request timeouts from the CLI
+ramparts scan https://your-mcp-server.com --timeout 90 --http-timeout 30
 ```
+
+### OWASP MCP Top 10 Mapping
+
+Every finding ramparts emits is tagged with one or more entries from the
+**OWASP MCP Top 10** (2025 draft) so you can group results by category and
+report against a recognized framework. Tags appear in:
+
+- the terminal output (`OWASP MCP Top 10: MCP05, MCP06`)
+- the JSON output (`owasp_tags` field on every finding)
+- the SARIF output (`properties.tags` on every result and rule)
+- the markdown report (grouped by category)
+
+The taxonomy is pinned to a versioned YAML file
+(`taxonomies/owasp-mcp-top-10/2025.yaml`) so future revisions are explicit
+upgrades rather than silent churn.
+
+### Supply-Chain Dependency Check
+
+When a stdio MCP server is launched via `npx` or `uvx`, ramparts extracts
+the package name + version from the launch command and queries
+[OSV.dev](https://osv.dev) for known security advisories on that release.
+Findings emit as `VulnerableDependency` entries (mapped to OWASP **MCP10
+Supply Chain**), surface in every output format, and run in parallel with
+the main scan so they don't slow you down. Real-world example — a scan of
+`stdio:npx:lodash@4.17.20` surfaces 5+ known CVEs (ReDoS, command
+injection, prototype pollution, code injection) directly in the report.
+
+The check fails soft: a network error, OSV outage, or unrecognized launch
+command logs a warning and is treated as "no findings" rather than a fatal
+scan error.
 
 ### Advanced Pattern Detection (YARA-X)
 
@@ -118,6 +148,39 @@ When you need to integrate with other tools, JSON format provides structured dat
 For debugging MCP protocol issues, raw format shows you exactly what the server responded with, which is invaluable when you're trying to figure out why something isn't working as expected.
 
 The JSON structure is designed to be jq-friendly, so you can easily extract issue counts, filter by severity, or pull out specific findings for reporting.
+
+### SARIF for Code Scanning
+
+For teams that want findings to land in GitHub Advanced Security's code
+scanning UI (or GitLab / Azure DevOps / Microsoft Defender), `--format
+sarif` emits SARIF 2.1.0 directly:
+
+```bash
+ramparts scan-config --format sarif > ramparts.sarif
+# Then in CI:
+- uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: ramparts.sarif
+```
+
+Each finding includes its OWASP MCP Top 10 ID as a SARIF tag and a
+numeric `security-severity` (0–10) so the right severity badge renders.
+
+### Replay Mode
+
+Scan once, render many times. The `replay` subcommand reads a previously
+emitted JSON scan result and re-emits it in any other format — no live
+network or LLM calls. Handy when you want to:
+
+- archive a scan as JSON in CI and convert to SARIF later as a separate
+  step (so the SARIF upload doesn't block on a slow scan)
+- view an archived multi-server scan-config result locally as a tree
+- pipe an existing scan into a different consumer without rescanning
+
+```bash
+ramparts scan-config --format json > scan.json
+ramparts replay scan.json --format sarif > scan.sarif
+```
 
 
 
