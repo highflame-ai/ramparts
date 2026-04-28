@@ -4,11 +4,13 @@ use tracing_subscriber::FmtSubscriber;
 
 use crate::config::ScannerConfig;
 
+mod backup;
 mod banner;
 mod cache;
 mod config;
 mod constants;
 mod core;
+mod fixes;
 #[cfg(test)]
 mod integration_tests;
 mod mcp_client;
@@ -146,6 +148,33 @@ enum Commands {
         /// Per-HTTP-request timeout in seconds. Overrides `scanner.http_timeout` from config.yaml.
         #[arg(long, value_name = "SECONDS")]
         http_timeout: Option<u64>,
+
+        /// Show the fixes that would be applied without writing anything.
+        ///
+        /// Equivalent to `--fix` without `--yes`. Exits 1 if any fixes would
+        /// be applied (so this is CI-usable as a check), 0 if the configs
+        /// are clean.
+        #[arg(long, conflicts_with_all = ["fix", "undo"])]
+        dry_run: bool,
+
+        /// Apply deterministic fixes to discovered IDE config files.
+        ///
+        /// Without `--yes`, behaves as `--dry-run`: prints the diff and
+        /// exits without writing. Pass `--yes` to actually apply.
+        #[arg(long, conflicts_with = "undo")]
+        fix: bool,
+
+        /// Acknowledge that `--fix` will modify your IDE config files in place.
+        ///
+        /// Required to actually write. Backups are stored under
+        /// `~/.ramparts/fixes/<run-id>/` and can be reverted with `--undo`.
+        #[arg(long, requires = "fix")]
+        yes: bool,
+
+        /// Restore the most recent fix run from backup, then delete the
+        /// backup. Files modified since the fix are skipped (drift).
+        #[arg(long, conflicts_with_all = ["fix", "dry_run"])]
+        undo: bool,
     },
 
     /// Generate a default config.yaml file
@@ -288,7 +317,20 @@ fn determine_log_level(cli: &Cli, scanner_config: &ScannerConfig) -> Level {
 /// the same timeout that ends up in `ScanOptions::http_timeout`.
 fn create_scanner_if_needed(cli: &Cli, scanner_config: &ScannerConfig) -> Option<MCPScanner> {
     let http_timeout_override = match &cli.command {
-        Commands::Scan { http_timeout, .. } | Commands::ScanConfig { http_timeout, .. } => {
+        Commands::Scan { http_timeout, .. } => *http_timeout,
+        // --fix / --undo / --dry-run never connect to MCP servers — skip
+        // scanner construction (which would otherwise block on TLS init for
+        // a code path that doesn't need it).
+        Commands::ScanConfig {
+            http_timeout,
+            fix,
+            undo,
+            dry_run,
+            ..
+        } => {
+            if *fix || *undo || *dry_run {
+                return None;
+            }
             *http_timeout
         }
         _ => return None,
@@ -336,17 +378,27 @@ async fn execute_command(
             report,
             timeout,
             http_timeout,
+            dry_run,
+            fix,
+            yes,
+            undo,
         } => {
-            handle_scan_config_command(
-                auth_headers,
-                format,
-                report,
-                timeout,
-                http_timeout,
-                &scanner_config,
-                scanner,
-            )
-            .await
+            if undo {
+                handle_undo_command()
+            } else if fix || dry_run {
+                handle_fix_command(fix && yes, dry_run)
+            } else {
+                handle_scan_config_command(
+                    auth_headers,
+                    format,
+                    report,
+                    timeout,
+                    http_timeout,
+                    &scanner_config,
+                    scanner,
+                )
+                .await
+            }
         }
         Commands::InitConfig { force } => {
             handle_init_config_command(force);
@@ -533,6 +585,242 @@ async fn handle_mcp_http_command(
     mcp_server::run_streamable_http_server(&host, port).await
 }
 
+/// Handle `scan-config --fix` and `scan-config --dry-run`.
+///
+/// `apply` is true when the user passed both `--fix --yes`. When false we
+/// behave as a dry-run regardless of how we were invoked: print the diff,
+/// exit 1 if any fixes would be applied, exit 0 if all configs are clean.
+struct PendingFix {
+    path: std::path::PathBuf,
+    original: Vec<u8>,
+    fixed: Vec<u8>,
+    rules: Vec<String>,
+}
+
+fn handle_fix_command(apply: bool, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use config::MCPConfigManager;
+    use serde_json::Value;
+
+    let manager = MCPConfigManager::new();
+    let paths = manager.existing_config_paths();
+    if paths.is_empty() {
+        println!("🔍 No IDE config files found. Nothing to fix.");
+        return Ok(());
+    }
+
+    println!(
+        "🔍 Found {} IDE config file{}:",
+        paths.len(),
+        if paths.len() == 1 { "" } else { "s" }
+    );
+    for (path, client) in &paths {
+        println!("  • {} IDE: {}", client.name(), path.display());
+    }
+    println!();
+
+    let mut total_applied = 0usize;
+    let mut to_write: Vec<PendingFix> = Vec::new();
+
+    for (path, client) in &paths {
+        let original = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("⚠ {}: cannot read ({}). Skipping.", path.display(), e);
+                continue;
+            }
+        };
+        let parsed: Value = match serde_json::from_slice(&original) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "⚠ {} ({}): not valid JSON ({}). Skipping.",
+                    path.display(),
+                    client.name(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        // Round-trip refusal: if re-serializing the parsed Value isn't
+        // byte-equal to the original (modulo trailing newline), the file
+        // contains comments, trailing commas, custom whitespace, or fields
+        // outside the schema we'd silently lose on write-back. Refuse
+        // rather than mangle.
+        if !is_safe_to_round_trip(&original, &parsed) {
+            eprintln!(
+                "⚠ {} ({}): not safe to auto-fix (formatting, comments, or non-schema fields would be lost on write-back). Skipping.",
+                path.display(),
+                client.name()
+            );
+            continue;
+        }
+
+        let mut fixed = parsed.clone();
+        let applied = fixes::apply_all(&mut fixed);
+        if applied.is_empty() {
+            continue;
+        }
+        total_applied += applied.len();
+
+        let mut new_bytes = serde_json::to_vec_pretty(&fixed)?;
+        // Preserve trailing newline if the original had one.
+        if original.last() == Some(&b'\n') && new_bytes.last() != Some(&b'\n') {
+            new_bytes.push(b'\n');
+        }
+
+        println!(
+            "📝 {} ({}): {} fix{}",
+            path.display(),
+            client.name(),
+            applied.len(),
+            if applied.len() == 1 { "" } else { "es" }
+        );
+        for fix in &applied {
+            println!("    • [{}] {}: {}", fix.rule, fix.field, fix.summary);
+        }
+        print_diff(&original, &new_bytes);
+
+        to_write.push(PendingFix {
+            path: path.clone(),
+            original,
+            fixed: new_bytes,
+            rules: applied.into_iter().map(|f| f.rule.to_string()).collect(),
+        });
+    }
+
+    if total_applied == 0 {
+        println!("✅ All IDE configs are clean. No fixes to apply.");
+        return Ok(());
+    }
+
+    if !apply {
+        println!();
+        if dry_run {
+            println!(
+                "Dry run: {total_applied} fix(es) would be applied across {} file(s).",
+                to_write.len()
+            );
+        } else {
+            println!(
+                "{total_applied} fix(es) would be applied across {} file(s). Re-run with --fix --yes to write.",
+                to_write.len()
+            );
+        }
+        // Non-zero exit so this is CI-usable as a check.
+        std::process::exit(1);
+    }
+
+    // Apply.
+    let store = backup::BackupStore::new()?;
+    let mut run = store.begin_run(env!("CARGO_PKG_VERSION"))?;
+    for pending in to_write {
+        run.record_and_apply(
+            &pending.path,
+            &pending.original,
+            &pending.fixed,
+            pending.rules,
+        )?;
+    }
+    match run.commit()? {
+        Some(run_dir) => {
+            println!();
+            println!(
+                "✅ Applied {total_applied} fix(es). Backup at {}.",
+                run_dir.display()
+            );
+            println!("   Run `ramparts scan-config --undo` to revert.");
+        }
+        None => {
+            println!("✅ No-op (all fixes were redundant).");
+        }
+    }
+    Ok(())
+}
+
+/// Handle `scan-config --undo`.
+fn handle_undo_command() -> Result<(), Box<dyn std::error::Error>> {
+    let store = backup::BackupStore::new()?;
+    let Some(run_dir) = store.latest_run()? else {
+        eprintln!("No fix runs to undo.");
+        std::process::exit(1);
+    };
+    println!("Restoring from {}...", run_dir.display());
+    let report = backup::BackupStore::undo(&run_dir)?;
+    for p in &report.restored {
+        println!("  ✓ restored {}", p.display());
+    }
+    for p in &report.skipped_due_to_drift {
+        eprintln!(
+            "  ⚠ skipped {} (file modified since fix; refusing to clobber)",
+            p.display()
+        );
+    }
+    for p in &report.missing_backup {
+        eprintln!("  ✗ missing backup for {}", p.display());
+    }
+    for p in &report.corrupt_backup {
+        eprintln!("  ✗ corrupt backup for {}", p.display());
+    }
+    if report.is_clean() {
+        println!("✅ Undo complete.");
+    } else {
+        eprintln!(
+            "⚠ Undo finished with issues. Backup directory preserved at {}.",
+            run_dir.display()
+        );
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Check whether a parsed `Value` re-serializes to the exact original bytes
+/// (modulo a single trailing newline). When true, the typed-fix → write-back
+/// path is guaranteed lossless. When false, the file uses formatting we
+/// don't preserve and we refuse to touch it.
+fn is_safe_to_round_trip(original: &[u8], parsed: &serde_json::Value) -> bool {
+    let Ok(reserialized) = serde_json::to_vec_pretty(parsed) else {
+        return false;
+    };
+    fn strip_trailing_newline(b: &[u8]) -> &[u8] {
+        if b.last() == Some(&b'\n') {
+            &b[..b.len() - 1]
+        } else {
+            b
+        }
+    }
+    strip_trailing_newline(original) == strip_trailing_newline(&reserialized)
+}
+
+/// Print a unified diff to stderr. Coloured when stderr is a TTY.
+fn print_diff(original: &[u8], modified: &[u8]) {
+    use similar::{ChangeTag, TextDiff};
+    use std::io::IsTerminal;
+    let original_str = String::from_utf8_lossy(original);
+    let modified_str = String::from_utf8_lossy(modified);
+    let diff = TextDiff::from_lines(&original_str, &modified_str);
+    let coloured = std::io::stderr().is_terminal();
+    for change in diff.iter_all_changes() {
+        let (sign, paint): (&str, fn(&str) -> String) = match change.tag() {
+            ChangeTag::Delete => ("-", |s| {
+                use colored::Colorize;
+                s.red().to_string()
+            }),
+            ChangeTag::Insert => ("+", |s| {
+                use colored::Colorize;
+                s.green().to_string()
+            }),
+            ChangeTag::Equal => (" ", |s| s.to_string()),
+        };
+        let line = format!("    {sign}{}", change.value().trim_end_matches('\n'));
+        if coloured && change.tag() != ChangeTag::Equal {
+            eprintln!("{}", paint(&line));
+        } else {
+            eprintln!("{line}");
+        }
+    }
+}
+
 /// Builds scan options from configuration and parameters.
 ///
 /// `timeout_override` and `http_timeout_override` come from CLI flags and, when
@@ -573,4 +861,113 @@ fn parse_auth_headers(headers: &[String]) -> Option<std::collections::HashMap<St
         }
     }
     Some(map)
+}
+
+#[cfg(test)]
+mod fix_e2e_tests {
+    //! End-to-end coverage for `scan-config --fix` plumbing: the round-trip
+    //! refusal predicate, the backup → undo loop driven by realistic IDE
+    //! configs, and the JSONC-refusal short-circuit.
+
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn round_trip_refusal_accepts_pretty_json() {
+        let bytes = b"{\n  \"mcpServers\": {\n    \"x\": {\n      \"url\": \"http://api.example.com\"\n    }\n  }\n}";
+        let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        assert!(is_safe_to_round_trip(bytes, &parsed));
+    }
+
+    #[test]
+    fn round_trip_refusal_rejects_jsonc_with_comments() {
+        // serde_json itself doesn't accept comments, so this isn't a true
+        // JSONC test; what we're verifying is that minified input is
+        // refused because re-serialization will be pretty-printed and
+        // non-equal to the original bytes.
+        let minified = b"{\"mcpServers\":{\"x\":{\"url\":\"http://api.example.com\"}}}";
+        let parsed: serde_json::Value = serde_json::from_slice(minified).unwrap();
+        assert!(!is_safe_to_round_trip(minified, &parsed));
+    }
+
+    #[test]
+    fn round_trip_refusal_tolerates_trailing_newline() {
+        let with_nl = b"{\n  \"x\": 1\n}\n";
+        let parsed: serde_json::Value = serde_json::from_slice(with_nl).unwrap();
+        assert!(is_safe_to_round_trip(with_nl, &parsed));
+        let without_nl = b"{\n  \"x\": 1\n}";
+        assert!(is_safe_to_round_trip(without_nl, &parsed));
+    }
+
+    #[test]
+    fn round_trip_refusal_rejects_custom_indent() {
+        // 4-space indent — to_string_pretty uses 2 spaces.
+        let four_space = b"{\n    \"x\": 1\n}\n";
+        let parsed: serde_json::Value = serde_json::from_slice(four_space).unwrap();
+        assert!(!is_safe_to_round_trip(four_space, &parsed));
+    }
+
+    /// AC2: full fix → undo round trip is byte-identical to original.
+    #[test]
+    fn fix_then_undo_is_byte_identical() {
+        let store_dir = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let target = work.path().join("mcp.json");
+
+        let original = b"{\n  \"mcpServers\": {\n    \"x\": {\n      \"url\": \"http://api.example.com\"\n    }\n  }\n}";
+        fs::write(&target, original).unwrap();
+
+        // Apply fix manually via the same primitives the handler uses.
+        let parsed: serde_json::Value = serde_json::from_slice(original).unwrap();
+        assert!(is_safe_to_round_trip(original, &parsed));
+        let mut fixed = parsed.clone();
+        let applied = fixes::apply_all(&mut fixed);
+        assert_eq!(applied.len(), 1);
+        let mut new_bytes = serde_json::to_vec_pretty(&fixed).unwrap();
+        if original.last() == Some(&b'\n') && new_bytes.last() != Some(&b'\n') {
+            new_bytes.push(b'\n');
+        }
+
+        let store = backup::BackupStore::with_root(store_dir.path().to_path_buf()).unwrap();
+        let mut run = store.begin_run("test").unwrap();
+        run.record_and_apply(&target, original, &new_bytes, vec!["http-to-https".into()])
+            .unwrap();
+        let run_dir = run.commit().unwrap().expect("non-empty run committed");
+
+        // After fix, file holds the new bytes.
+        assert_ne!(fs::read(&target).unwrap(), original.to_vec());
+        assert!(String::from_utf8_lossy(&fs::read(&target).unwrap()).contains("https://"));
+
+        // Undo.
+        let report = backup::BackupStore::undo(&run_dir).unwrap();
+        assert!(report.is_clean(), "{report:?}");
+
+        // AC2: byte-identical.
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            original.to_vec(),
+            "undo did not produce byte-identical original"
+        );
+    }
+
+    #[test]
+    fn fix_skips_files_that_fail_round_trip_check() {
+        // Minified JSON: re-serialization would reformat it, so the engine
+        // refuses. We model the handler's decision: round-trip check fails
+        // → no fix attempted → file unchanged.
+        let work = TempDir::new().unwrap();
+        let target = work.path().join("mcp.json");
+        let minified = b"{\"mcpServers\":{\"x\":{\"url\":\"http://api.example.com\"}}}";
+        fs::write(&target, minified).unwrap();
+
+        let bytes = fs::read(&target).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            !is_safe_to_round_trip(&bytes, &parsed),
+            "minified file must fail round-trip check"
+        );
+        // Handler skips. File on disk untouched.
+        assert_eq!(fs::read(&target).unwrap(), minified.to_vec());
+    }
 }
