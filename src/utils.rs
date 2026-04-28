@@ -2087,15 +2087,36 @@ pub fn generate_markdown_report(results: &[ScanResult]) -> Result<String> {
     let timestamp = Utc::now();
     let mut report = String::new();
 
+    // Title reflects the *current* scanner surface — ramparts scans both
+    // live MCP servers and on-disk agent skill files (`ramparts skills
+    // scan`). Reports may bundle either or both kinds of result depending
+    // on which command produced them; the title is generic-enough to
+    // cover the mixed case.
+    let scanner_label = "Ramparts MCP & Agent Skill Scanner";
+
     // Header
-    writeln!(report, "# MCP Security Scan Report")?;
+    writeln!(report, "# {scanner_label} Report")?;
     writeln!(report)?;
     writeln!(
         report,
         "**Generated:** {}",
         timestamp.format("%Y-%m-%d %H:%M:%S UTC")
     )?;
-    writeln!(report, "**Scanner:** Ramparts MCP Security Scanner")?;
+    writeln!(report, "**Scanner:** {scanner_label}")?;
+    // Carry the build identity so a reader of an archived report
+    // months later can correlate findings to a specific scanner build.
+    // First scan's `ramparts_version`/`commit` are representative — all
+    // results in a single report come from the same scanner invocation.
+    if let Some(first) = results.first() {
+        if !first.ramparts_version.is_empty() {
+            let build = if first.ramparts_commit.is_empty() {
+                format!("v{}", first.ramparts_version)
+            } else {
+                format!("v{} ({})", first.ramparts_version, first.ramparts_commit)
+            };
+            writeln!(report, "**Build:** {build}")?;
+        }
+    }
     writeln!(report)?;
 
     // Executive Summary
