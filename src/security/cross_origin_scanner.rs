@@ -283,6 +283,7 @@ impl CrossOriginScanner {
                     analysis.unique_root_domains.len()
                 ),
                 rule_metadata: Some(metadata.clone()),
+                owasp_tags: crate::taxonomy::tags_for_yara_rule("CrossDomainContamination"),
                 phase: Some(match self.phase {
                     ScanPhase::PreScan => "pre-scan".to_string(),
                     ScanPhase::PostScan => "post-scan".to_string(),
@@ -306,6 +307,7 @@ impl CrossOriginScanner {
                     matched_text: Some(outlier.clone()),
                     context: "Tool or resource using different domain than majority".to_string(),
                     rule_metadata: Some(metadata.clone()),
+                    owasp_tags: crate::taxonomy::tags_for_yara_rule("DomainOutlier"),
                     phase: Some(match self.phase {
                         ScanPhase::PreScan => "pre-scan".to_string(),
                         ScanPhase::PostScan => "post-scan".to_string(),
@@ -346,6 +348,7 @@ impl CrossOriginScanner {
                     "Tools or resources use both secure (HTTPS) and insecure (HTTP) connections"
                         .to_string(),
                 rule_metadata: Some(metadata.clone()),
+                owasp_tags: crate::taxonomy::tags_for_yara_rule("MixedSecuritySchemes"),
                 phase: Some(match self.phase {
                     ScanPhase::PreScan => "pre-scan".to_string(),
                     ScanPhase::PostScan => "post-scan".to_string(),

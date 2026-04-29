@@ -14,8 +14,16 @@ ramparts server [options]
 # Scan from IDE configuration files
 ramparts scan-config [options]
 
+# Re-emit a previously-saved scan result in another format
+ramparts replay <path> [--format <FORMAT>]
+
 # Initialize configuration file
 ramparts init-config
+
+# Run Ramparts itself as an MCP server
+ramparts mcp-stdio
+ramparts mcp-http  [--host HOST] [--port PORT]
+ramparts mcp-sse   [--host HOST] [--port PORT]   # alias of mcp-http (rmcp 1.x folds SSE into streamable HTTP)
 
 # Show help
 ramparts --help
@@ -52,20 +60,21 @@ ramparts scan <URL> [OPTIONS]
 
 ```bash
 Options:
-  -a, --auth-headers <HEADERS>    Authentication headers (format: "Header: Value")
-                                  Can be specified multiple times
-  -o, --output <FORMAT>           Output format [default: table]
-                                  [possible values: json, raw, table, text]
+      --auth-headers <HEADERS>    Authentication headers (format: "Header: Value", comma-separated)
+      --format <FORMAT>           Output format [default: from config.yaml; usually `table`]
+                                  [possible values: text, table, json, raw, sarif]
       --report                    Generate detailed markdown report (scan_YYYYMMDD_HHMMSS.md)
-  -t, --timeout <SECONDS>         Request timeout in seconds [default: 60]
-      --http-timeout <SECONDS>    HTTP timeout in seconds [default: 30]
-      --detailed                  Enable detailed output
-      --min-severity <LEVEL>      Minimum severity level to report
-                                  [possible values: low, medium, high, critical]
-      --config <FILE>             Custom configuration file path
-      --pretty                    Pretty print JSON output (only with --output json)
+      --timeout <SECONDS>         Overall scan timeout. Overrides scanner.scan_timeout.
+      --http-timeout <SECONDS>    Per-HTTP-request timeout. Overrides scanner.http_timeout.
+      --only <KINDS>              Restrict scan to a subset of artifact kinds. Comma-separated:
+                                  tools, prompts, resources (singular forms also accepted).
+                                  Default: scan all kinds.
   -h, --help                      Print help information
 ```
+
+> **Note**: `--format sarif` produces SARIF 2.1.0 output suitable for GitHub Advanced
+> Security code-scanning, GitLab, and other SARIF consumers. OWASP MCP Top 10 IDs are
+> included as `properties.tags` on every result and rule definition.
 
 ### Examples
 
@@ -79,29 +88,37 @@ ramparts scan https://api.githubcopilot.com/mcp/
 
 ```bash
 ramparts scan https://api.githubcopilot.com/mcp/ \
-  --auth-headers "Authorization: Bearer $TOKEN" \
-  --auth-headers "X-API-Key: $API_KEY"
+  --auth-headers "Authorization: Bearer $TOKEN"
 ```
 
-**Detailed JSON output:**
+**JSON output:**
 
 ```bash
-ramparts scan https://api.githubcopilot.com/mcp/ \
-  --output json \
-  --detailed \
-  --pretty
+ramparts scan https://api.githubcopilot.com/mcp/ --format json
 ```
 
-**Custom timeout and severity:**
+**SARIF output for GitHub code scanning:**
+
+```bash
+ramparts scan https://api.githubcopilot.com/mcp/ --format sarif > ramparts.sarif
+# Then upload via github/codeql-action/upload-sarif in CI
+```
+
+**Custom timeout:**
 
 ```bash
 ramparts scan https://api.githubcopilot.com/mcp/ \
   --timeout 120 \
-  --http-timeout 45 \
-  --min-severity high
+  --http-timeout 45
 ```
 
-**Generate detailed report:**
+**Scan only tool definitions (skip prompts and resources):**
+
+```bash
+ramparts scan https://api.githubcopilot.com/mcp/ --only tools
+```
+
+**Generate detailed markdown report:**
 
 ```bash
 ramparts scan https://api.githubcopilot.com/mcp/ --report
@@ -110,10 +127,18 @@ ramparts scan https://api.githubcopilot.com/mcp/ --report
 **STDIO server scan:**
 
 ```bash
-ramparts scan "stdio:///usr/local/bin/mcp-server"
-ramparts scan "node /path/to/server.js --config config.json"
-ramparts scan "/usr/bin/python3 /path/to/server.py"
+# Format: stdio:<command>:<arg1>:<arg2>:...
+ramparts scan "stdio:npx:-y:@modelcontextprotocol/server-everything"
+ramparts scan "stdio:python3:/path/to/server.py"
+ramparts scan "stdio:node:/path/to/server.js"
 ```
+
+> **Supply-chain check**: when the stdio command is `npx` or `uvx`, ramparts
+> automatically queries [OSV.dev](https://osv.dev) for known advisories on the
+> launched package@version and emits any findings as `VulnerableDependency`
+> entries (mapped to OWASP MCP10 Supply Chain). The lookup runs in parallel with
+> the main scan and fails soft — network errors are logged and treated as "no
+> findings", never as a fatal scan error.
 
 ## Scan-Config Command
 
@@ -129,11 +154,17 @@ ramparts scan-config [OPTIONS]
 
 ```bash
 Options:
-  -a, --auth-headers <HEADERS>    Authentication headers for MCP servers
-  -o, --output <FORMAT>           Output format [default: table]
-                                  [possible values: json, raw, table, text]
+      --auth-headers <HEADERS>    Authentication headers for MCP servers
+      --format <FORMAT>           Output format [default: from config.yaml]
+                                  [possible values: text, table, json, raw, sarif]
       --report                    Generate detailed markdown report (scan_YYYYMMDD_HHMMSS.md)
-      --config <FILE>             Custom configuration file path
+      --timeout <SECONDS>         Overall per-server scan timeout
+      --http-timeout <SECONDS>    Per-HTTP-request timeout
+      --root <PATH>               Walk this directory for MCP config files instead of the
+                                  user's home/IDE locations. Useful for scanning a
+                                  checked-in repo of IDE configs in CI.
+      --only <KINDS>              Restrict scan to a subset of artifact kinds
+                                  (tools, prompts, resources)
   -h, --help                      Print help information
 ```
 
@@ -150,7 +181,7 @@ ramparts scan-config
 ```bash
 ramparts scan-config \
   --auth-headers "Authorization: Bearer $TOKEN" \
-  --output json
+  --format json
 ```
 
 **Generate report:**
@@ -159,15 +190,31 @@ ramparts scan-config \
 ramparts scan-config --report
 ```
 
+**Scan a checked-in repo of IDE configs (e.g. in CI):**
+
+```bash
+# `--root` walks the directory recursively, picks up `mcp.json`,
+# `*.mcp.json`, `claude_desktop_config.json`, `settings.json`, etc.
+# Skips `.git`, `node_modules`, `target`, `dist`, `build`, `.venv`,
+# and similar build directories. Symlinks are not followed.
+ramparts scan-config --root ./ide-configs --format sarif > ramparts.sarif
+```
+
+**Only tool definitions (skip prompts/resources):**
+
+```bash
+ramparts scan-config --only tools
+```
+
 ### Supported IDE Configuration Files
 
 Ramparts automatically discovers and reads MCP server configurations from:
 
 - **Cursor**: `~/.cursor/mcp.json`
 - **Windsurf**: `~/.codeium/windsurf/mcp_config.json`
-- **VS Code**: `~/.vscode/mcp.json`
+- **VS Code**: `~/.vscode/mcp.json`, `~/Library/Application Support/Code/User/mcp.json`
 - **Claude Desktop**: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
-- **Claude Code**: `~/.claude/settings.json`
+- **Claude Code**: `~/.claude/settings.json`, `~/.claude/settings.local.json`
 - **Gemini CLI**: `~/.gemini/settings.json`, `.gemini/settings.json` (workspace)
 - **Neovim**: `~/.config/nvim/mcp.json`
 - **Helix**: `~/.config/helix/mcp.json`
@@ -181,16 +228,8 @@ Ramparts automatically discovers and reads MCP server configurations from:
 > file from its in-memory state.
 
 Auto-fix applies a small, conservative set of deterministic remediations to
-discovered IDE config files:
-
-| Rule                     | What it does                                                                                      | Example                                                                                                                               |
-| ------------------------ | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `http-to-https`          | Rewrites `http://` URLs to `https://` for non-loopback hosts                                      | `http://api.example.com/mcp` → `https://api.example.com/mcp`                                                                          |
-| `secret-externalization` | Replaces inline secret values with `${VAR}` references when the env key is `SCREAMING_SNAKE_CASE` | `"GITHUB_TOKEN": "ghp_xxxx"` → `"GITHUB_TOKEN": "${GITHUB_TOKEN}"`                                                                    |
-| `dangerous-flag-removal` | Removes a closed list of opt-out flags that disable security checks                               | `NODE_TLS_REJECT_UNAUTHORIZED=0`, `DANGEROUSLY_OMIT_AUTH=true`, `MCP_DISABLE_AUTH=1`, `PYTHONHTTPSVERIFY=0`, `GIT_SSL_NO_VERIFY=true` |
-
-Anything that requires LLM judgement, network resolution, or schema
-inference is intentionally **not** auto-fixed.
+discovered IDE config files. Anything that requires LLM judgement, network
+resolution, or schema inference is intentionally **not** auto-fixed.
 
 #### Usage
 
@@ -297,6 +336,56 @@ If something looks wrong after a fix:
   `scan-config`'s normal discovery — ramparts will not write to files
   outside that set.
 
+If a file's content uses a different schema than the path suggests (e.g. a
+Claude-Desktop-style `{"mcpServers": ...}` document saved at a VS Code path),
+ramparts falls through to the multi-format parser chain rather than silently
+treating it as empty. Files that contain no recognizable MCP server entries
+appear in the discovery summary with `0 servers` and are skipped.
+
+## Replay Command
+
+Re-emit a previously-saved scan result through a different output format
+without re-connecting to the MCP server. The headline use case is **archive
+a JSON scan in CI, then convert it to SARIF** for GitHub code-scanning
+ingestion as a separate step.
+
+### Usage
+
+```bash
+ramparts replay <PATH> [--format <FORMAT>]
+```
+
+### Arguments
+
+- `<PATH>` — Path to a JSON file containing a `ScanResult` (single-server,
+  emitted by `ramparts scan`) or a `Vec<ScanResult>` (multi-server, emitted
+  by `ramparts scan-config`). The renderer auto-detects which shape is
+  present.
+
+### Options
+
+```bash
+Options:
+      --format <FORMAT>   Output format [default: from config.yaml]
+                          [possible values: text, table, json, raw, sarif]
+  -h, --help              Print help information
+```
+
+### Examples
+
+```bash
+# Capture once in CI, convert to SARIF later
+ramparts scan https://api.example.com/mcp/ --format json > scan.json
+ramparts replay scan.json --format sarif > scan.sarif
+
+# View an archived multi-server scan-config result locally
+ramparts scan-config --format json > all-servers.json
+ramparts replay all-servers.json
+```
+
+`replay` does no network or LLM calls — it's a pure format conversion of
+already-emitted findings.
+
 ## Server Command
 
 Start the MCP Scanner microservice.
@@ -373,38 +462,70 @@ This creates a `ramparts.yaml` file in the current directory with all configurat
 
 ## Output Formats
 
+For machine-readable formats (`json`, `raw`, `sarif`), the welcome banner is
+suppressed automatically so downstream parsers (jq, `codeql-action/upload-sarif`,
+etc.) get clean stdout.
+
 ### Table Format (Default)
 
 Human-readable table format with colored output:
 
 ```bash
 ramparts scan <url>
-ramparts scan <url> --output table
+ramparts scan <url> --format table
 ```
 
 ### JSON Format
 
-Machine-readable JSON output:
+Machine-readable structured output:
 
 ```bash
-ramparts scan <url> --output json
-ramparts scan <url> --output json --pretty
+ramparts scan <url> --format json
 ```
 
 ### Text Format
 
-Simple text format:
+Simple text output:
 
 ```bash
-ramparts scan <url> --output text
+ramparts scan <url> --format text
 ```
 
 ### Raw Format
 
-Raw JSON format preserving original MCP server responses with embedded security data:
+Raw JSON preserving original MCP server responses with embedded security data:
 
 ```bash
-ramparts scan <url> --output raw
+ramparts scan <url> --format raw
+```
+
+### SARIF Format
+
+SARIF 2.1.0 output for GitHub Advanced Security code-scanning, GitLab, Azure
+DevOps, Microsoft Defender, and most enterprise security dashboards:
+
+```bash
+ramparts scan <url> --format sarif > ramparts.sarif
+```
+
+Each finding includes:
+
+- `ruleId` — YARA rule name or `ramparts.security.<IssueType>`
+- `level` — `error` (CRITICAL/HIGH), `warning` (MEDIUM), `note` (LOW)
+- `properties.security-severity` — numeric 0–10 score so GitHub renders the
+  right severity badge
+- `properties.tags` — OWASP MCP Top 10 IDs (e.g. `owasp-mcp-top-10:2025-draft:MCP05`)
+
+CI integration example with GitHub Code Scanning:
+
+```yaml
+- name: Run ramparts
+  run: ramparts scan-config --format sarif > ramparts.sarif
+
+- name: Upload SARIF
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: ramparts.sarif
 ```
 
 ## Environment Variables

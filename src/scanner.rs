@@ -670,6 +670,7 @@ impl YaraScanner {
             matched_text: None,
             context: generate_context_message(T::item_type(), &match_info.rule_name),
             rule_metadata: match_info.metadata.clone(),
+            owasp_tags: crate::taxonomy::tags_for_yara_rule(&match_info.rule_name),
             phase: None,
             rules_executed: None,
             security_issues_detected: None,
@@ -757,6 +758,7 @@ impl Scanner for YaraScanner {
                         stats.pre_scan_count, total_items
                     ),
                     rule_metadata: None,
+                    owasp_tags: Vec::new(),
                     phase: Some("pre-scan".to_string()),
                     rules_executed: if stats.pre_scan_rules.is_empty() {
                         None
@@ -860,6 +862,7 @@ impl Scanner for YaraScanner {
                         stats.post_scan_count, total_items
                     ),
                     rule_metadata: None,
+                    owasp_tags: Vec::new(),
                     phase: Some("post-scan".to_string()),
                     rules_executed: if stats.post_scan_rules.is_empty() {
                         None
@@ -1245,6 +1248,18 @@ impl MCPScanner {
 
         let mut result = ScanResult::new(display_url.clone());
 
+        // Kick off a parallel OSV.dev lookup for this server's launch package
+        // (e.g. `npx -y @scope/pkg@1.2.3` -> npm:@scope/pkg@1.2.3). We don't
+        // wait on it inline — the future is awaited after the scan body so
+        // the OSV roundtrip overlaps with the actual MCP handshake + tool
+        // enumeration. Returns an empty Vec when no recognizable package
+        // spec can be parsed from the command (e.g. raw `python3 script.py`).
+        let osv_findings_future =
+            crate::osv::parse_package_spec_from_command(command, args).map(|spec| {
+                debug!("Launching OSV lookup for {}/{}", spec.ecosystem, spec.name);
+                crate::osv::query_osv(self.client.clone(), spec)
+            });
+
         // Wrap the entire connect-and-scan pipeline in `options.timeout` so a
         // hung subprocess (no MCP handshake response, deadlocked tool, etc.)
         // can't make the CLI hang forever — same overall budget the HTTP path
@@ -1269,6 +1284,15 @@ impl MCPScanner {
             }
         })
         .await;
+
+        // Drain the OSV future (no-op if no spec was parseable). Findings
+        // append to result.yara_results regardless of whether the main scan
+        // succeeded — supply-chain risks are real even if the server is
+        // unreachable right now.
+        let osv_findings = match osv_findings_future {
+            Some(fut) => fut.await,
+            None => Vec::new(),
+        };
 
         match scan_result {
             Ok((session, mut scan_data)) => {
@@ -1363,15 +1387,45 @@ impl MCPScanner {
             }
         }
 
+        // Append OSV supply-chain findings (if any) regardless of the main
+        // scan's success: a failed handshake doesn't make the dependency
+        // any less vulnerable.
+        if !osv_findings.is_empty() {
+            debug!(
+                "OSV reported {} vulnerability finding(s) for {}",
+                osv_findings.len(),
+                display_url
+            );
+            result.yara_results.extend(osv_findings);
+        }
+
         result.response_time_ms = scan_timer.elapsed_ms();
         Ok(result)
     }
 
     /// Scan MCP servers from IDE configuration files
-    /// Scan configuration files grouped by IDE  
+    /// Scan configuration files grouped by IDE
     pub async fn scan_config_by_ide(&self, options: ScanOptions) -> Result<Vec<ScanResult>> {
-        let config_manager = MCPConfigManager::new();
+        self.scan_config_by_ide_inner(MCPConfigManager::new(), options)
+            .await
+    }
 
+    /// Scan MCP servers discovered by walking a user-supplied root directory
+    /// (e.g. a checked-in repo of IDE configs). See ramparts#51.
+    pub async fn scan_config_in_root(
+        &self,
+        root: &Path,
+        options: ScanOptions,
+    ) -> Result<Vec<ScanResult>> {
+        self.scan_config_by_ide_inner(MCPConfigManager::with_root(root), options)
+            .await
+    }
+
+    async fn scan_config_by_ide_inner(
+        &self,
+        config_manager: MCPConfigManager,
+        options: ScanOptions,
+    ) -> Result<Vec<ScanResult>> {
         if !config_manager.has_config_files() {
             return Err(anyhow!("No MCP IDE configuration files found"));
         }
@@ -1514,6 +1568,7 @@ impl MCPScanner {
                             matched_text: None,
                             context: generate_context_message("server", &m.rule_name),
                             rule_metadata: m.metadata.clone(),
+                            owasp_tags: crate::taxonomy::tags_for_yara_rule(&m.rule_name),
                             phase: Some("pre-config".to_string()),
                             rules_executed: None,
                             security_issues_detected: None,
@@ -1554,6 +1609,7 @@ impl MCPScanner {
                                 confidence: Some("MEDIUM".to_string()),
                                 tags: vec!["baseline".to_string()],
                             }),
+                            owasp_tags: crate::taxonomy::tags_for_yara_rule("MCPConfigChanged"),
                             phase: Some("pre-config".to_string()),
                             rules_executed: None,
                             security_issues_detected: None,
@@ -1927,6 +1983,10 @@ impl MCPScanner {
         // Store fetch errors in scan_data for later inclusion in final result
         scan_data.fetch_errors = fetch_errors;
 
+        // Apply --only filter: drop categories the user didn't ask for so
+        // they don't appear in security analysis or output.
+        Self::apply_only_filter(&mut scan_data, options);
+
         // Clean up the session to prevent session deletion errors
         if let Err(e) = self.mcp_client.cleanup_session(&session).await {
             warn!("Failed to clean up MCP session: {}", e);
@@ -1935,11 +1995,30 @@ impl MCPScanner {
         Ok(scan_data)
     }
 
+    /// Drop tools / resources / prompts from `scan_data` based on
+    /// `ScanOptions::only`. When `only` is `None`, no-op. When it's `Some`,
+    /// any artifact kind not in the list is cleared so downstream YARA, LLM,
+    /// and cross-origin steps see nothing for it.
+    fn apply_only_filter(scan_data: &mut ScanData, options: &ScanOptions) {
+        let Some(kinds) = options.only.as_ref() else {
+            return;
+        };
+        if !kinds.contains(&crate::types::ArtifactKind::Tools) {
+            scan_data.tools.clear();
+        }
+        if !kinds.contains(&crate::types::ArtifactKind::Resources) {
+            scan_data.resources.clear();
+        }
+        if !kinds.contains(&crate::types::ArtifactKind::Prompts) {
+            scan_data.prompts.clear();
+        }
+    }
+
     /// Perform scan with an existing MCP session (for STDIO transport)
     async fn perform_scan_with_session(
         &self,
         session: &crate::types::MCPSession,
-        _options: &ScanOptions,
+        options: &ScanOptions,
     ) -> Result<ScanData> {
         let mut scan_data = ScanData::new();
 
@@ -2043,6 +2122,9 @@ impl MCPScanner {
 
         // Store fetch errors in scan_data for later inclusion in final result
         scan_data.fetch_errors = fetch_errors;
+
+        // Apply --only filter (same as the HTTP path).
+        Self::apply_only_filter(&mut scan_data, options);
 
         // Clean up the session to prevent session deletion errors
         if let Err(e) = self.mcp_client.cleanup_session(session).await {

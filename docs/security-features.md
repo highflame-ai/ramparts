@@ -120,6 +120,18 @@ Jailbreak attacks involve sophisticated attempts to bypass AI safety measures an
 
 Ramparts looks for patterns that suggest tools might be designed to enable jailbreaking, including tools that could be chained together to bypass restrictions, tools that seem designed to manipulate AI behavior, and tools that might provide pathways around safety measures.
 
+### Vulnerable Dependencies (Supply Chain)
+
+When a stdio MCP server is launched via `npx` (npm) or `uvx` (PyPI),
+ramparts extracts the package + version from the launch command and
+queries [OSV.dev](https://osv.dev) for known security advisories. Any
+findings are emitted as `VulnerableDependency` entries with full CVE/GHSA
+identifiers, summaries, and mapped CVSS severity. This catches the case
+where the MCP server itself is fine but it's running on a release of an
+underlying library with known CVEs (ReDoS, prototype pollution,
+arbitrary code execution, etc.). The check runs in parallel with the
+main scan and fails soft.
+
 ## How Ramparts Detects These Threats
 
 Ramparts uses a three-layer approach to catch these security issues:
@@ -136,6 +148,36 @@ Ramparts uses a three-layer approach to catch these security issues:
 This metadata makes it easy to prioritize security findings and understand their impact on your specific environment.
 
 **LLM-Powered Analysis** is where things get interesting. Ramparts uses AI models to understand the semantic meaning of tools and catch subtle issues that static analysis might miss. It can detect when a tool's description doesn't match its actual behavior, identify tools that might be designed to be deceptive, and spot complex attack patterns that require understanding context.
+
+## OWASP MCP Top 10 Mapping
+
+Every finding ramparts emits is tagged with one or more entries from the
+**OWASP MCP Top 10** so consumers (terminal output, JSON, SARIF, the
+markdown report) can group and prioritize results against a recognized
+framework. The taxonomy is pinned to a versioned YAML file
+(`taxonomies/owasp-mcp-top-10/2025.yaml`) — when the official list
+publishes a new revision, it lands as a new file rather than mutating
+the existing one, so previously-tagged findings stay interpretable.
+
+| ID | Category | Example ramparts findings |
+|---|---|---|
+| MCP01 | Prompt Injection | `PromptInjection`, `Jailbreak` |
+| MCP02 | Tool Poisoning | `ToolPoisoning`, `MCPConfigChanged` (baseline drift) |
+| MCP03 | Excessive Agency | `Jailbreak`, overscoped capabilities |
+| MCP04 | Insecure Tool Output Handling | `PathTraversalVulnerability` |
+| MCP05 | Cross-Origin Tool Confusion | `CrossDomainContamination`, `DomainOutlier`, `MixedSecuritySchemes` |
+| MCP06 | Credential and Secret Leakage | `SecretsLeakage`, `EnvironmentVariableLeakage`, `SSHKeyExposure`, `PEMFileAccess` |
+| MCP07 | Command and SQL Injection | `CommandInjection`, `SQLInjection`, `MCPConfigRisk` |
+| MCP08 | Authentication & Authorization Bypass | `AuthBypass` |
+| MCP09 | Sensitive Data Exposure | `PIILeakage`, secret findings |
+| MCP10 | Supply Chain | `MCPConfigRisk`, `VulnerableDependency` (OSV.dev) |
+
+Tags appear in:
+
+- **Terminal**: `OWASP MCP Top 10: MCP05, MCP06` after each finding
+- **JSON**: `owasp_tags` array on every `SecurityIssue` and `YaraScanResult`
+- **SARIF**: `properties.tags` on every `result` and `rule` definition
+  (e.g. `owasp-mcp-top-10:2025-draft:MCP05`)
 
 ## Severity Levels and What They Mean
 

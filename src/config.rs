@@ -2338,6 +2338,101 @@ impl MCPConfigManager {
     pub fn has_config_files(&self) -> bool {
         self.config_paths.iter().any(|(path, _)| path.exists())
     }
+
+    /// Build a `MCPConfigManager` whose `config_paths` are discovered by
+    /// walking `root` for known MCP configuration filenames. Used by
+    /// `scan-config --root <PATH>` (see ramparts#51) to scan a checked-in
+    /// repository of IDE configs without relying on the user's home
+    /// directory state.
+    pub fn with_root(root: &Path) -> Self {
+        Self {
+            config_paths: Self::discover_config_paths_in_root(root),
+        }
+    }
+
+    /// Recursively walk `root` collecting paths whose filename matches a
+    /// known MCP config pattern. The directory walk skips a small set of
+    /// directories that never contain MCP configs (`.git`, `node_modules`,
+    /// `target`, `dist`, `build`) so a repo with thousands of files in
+    /// those directories doesn't pay for a full crawl.
+    fn discover_config_paths_in_root(root: &Path) -> Vec<(PathBuf, MCPClient)> {
+        const SKIP_DIRS: &[&str] = &[
+            ".git",
+            "node_modules",
+            "target",
+            "dist",
+            "build",
+            ".venv",
+            "venv",
+            "__pycache__",
+        ];
+        const CONFIG_FILENAMES: &[&str] = &[
+            "mcp.json",
+            "mcp_config.json",
+            "claude_desktop_config.json",
+            "settings.json",
+            "settings.local.json",
+            "managed-settings.json",
+        ];
+        const MAX_DEPTH: usize = 16;
+
+        fn walk(
+            dir: &Path,
+            depth: usize,
+            max_depth: usize,
+            skip_dirs: &[&str],
+            filenames: &[&str],
+            out: &mut Vec<(PathBuf, MCPClient)>,
+        ) {
+            if depth > max_depth {
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    // Don't follow symlinks — avoids cycles and surprises
+                    // when scanning repos that link out to elsewhere.
+                    continue;
+                }
+                if file_type.is_dir() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if skip_dirs.contains(&name)
+                            || name.starts_with('.')
+                                && name != ".vscode"
+                                && name != ".cursor"
+                                && name != ".claude"
+                                && name != ".gemini"
+                                && name != ".windsurf"
+                                && name != ".codeium"
+                        {
+                            continue;
+                        }
+                    }
+                    walk(&path, depth + 1, max_depth, skip_dirs, filenames, out);
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if filenames.contains(&name) || name.ends_with(".mcp.json") {
+                        let client =
+                            MCPConfigManager::detect_client(&path).unwrap_or(MCPClient::VSCode);
+                        out.push((path, client));
+                    }
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        if !root.exists() {
+            warn!("--root path does not exist: {}", root.display());
+            return found;
+        }
+        walk(root, 0, MAX_DEPTH, SKIP_DIRS, CONFIG_FILENAMES, &mut found);
+        found
+    }
 }
 
 #[cfg(test)]
