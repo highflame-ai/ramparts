@@ -488,7 +488,9 @@ async fn execute_command(
                     }
                     filter.disable(name);
                 }
-                handle_fix_command(fix && yes, dry_run, &filter, force)
+                // `yes` is `requires = "fix"` in clap, so `yes` implies `fix`;
+                // it alone signals "actually write".
+                handle_fix_command(yes, dry_run, &filter, force)
             } else {
                 handle_scan_config_command(
                     auth_headers,
