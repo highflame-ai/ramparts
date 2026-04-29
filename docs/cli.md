@@ -206,7 +206,33 @@ ramparts scan-config --fix --yes
 
 # Restore the most recent fix run from backup, then delete the backup.
 ramparts scan-config --undo
+
+# Apply even if some target files have uncommitted git changes (override).
+ramparts scan-config --fix --yes --force
+
+# Run a subset of rules.
+ramparts scan-config --fix --yes --disable-rule allowlist-tightening
 ```
+
+#### Fix rules shipped
+
+| Rule                     | What it does                                                                                                                                                                                                                                                                                                     |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `http-to-https`          | Rewrites `http://` URLs in `url` fields to `https://`. Loopback hosts (`localhost`, `127.x.x.x`, `0.0.0.0`, `::1`) are preserved.                                                                                                                                                                                |
+| `secret-externalization` | Replaces inline `SCREAMING_SNAKE` env values with `${VAR}` references. Already-referenced values, empty values, and `dangerous-flag` keys are skipped. If the config dir already contains a `.env.example`, new placeholder lines (`VAR=`) are appended; otherwise the suggested contents are printed to stderr. |
+| `dangerous-flag-removal` | Removes a closed list of opt-out flags that disable security: `NODE_TLS_REJECT_UNAUTHORIZED=0`, `DANGEROUSLY_OMIT_AUTH=true`, `MCP_DISABLE_AUTH=1`, `PYTHONHTTPSVERIFY=0`, `GIT_SSL_NO_VERIFY=true`.                                                                                                             |
+| `allowlist-tightening`   | Drops over-broad sentinel entries (`*`, `**`, `/`, `~`, `0.0.0.0/0`, `::/0`) from `allowedDirectories` / `allowedHosts` arrays **only when more specific entries are also present**. If a sentinel is the sole entry, the list is left alone (no signal for what to narrow to).                                  |
+
+Rules can be selected per-run with `--enable-rule NAME` and `--disable-rule NAME` (repeatable).
+
+#### Git-cleanliness check (`--force`)
+
+If a target file lives inside a git repository and has uncommitted changes
+(working-tree or index), `--fix --yes` refuses by default to avoid
+overwriting the user's in-progress edits. The error lists the dirty paths;
+commit/stash and re-run, or pass `--force` to override. Files outside any
+git repo (most IDE configs in `~/Library/Application Support/...` etc.) are
+unaffected by this check. The backup is written regardless of `--force`.
 
 #### Backups and `--undo`
 
@@ -257,10 +283,10 @@ If something looks wrong after a fix:
 
 #### Limitations and caveats
 
-- **No git-cleanliness check.** Many MCP config files live outside any git
-  repo (e.g. `~/Library/Application Support/Claude/claude_desktop_config.json`),
-  so a "refuse if dirty" rule would have too many false negatives to be a
-  meaningful safety. The backup is the safety.
+- **Git-cleanliness check is best-effort.** Files outside any git repo
+  (e.g. `~/Library/Application Support/Claude/claude_desktop_config.json`)
+  are not gated by the check — the backup is the safety net for those.
+  When the check does fire, override with `--force` if intentional.
 - **`fsync(2)` only on Unix.** macOS's `fsync` does not guarantee
   platter-level durability — `F_FULLFSYNC` would. We accept this for v1;
   the backup makes a power-loss-during-fix recoverable on next boot.

@@ -39,16 +39,84 @@ pub struct AppliedFix {
     pub summary: String,
 }
 
-/// Apply every fix rule to `value` in place. Returns the list of fixes
-/// applied. The order is deterministic: rules run in the order returned by
-/// `all_rules()`, and within a rule, fields are visited in the JSON's
-/// natural map iteration order (which `serde_json` preserves via the
-/// `preserve_order` feature — but we don't depend on that for correctness,
-/// only for diff stability).
-pub fn apply_all(value: &mut Value) -> Vec<AppliedFix> {
+/// Per-rule context passed to `FixRule::apply`. Currently only carries the
+/// path of the file being fixed (for rules that need to look at sibling
+/// files like lockfiles); will grow as needed.
+#[derive(Debug, Clone, Copy)]
+pub struct FixContext<'a> {
+    /// Absolute path to the IDE config file being fixed. Rules can use this
+    /// to find co-located files (e.g. `package-lock.json` next to a
+    /// project's MCP config).
+    #[allow(dead_code)] // read by `unpinned-package-pinning` rule (added below)
+    pub config_path: &'a std::path::Path,
+}
+
+/// Predicate selecting which rules run. Wraps a `HashSet<&str>` of enabled
+/// rule names. Construct via `RuleFilter::from_iter` or
+/// `RuleFilter::all_default`.
+#[derive(Debug, Clone)]
+pub struct RuleFilter {
+    enabled: std::collections::HashSet<String>,
+}
+
+impl RuleFilter {
+    /// Filter that enables every rule whose `enabled_by_default()` returns
+    /// true. v1 ships all three core rules as enabled-by-default.
+    pub fn all_default() -> Self {
+        let enabled = all_rules()
+            .into_iter()
+            .filter(|r| r.enabled_by_default())
+            .map(|r| r.name().to_string())
+            .collect();
+        Self { enabled }
+    }
+
+    /// Filter from an explicit set of rule names.
+    #[allow(dead_code)] // reserved for future config-file integration
+    pub fn from_names<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            enabled: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Add a rule by name. Unknown names are silently kept (warned in main).
+    pub fn enable(&mut self, name: &str) {
+        self.enabled.insert(name.to_string());
+    }
+
+    /// Remove a rule by name.
+    pub fn disable(&mut self, name: &str) {
+        self.enabled.remove(name);
+    }
+
+    pub fn is_enabled(&self, name: &str) -> bool {
+        self.enabled.contains(name)
+    }
+}
+
+/// Names of every rule the registry knows about. Used for CLI help text
+/// and to validate user-supplied `--enable-rule` / `--disable-rule` values.
+pub fn known_rule_names() -> Vec<&'static str> {
+    all_rules().into_iter().map(|r| r.name()).collect()
+}
+
+/// Apply every enabled fix rule to `value` in place. Returns the list of
+/// fixes applied. The order is deterministic: rules run in the order
+/// returned by `all_rules()`, and within a rule, fields are visited in the
+/// JSON's natural map iteration order (which `serde_json` preserves via
+/// the `preserve_order` feature — but we don't depend on that for
+/// correctness, only for diff stability).
+pub fn apply_all(value: &mut Value, ctx: FixContext<'_>, filter: &RuleFilter) -> Vec<AppliedFix> {
     let mut applied = Vec::new();
     for rule in all_rules() {
-        rule.apply(value, &mut applied);
+        if !filter.is_enabled(rule.name()) {
+            continue;
+        }
+        rule.apply(value, ctx, &mut applied);
     }
     applied
 }
@@ -59,11 +127,27 @@ fn all_rules() -> Vec<Box<dyn FixRule>> {
         Box::new(HttpToHttps),
         Box::new(SecretExternalization),
         Box::new(DangerousFlagRemoval),
+        Box::new(AllowlistTightening),
     ]
 }
 
-trait FixRule {
-    fn apply(&self, value: &mut Value, out: &mut Vec<AppliedFix>);
+/// One auto-fix rule. Each rule has a stable `name()` (used for config
+/// gating, CLI flags, and the manifest's `applied_rules` list) and an
+/// `enabled_by_default()` flag (currently all rules are enabled; the
+/// surface exists so future risky rules can ship opt-in).
+pub trait FixRule {
+    /// Stable identifier — also the user-facing name in `--enable-rule` /
+    /// `--disable-rule` and in the diff summary.
+    fn name(&self) -> &'static str;
+
+    /// Whether this rule runs unless explicitly disabled. v1 ships all
+    /// three as `true`; reserved for future opt-in rules.
+    fn enabled_by_default(&self) -> bool {
+        true
+    }
+
+    /// Apply the rule to `value`, recording any changes in `out`.
+    fn apply(&self, value: &mut Value, ctx: FixContext<'_>, out: &mut Vec<AppliedFix>);
 }
 
 /// Visit every server entry across all three shapes, calling `f` with a
@@ -112,7 +196,11 @@ fn for_each_server(value: &mut Value, mut f: impl FnMut(&str, &mut Map<String, V
 struct HttpToHttps;
 
 impl FixRule for HttpToHttps {
-    fn apply(&self, value: &mut Value, out: &mut Vec<AppliedFix>) {
+    fn name(&self) -> &'static str {
+        "http-to-https"
+    }
+
+    fn apply(&self, value: &mut Value, _ctx: FixContext<'_>, out: &mut Vec<AppliedFix>) {
         for_each_server(value, |path, server| {
             let Some(Value::String(url)) = server.get_mut("url") else {
                 return;
@@ -158,7 +246,11 @@ fn is_loopback_host(host: &str) -> bool {
 struct SecretExternalization;
 
 impl FixRule for SecretExternalization {
-    fn apply(&self, value: &mut Value, out: &mut Vec<AppliedFix>) {
+    fn name(&self) -> &'static str {
+        "secret-externalization"
+    }
+
+    fn apply(&self, value: &mut Value, _ctx: FixContext<'_>, out: &mut Vec<AppliedFix>) {
         for_each_server(value, |path, server| {
             let Some(Value::Object(env)) = server.get_mut("env") else {
                 return;
@@ -267,7 +359,11 @@ const DANGEROUS_FLAGS: &[(&str, &str, &str)] = &[
 ];
 
 impl FixRule for DangerousFlagRemoval {
-    fn apply(&self, value: &mut Value, out: &mut Vec<AppliedFix>) {
+    fn name(&self) -> &'static str {
+        "dangerous-flag-removal"
+    }
+
+    fn apply(&self, value: &mut Value, _ctx: FixContext<'_>, out: &mut Vec<AppliedFix>) {
         for_each_server(value, |path, server| {
             let Some(Value::Object(env)) = server.get_mut("env") else {
                 return;
@@ -297,6 +393,74 @@ impl FixRule for DangerousFlagRemoval {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Rule 4: tighten over-broad `allowedDirectories` / `allowedHosts`.
+// ---------------------------------------------------------------------------
+//
+// Conservative narrowing: drop sentinel entries that grant blanket access
+// (`*`, `**`, `/`, `~`, `0.0.0.0/0`, `::/0`) only when more specific entries
+// are also present in the same list. If the broad entry is the *only* entry
+// we have no signal for what to narrow it to and leave the list alone.
+//
+// Both array-of-strings and single-string forms are recognised. Single-string
+// values containing only a sentinel are left alone (same "no signal" rule).
+
+struct AllowlistTightening;
+
+const DIR_SENTINELS: &[&str] = &["*", "**", "/", "~", "~/"];
+const HOST_SENTINELS: &[&str] = &["*", "0.0.0.0/0", "::/0"];
+
+impl FixRule for AllowlistTightening {
+    fn name(&self) -> &'static str {
+        "allowlist-tightening"
+    }
+
+    fn apply(&self, value: &mut Value, _ctx: FixContext<'_>, out: &mut Vec<AppliedFix>) {
+        for_each_server(value, |path, server| {
+            tighten_array(server, "allowedDirectories", DIR_SENTINELS, path, out);
+            tighten_array(server, "allowedHosts", HOST_SENTINELS, path, out);
+        });
+    }
+}
+
+fn tighten_array(
+    server: &mut Map<String, Value>,
+    field: &str,
+    sentinels: &[&str],
+    path: &str,
+    out: &mut Vec<AppliedFix>,
+) {
+    let Some(Value::Array(items)) = server.get_mut(field) else {
+        return;
+    };
+    // Need at least one specific entry to keep, otherwise no signal.
+    let specific_count = items
+        .iter()
+        .filter(|v| match v {
+            Value::String(s) => !sentinels.contains(&s.as_str()),
+            _ => false,
+        })
+        .count();
+    if specific_count == 0 {
+        return;
+    }
+    let mut removed: Vec<String> = Vec::new();
+    items.retain(|v| match v {
+        Value::String(s) if sentinels.contains(&s.as_str()) => {
+            removed.push(s.clone());
+            false
+        }
+        _ => true,
+    });
+    for s in removed {
+        out.push(AppliedFix {
+            rule: "allowlist-tightening",
+            field: format!("{path}.{field}"),
+            summary: format!("removed over-broad entry {s:?}"),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,7 +468,11 @@ mod tests {
 
     fn fixed(input: Value) -> (Value, Vec<AppliedFix>) {
         let mut v = input;
-        let applied = apply_all(&mut v);
+        let dummy_path = std::path::Path::new("/dev/null");
+        let ctx = FixContext {
+            config_path: dummy_path,
+        };
+        let applied = apply_all(&mut v, ctx, &RuleFilter::all_default());
         (v, applied)
     }
 
@@ -479,6 +647,68 @@ mod tests {
             v["mcpServers"]["x"]["env"]["NODE_TLS_REJECT_UNAUTHORIZED"],
             "1"
         );
+    }
+
+    // ----- allowlist tightening -----
+
+    #[test]
+    fn allowlist_tightening_drops_sentinels_when_specifics_exist() {
+        let (v, applied) = fixed(json!({
+            "mcpServers": {
+                "x": {
+                    "allowedDirectories": ["/", "/home/me/work"],
+                    "allowedHosts": ["*", "api.example.com"]
+                }
+            }
+        }));
+        assert_eq!(applied.len(), 2);
+        assert!(applied.iter().all(|f| f.rule == "allowlist-tightening"));
+        assert_eq!(
+            v["mcpServers"]["x"]["allowedDirectories"],
+            json!(["/home/me/work"])
+        );
+        assert_eq!(
+            v["mcpServers"]["x"]["allowedHosts"],
+            json!(["api.example.com"])
+        );
+    }
+
+    #[test]
+    fn allowlist_tightening_leaves_sole_sentinel_alone() {
+        // No specific entries to fall back on — leave the list alone.
+        let (v, applied) = fixed(json!({
+            "mcpServers": {
+                "x": { "allowedDirectories": ["/"] }
+            }
+        }));
+        assert!(applied.is_empty());
+        assert_eq!(v["mcpServers"]["x"]["allowedDirectories"], json!(["/"]));
+    }
+
+    #[test]
+    fn allowlist_tightening_skips_clean_lists() {
+        let (_, applied) = fixed(json!({
+            "mcpServers": {
+                "x": {
+                    "allowedDirectories": ["/home/me/work", "/tmp"],
+                    "allowedHosts": ["api.example.com"]
+                }
+            }
+        }));
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn allowlist_tightening_skips_non_array_field() {
+        // Single-string `allowedDirectories` (some configs use this form);
+        // we don't touch it.
+        let (v, applied) = fixed(json!({
+            "mcpServers": {
+                "x": { "allowedDirectories": "/" }
+            }
+        }));
+        assert!(applied.is_empty());
+        assert_eq!(v["mcpServers"]["x"]["allowedDirectories"], "/");
     }
 
     // ----- non-applicable inputs -----

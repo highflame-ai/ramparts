@@ -175,6 +175,22 @@ enum Commands {
         /// backup. Files modified since the fix are skipped (drift).
         #[arg(long, conflicts_with_all = ["fix", "dry_run"])]
         undo: bool,
+
+        /// Enable a fix rule by name (repeatable). Adds to the
+        /// enabled-by-default set. Use `--list-rules` to see names.
+        #[arg(long = "enable-rule", value_name = "NAME")]
+        enable_rules: Vec<String>,
+
+        /// Disable a fix rule by name (repeatable). Removes from the
+        /// enabled-by-default set. Use `--list-rules` to see names.
+        #[arg(long = "disable-rule", value_name = "NAME")]
+        disable_rules: Vec<String>,
+
+        /// Override safety refusals. Specifically: proceed even if a target
+        /// IDE config file lives in a git repo and has uncommitted changes.
+        /// The backup is always written regardless of this flag.
+        #[arg(long, requires = "fix")]
+        force: bool,
     },
 
     /// Generate a default config.yaml file
@@ -382,11 +398,29 @@ async fn execute_command(
             fix,
             yes,
             undo,
+            enable_rules,
+            disable_rules,
+            force,
         } => {
             if undo {
                 handle_undo_command()
             } else if fix || dry_run {
-                handle_fix_command(fix && yes, dry_run)
+                let mut filter = fixes::RuleFilter::all_default();
+                let known: std::collections::HashSet<&'static str> =
+                    fixes::known_rule_names().into_iter().collect();
+                for name in &enable_rules {
+                    if !known.contains(name.as_str()) {
+                        warn!("--enable-rule: unknown rule '{name}' (known: {:?})", known);
+                    }
+                    filter.enable(name);
+                }
+                for name in &disable_rules {
+                    if !known.contains(name.as_str()) {
+                        warn!("--disable-rule: unknown rule '{name}' (known: {:?})", known);
+                    }
+                    filter.disable(name);
+                }
+                handle_fix_command(fix && yes, dry_run, &filter, force)
             } else {
                 handle_scan_config_command(
                     auth_headers,
@@ -595,9 +629,17 @@ struct PendingFix {
     original: Vec<u8>,
     fixed: Vec<u8>,
     rules: Vec<String>,
+    /// Env-var names (`SCREAMING_SNAKE`) that `secret-externalization`
+    /// rewrote in this file. Used to update a sibling `.env.example`.
+    externalized_vars: Vec<String>,
 }
 
-fn handle_fix_command(apply: bool, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_fix_command(
+    apply: bool,
+    dry_run: bool,
+    rule_filter: &fixes::RuleFilter,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     use config::MCPConfigManager;
     use serde_json::Value;
 
@@ -657,7 +699,8 @@ fn handle_fix_command(apply: bool, dry_run: bool) -> Result<(), Box<dyn std::err
         }
 
         let mut fixed = parsed.clone();
-        let applied = fixes::apply_all(&mut fixed);
+        let ctx = fixes::FixContext { config_path: path };
+        let applied = fixes::apply_all(&mut fixed, ctx, rule_filter);
         if applied.is_empty() {
             continue;
         }
@@ -681,11 +724,20 @@ fn handle_fix_command(apply: bool, dry_run: bool) -> Result<(), Box<dyn std::err
         }
         print_diff(&original, &new_bytes);
 
+        let externalized_vars: Vec<String> = applied
+            .iter()
+            .filter(|f| f.rule == "secret-externalization")
+            .filter_map(|f| {
+                // field looks like `mcpServers.x.env.GITHUB_TOKEN` — last segment is the var name.
+                f.field.rsplit('.').next().map(str::to_string)
+            })
+            .collect();
         to_write.push(PendingFix {
             path: path.clone(),
             original,
             fixed: new_bytes,
             rules: applied.into_iter().map(|f| f.rule.to_string()).collect(),
+            externalized_vars,
         });
     }
 
@@ -711,9 +763,35 @@ fn handle_fix_command(apply: bool, dry_run: bool) -> Result<(), Box<dyn std::err
         std::process::exit(1);
     }
 
+    // Git-cleanliness check: refuse to modify a file that has uncommitted
+    // changes in its git repo unless --force is set. Files outside any git
+    // repo are unaffected. The backup is written regardless, so --force is
+    // about respecting the user's in-progress edits, not about safety.
+    if !force {
+        let dirty: Vec<_> = to_write
+            .iter()
+            .filter(|p| git_file_is_dirty(&p.path).unwrap_or(false))
+            .map(|p| p.path.clone())
+            .collect();
+        if !dirty.is_empty() {
+            eprintln!();
+            eprintln!(
+                "✗ Refusing to fix {} file(s) with uncommitted git changes:",
+                dirty.len()
+            );
+            for p in &dirty {
+                eprintln!("    {}", p.display());
+            }
+            eprintln!("  Commit/stash first, or pass --force to override.");
+            std::process::exit(1);
+        }
+    }
+
     // Apply.
     let store = backup::BackupStore::new()?;
     let mut run = store.begin_run(env!("CARGO_PKG_VERSION"))?;
+    let mut env_example_updates: std::collections::HashMap<std::path::PathBuf, Vec<String>> =
+        std::collections::HashMap::new();
     for pending in to_write {
         run.record_and_apply(
             &pending.path,
@@ -721,6 +799,49 @@ fn handle_fix_command(apply: bool, dry_run: bool) -> Result<(), Box<dyn std::err
             &pending.fixed,
             pending.rules,
         )?;
+        if !pending.externalized_vars.is_empty() {
+            if let Some(parent) = pending.path.parent() {
+                env_example_updates
+                    .entry(parent.join(".env.example"))
+                    .or_default()
+                    .extend(pending.externalized_vars);
+            }
+        }
+    }
+    // .env.example writes: only append to a file the user already maintains.
+    // We never *create* `.env.example` — the IDE-config dirs we scan often
+    // sit in shared locations (`~/Library/Application Support/...`) where
+    // a freshly-minted `.env.example` would be surprising. For new-file
+    // creation, print a stderr hint instead and let the user copy-paste.
+    for (env_path, mut vars) in env_example_updates {
+        vars.sort();
+        vars.dedup();
+        if !env_path.exists() {
+            eprintln!(
+                "💡 Suggested {} contents (file does not exist; create manually if useful):",
+                env_path.display()
+            );
+            for v in &vars {
+                eprintln!("    {v}=");
+            }
+            continue;
+        }
+        let original = std::fs::read(&env_path)?;
+        let merged = merge_env_example(&original, &vars);
+        if merged == original {
+            continue;
+        }
+        run.record_and_apply(
+            &env_path,
+            &original,
+            &merged,
+            vec!["secret-externalization:env-example".into()],
+        )?;
+        eprintln!(
+            "📝 Updated {} with {} new placeholder(s).",
+            env_path.display(),
+            vars.len()
+        );
     }
     match run.commit()? {
         Some(run_dir) => {
@@ -790,6 +911,69 @@ fn is_safe_to_round_trip(original: &[u8], parsed: &serde_json::Value) -> bool {
         }
     }
     strip_trailing_newline(original) == strip_trailing_newline(&reserialized)
+}
+
+/// Check whether `path` lives in a git repo and has uncommitted changes
+/// (working-tree or index). Returns `Ok(false)` for files outside any git
+/// repo. Returns `Ok(false)` on any git error — we don't want a missing
+/// `git` binary to block fixes.
+fn git_file_is_dirty(path: &std::path::Path) -> Result<bool, std::io::Error> {
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(parent)
+        .arg("status")
+        .arg("--porcelain")
+        .arg("--")
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        // Not a git repo, or git not installed — treat as clean.
+        return Ok(false);
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+/// Merge `new_keys` into an existing `.env.example` file. Each key is
+/// rendered as `KEY=` if not already present. Existing content is preserved
+/// verbatim. Returns the merged bytes.
+fn merge_env_example(existing: &[u8], new_keys: &[String]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(existing);
+    let present: std::collections::HashSet<&str> = text
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                return None;
+            }
+            trimmed.split_once('=').map(|(k, _)| k.trim())
+        })
+        .collect();
+    let mut out = existing.to_vec();
+    let mut wrote_header = false;
+    for key in new_keys {
+        if present.contains(key.as_str()) {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+        if !wrote_header {
+            if !out.is_empty() {
+                out.extend_from_slice(b"\n");
+            }
+            out.extend_from_slice(
+                b"# Added by `ramparts scan-config --fix` -- fill in real values.\n",
+            );
+            wrote_header = true;
+        }
+        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(b"=\n");
+    }
+    out
 }
 
 /// Print a unified diff to stderr. Coloured when stderr is a TTY.
@@ -922,7 +1106,10 @@ mod fix_e2e_tests {
         let parsed: serde_json::Value = serde_json::from_slice(original).unwrap();
         assert!(is_safe_to_round_trip(original, &parsed));
         let mut fixed = parsed.clone();
-        let applied = fixes::apply_all(&mut fixed);
+        let ctx = fixes::FixContext {
+            config_path: &target,
+        };
+        let applied = fixes::apply_all(&mut fixed, ctx, &fixes::RuleFilter::all_default());
         assert_eq!(applied.len(), 1);
         let mut new_bytes = serde_json::to_vec_pretty(&fixed).unwrap();
         if original.last() == Some(&b'\n') && new_bytes.last() != Some(&b'\n') {
@@ -969,5 +1156,53 @@ mod fix_e2e_tests {
         );
         // Handler skips. File on disk untouched.
         assert_eq!(fs::read(&target).unwrap(), minified.to_vec());
+    }
+
+    #[test]
+    fn merge_env_example_appends_missing_keys() {
+        let existing = b"FOO=already_set\n";
+        let merged = merge_env_example(existing, &["FOO".into(), "BAR".into(), "BAZ".into()]);
+        let merged_str = String::from_utf8(merged).unwrap();
+        // FOO already present → not duplicated.
+        assert_eq!(merged_str.matches("FOO=").count(), 1);
+        // BAR and BAZ added.
+        assert!(merged_str.contains("\nBAR=\n"));
+        assert!(merged_str.contains("\nBAZ=\n"));
+        // Original line preserved verbatim.
+        assert!(merged_str.starts_with("FOO=already_set\n"));
+    }
+
+    #[test]
+    fn merge_env_example_no_op_when_all_present() {
+        let existing = b"FOO=x\nBAR=y\n";
+        let merged = merge_env_example(existing, &["FOO".into(), "BAR".into()]);
+        assert_eq!(merged, existing);
+    }
+
+    #[test]
+    fn merge_env_example_handles_no_trailing_newline() {
+        let existing = b"FOO=x";
+        let merged = merge_env_example(existing, &["BAR".into()]);
+        let s = String::from_utf8(merged).unwrap();
+        assert!(s.starts_with("FOO=x"));
+        assert!(s.contains("\nBAR=\n"));
+    }
+
+    #[test]
+    fn merge_env_example_ignores_comment_and_blank_lines() {
+        let existing = b"# header\n\nFOO=x\n";
+        let merged = merge_env_example(existing, &["FOO".into(), "BAR".into()]);
+        let s = String::from_utf8(merged).unwrap();
+        assert_eq!(s.matches("FOO=").count(), 1);
+        assert!(s.contains("BAR="));
+    }
+
+    #[test]
+    fn git_dirty_check_returns_false_outside_git_repo() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("not-a-repo.json");
+        fs::write(&path, b"{}").unwrap();
+        // No `.git` ancestor → treated as clean.
+        assert!(!git_file_is_dirty(&path).unwrap());
     }
 }
