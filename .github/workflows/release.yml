@@ -191,6 +191,8 @@ jobs:
           client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
           private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          repositories: |
+            - ${{ github.repository }}
 
       - name: Upload release assets
         uses: actions/upload-release-asset@v1
@@ -308,6 +310,9 @@ jobs:
           client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
           private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          repositories: |
+            - ${{ github.repository }}
+            - ${{ env.DEVOPS_REPO }}
 
       - name: Trigger private repo workflow
         env:
