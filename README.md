@@ -113,6 +113,15 @@ executes by name. Ramparts parses each skill's frontmatter and body and runs
 the same security pipeline (LLM analysis, YARA pre/post scan, OWASP MCP Top
 10 tagging) used for live MCP servers — pure static analysis on disk.
 
+[agentskills.io](https://github.com/agentskills/agentskills) bundles
+(`<name>/SKILL.md` plus sibling `scripts/` / `references/` /
+`assets/`) are first-class: ramparts detects the bundle shape, falls
+back to the parent-directory name for `name:`, validates the spec's
+naming rules (1–64 chars, `[a-z0-9-]`, no leading/trailing or double
+hyphens), surfaces name-vs-directory mismatches as HIGH-severity
+deception findings, and runs YARA over every bundled script
+(`.py`/`.sh`/`.js`/…) and reference doc.
+
 > **💡 Did you know you can start Ramparts as a server?** Run `ramparts server` to get a REST API for continuous monitoring and CI/CD integration. See 📚 **[Ramparts Server Mode](docs/api.md)** 
 
 ### Run as an MCP server (stdio)
