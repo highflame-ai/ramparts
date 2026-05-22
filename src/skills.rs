@@ -98,19 +98,27 @@ fn is_non_skill_filename(name: &str) -> bool {
 /// works on case-insensitive filesystems too — `read_dir` returns the
 /// on-disk casing, not the lookup casing, so `Skill.md` and `SKILL.md`
 /// remain distinguishable.
-pub fn is_agentskills_bundle(path: &Path) -> bool {
+pub(crate) fn is_agentskills_bundle(path: &Path) -> bool {
     path.file_name() == Some(OsStr::new("SKILL.md"))
 }
 
 /// The parent directory of a `SKILL.md` is the bundle root. Returns
 /// `None` for non-bundle paths so callers can `.filter_map` over a
-/// discovered set without an extra branch.
-pub fn bundle_root_of(path: &Path) -> Option<&Path> {
-    if is_agentskills_bundle(path) {
-        path.parent()
-    } else {
-        None
+/// discovered set without an extra branch. An empty parent (e.g.
+/// `PathBuf::from("SKILL.md").parent() == Some("")`) is also treated
+/// as no root — without this filter the bundle-roots set would
+/// contain `""`, which `Path::starts_with` then matches against every
+/// relative discovered path, falsely classifying unrelated `.md`
+/// files as bundle siblings.
+pub(crate) fn bundle_root_of(path: &Path) -> Option<&Path> {
+    if !is_agentskills_bundle(path) {
+        return None;
     }
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    Some(parent)
 }
 
 /// Returns true when `path` lives inside one of the recognized bundle
@@ -118,7 +126,7 @@ pub fn bundle_root_of(path: &Path) -> Option<&Path> {
 /// known bundle root. The bundle parser pulls those files in via
 /// synthetic resources, so the top-level walker should drop them to
 /// avoid double-scan.
-pub fn is_under_bundle_sibling_dir(path: &Path, bundle_roots: &HashSet<PathBuf>) -> bool {
+pub(crate) fn is_under_bundle_sibling_dir(path: &Path, bundle_roots: &HashSet<PathBuf>) -> bool {
     const SIBLING_DIRS: &[&str] = &["scripts", "references", "assets"];
     for root in bundle_roots {
         for sibling in SIBLING_DIRS {
@@ -134,7 +142,7 @@ pub fn is_under_bundle_sibling_dir(path: &Path, bundle_roots: &HashSet<PathBuf>)
 /// Kept tight on purpose — exotic languages (Lua, Tcl, etc.) can be added
 /// when we see them in real skill bundles. The list is matched
 /// case-insensitively.
-pub(crate) const SCRIPT_EXTS: &[&str] = &[
+const SCRIPT_EXTS: &[&str] = &[
     "py", "sh", "bash", "zsh", "js", "mjs", "cjs", "ts", "rb", "pl", "ps1",
 ];
 
@@ -144,7 +152,7 @@ pub(crate) const SCRIPT_EXTS: &[&str] = &[
 /// string on failure; otherwise `Ok(())`. Hand-rolled (no regex
 /// dependency) so the failure mode is specific enough to surface in the
 /// finding description.
-pub fn validate_skill_name(name: &str) -> std::result::Result<(), &'static str> {
+fn validate_skill_name(name: &str) -> std::result::Result<(), &'static str> {
     if name.is_empty() {
         return Err("name is empty");
     }
@@ -412,7 +420,7 @@ fn assemble_skill(
     body: &str,
     parsed_fm: &SkillFrontmatter,
     name: String,
-    mut extra_findings: Vec<YaraScanResult>,
+    extra_findings: Vec<YaraScanResult>,
 ) -> Option<ParsedSkill> {
     // Try to lift real argument names out of an `argument-hint` string
     // like "<env>" or "<env> <region>". When that yields nothing usable
@@ -491,7 +499,7 @@ fn assemble_skill(
     // Append the existing analyzers onto whatever findings the caller
     // already collected (e.g. bundle-validation findings). Order is
     // arbitrary — downstream renderers don't depend on it.
-    let mut heuristic_findings: Vec<YaraScanResult> = std::mem::take(&mut extra_findings);
+    let mut heuristic_findings: Vec<YaraScanResult> = extra_findings;
     if let Some(grant) = parsed_fm.allowed_tools.as_deref() {
         heuristic_findings.extend(analyze_allowed_tools(&prompt.name, path, grant));
     }
@@ -531,7 +539,9 @@ fn assemble_skill(
 /// 3. Walks sibling `scripts/` and `references/` to synthesize one
 ///    `MCPResource` per scannable file. Bundled assets (`assets/`) are
 ///    skipped — usually binary, low value-to-noise.
-pub fn parse_agentskills_bundle(skill_md_path: &Path) -> Option<(ParsedSkill, Vec<MCPResource>)> {
+pub(crate) fn parse_agentskills_bundle(
+    skill_md_path: &Path,
+) -> Option<(ParsedSkill, Vec<MCPResource>)> {
     if let Ok(metadata) = std::fs::metadata(skill_md_path) {
         if metadata.len() > MAX_SKILL_FILE_BYTES {
             warn!(
@@ -559,7 +569,7 @@ pub fn parse_agentskills_bundle(skill_md_path: &Path) -> Option<(ParsedSkill, Ve
 /// still hits the filesystem because that's intrinsic to bundle shape;
 /// pass a `skill_md_path` whose parent directory exists or has no
 /// scannable siblings to get a clean test.
-pub fn parse_agentskills_bundle_content(
+fn parse_agentskills_bundle_content(
     skill_md_path: &Path,
     raw: &str,
 ) -> Option<(ParsedSkill, Vec<MCPResource>)> {
@@ -765,6 +775,15 @@ fn collect_bundle_siblings(bundle_root: &Path, skill_name: &str, out: &mut Vec<M
     );
 }
 
+/// Per-subdirectory cap on the number of scannable siblings a bundle
+/// can contribute. A malicious bundle with 100k tiny `scripts/*.py`
+/// files would otherwise produce 100k synthetic `MCPResource`s, each
+/// loaded into memory and pushed through the YARA pipeline. 256 is
+/// well above what any honest bundle ships and bounds worst-case
+/// memory at `MAX_BUNDLE_FILES_PER_DIR * MAX_SKILL_FILE_BYTES` per
+/// subdirectory.
+const MAX_BUNDLE_FILES_PER_DIR: usize = 256;
+
 /// Walk one bundle sibling directory (`scripts/` or `references/`) and
 /// push a synthetic `MCPResource` for every file `accept` returns true
 /// for. The accept callback receives the file's basename; the walker
@@ -782,7 +801,16 @@ fn walk_bundle_subdir(
         // ship only some of the three optional siblings.
         return;
     };
+    let starting_len = out.len();
     for entry in entries.flatten() {
+        if out.len() - starting_len >= MAX_BUNDLE_FILES_PER_DIR {
+            warn!(
+                "Bundle {}/{subdir_name}: reached {} file cap; remaining entries skipped",
+                bundle_root.display(),
+                MAX_BUNDLE_FILES_PER_DIR
+            );
+            break;
+        }
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -2966,6 +2994,92 @@ mod tests {
         assert_eq!(resources.len(), 1);
         assert!(resources[0].uri.starts_with("skill://"));
         assert!(!resources[0].uri.contains("file://"));
+    }
+
+    #[test]
+    fn agentskills_oversize_script_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("my-skill");
+        std::fs::create_dir_all(bundle.join("scripts")).unwrap();
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+        // Build a script larger than MAX_SKILL_FILE_BYTES (2 MiB). We
+        // write `print(1)\n` x N to land just over the limit without
+        // burning fixture-test time on a needlessly large write.
+        let chunk = "print(1)\n";
+        let target_bytes = (MAX_SKILL_FILE_BYTES + 1024) as usize;
+        let repetitions = target_bytes.div_ceil(chunk.len());
+        let big: String = chunk.repeat(repetitions);
+        std::fs::write(bundle.join("scripts/huge.py"), &big).unwrap();
+        // Also include a normal-sized script — confirms the cap is
+        // per-file and doesn't abort the whole walk.
+        std::fs::write(bundle.join("scripts/ok.py"), "print(2)").unwrap();
+
+        let (_, resources) = parse_agentskills_bundle(&bundle.join("SKILL.md")).expect("parsed");
+        let names: Vec<_> = resources.iter().map(|r| r.name.clone()).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("huge.py")),
+            "huge.py exceeded the size cap and should have been skipped"
+        );
+        assert!(names.contains(&"my-skill/scripts/ok.py".to_string()));
+    }
+
+    #[test]
+    fn agentskills_bundle_files_per_dir_cap() {
+        // Floods `scripts/` with > MAX_BUNDLE_FILES_PER_DIR tiny files;
+        // walker should stop at the cap rather than producing one
+        // resource per file (DoS guard).
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("flood-skill");
+        std::fs::create_dir_all(bundle.join("scripts")).unwrap();
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            "---\nname: flood-skill\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+        let over_cap = MAX_BUNDLE_FILES_PER_DIR + 10;
+        for i in 0..over_cap {
+            std::fs::write(bundle.join(format!("scripts/x{i}.py")), "print(1)").unwrap();
+        }
+        let (_, resources) = parse_agentskills_bundle(&bundle.join("SKILL.md")).expect("parsed");
+        assert!(
+            resources.len() <= MAX_BUNDLE_FILES_PER_DIR,
+            "expected at most {MAX_BUNDLE_FILES_PER_DIR} resources, got {}",
+            resources.len()
+        );
+    }
+
+    #[test]
+    fn bundle_root_of_rejects_empty_parent() {
+        // A SKILL.md path with no parent component must NOT contribute
+        // a bundle-root entry — otherwise the empty-string root would
+        // prefix-match every relative discovered path and corrupt the
+        // bundle-sibling filter in main.rs.
+        // Bare `SKILL.md` (no parent) yields None.
+        assert!(bundle_root_of(&PathBuf::from("SKILL.md")).is_none());
+        // `./SKILL.md` has a non-empty parent (`.`), so it IS a valid
+        // bundle root — `.` resolves to whatever the caller's CWD is,
+        // which is the meaningful interpretation.
+        assert_eq!(
+            bundle_root_of(&PathBuf::from("./SKILL.md")),
+            Some(std::path::Path::new("."))
+        );
+        assert_eq!(
+            bundle_root_of(&PathBuf::from("foo/SKILL.md")),
+            Some(std::path::Path::new("foo"))
+        );
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_non_ascii() {
+        // Multi-byte UTF-8 (en-dash, accented vowel, fullwidth digits)
+        // contains bytes outside [a-z0-9-]; the byte loop must reject.
+        assert!(validate_skill_name("a\u{2013}b").is_err()); // en-dash
+        assert!(validate_skill_name("café").is_err());
+        assert!(validate_skill_name("\u{FF11}\u{FF12}").is_err()); // ＦＦ digits
     }
 
     #[test]

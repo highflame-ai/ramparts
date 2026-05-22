@@ -685,9 +685,18 @@ async fn handle_skills_scan_command(
     let mut prompt_paths: Vec<std::path::PathBuf> = Vec::with_capacity(skill_paths.len());
     let mut parser_findings: Vec<types::YaraScanResult> = Vec::new();
     let mut bundle_resources: Vec<types::MCPResource> = Vec::new();
+    // Resolved bundle names (skill names from a `SKILL.md` parse). Used
+    // below to scope the post-scan target_type rewrite — we only flip
+    // resource-typed findings to prompt-typed when the finding's
+    // target_name corresponds to one of *our* synthesized bundle
+    // resources. Otherwise a future change that surfaces non-bundle
+    // resource findings here would get silently retyped.
+    let mut bundle_prompt_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for p in &skill_paths {
         if skills::is_agentskills_bundle(p) {
             if let Some((parsed, resources)) = skills::parse_agentskills_bundle(p) {
+                bundle_prompt_names.insert(parsed.prompt.name.clone());
                 prompts.push(parsed.prompt);
                 prompt_paths.push(p.clone());
                 parser_findings.extend(parsed.heuristic_findings);
@@ -763,16 +772,28 @@ async fn handle_skills_scan_command(
                 let mut chain = scanner::ScannerChain::new();
                 chain.add(Box::new(yara));
                 chain.run_pre_scan(&mut scan_data);
-                // Rewrite any resource-typed finding to look like a
-                // prompt-typed finding. The terminal renderer
+                // Rewrite resource-typed findings whose target_name is
+                // a synthetic bundle resource (`<bundle_name>/...`) to
+                // prompt-typed. The terminal renderer
                 // (`print_skill_table_result`) filters yara_results to
                 // `target_type == "prompt"`, so without this rewrite
                 // bundled-script findings would be invisible in the
-                // default output. `target_name` is already of the form
-                // `<skill>/scripts/<file>` from `walk_bundle_subdir`,
-                // so it reads naturally under the per-skill block.
+                // default output. The match is scoped to the bundle
+                // names we resolved during parsing — non-bundle
+                // resource findings (a future caller might surface
+                // them through the same scratch) stay resource-typed
+                // and aren't silently absorbed.
                 for finding in scan_data.yara_results.iter_mut() {
-                    if finding.target_type == "resource" {
+                    if finding.target_type != "resource" {
+                        continue;
+                    }
+                    let from_bundle = bundle_prompt_names.iter().any(|name| {
+                        finding
+                            .target_name
+                            .strip_prefix(name.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                    });
+                    if from_bundle {
                         finding.target_type = "prompt".to_string();
                     }
                 }
