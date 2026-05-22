@@ -121,21 +121,31 @@ pub(crate) fn bundle_root_of(path: &Path) -> Option<&Path> {
     Some(parent)
 }
 
-/// Returns true when `path` lives inside one of the recognized bundle
-/// sibling directories (`scripts/`, `references/`, `assets/`) of any
-/// known bundle root. The bundle parser pulls those files in via
-/// synthetic resources, so the top-level walker should drop them to
-/// avoid double-scan.
+/// Returns true when `path` is a direct child of one of the recognized
+/// bundle sibling directories (`<bundle>/scripts/<file>`,
+/// `<bundle>/references/<file>`, `<bundle>/assets/<file>`). The bundle
+/// parser is **shallow** — `walk_bundle_subdir` only reads files one
+/// level under each sibling dir — so this filter must also be shallow.
+/// A deeper match (`<bundle>/references/sub/deep.md`) would otherwise
+/// be dropped from the top-level walk AND missed by the bundle
+/// parser, silently disappearing from any scan. The shallow shape
+/// matches: this returns false for nested paths, which then flow
+/// through the normal flat-skill parser.
+///
+/// Done without `PathBuf` allocations: `parent.file_name()` and
+/// `parent.parent()` are zero-alloc views.
 pub(crate) fn is_under_bundle_sibling_dir(path: &Path, bundle_roots: &HashSet<PathBuf>) -> bool {
-    const SIBLING_DIRS: &[&str] = &["scripts", "references", "assets"];
-    for root in bundle_roots {
-        for sibling in SIBLING_DIRS {
-            if path.starts_with(root.join(sibling)) {
-                return true;
-            }
-        }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let sibling_dir_name = parent.file_name().and_then(|n| n.to_str());
+    let is_sibling = matches!(sibling_dir_name, Some("scripts" | "references" | "assets"));
+    if !is_sibling {
+        return false;
     }
-    false
+    parent
+        .parent()
+        .is_some_and(|grandparent| bundle_roots.contains(grandparent))
 }
 
 /// Extensions ramparts treats as bundled-script content for YARA scanning.
@@ -632,7 +642,13 @@ fn parse_agentskills_bundle_content(
         _ => ("unnamed".to_string(), false),
     };
 
-    if fm_name.is_none() && (parent_dir_name.as_deref().is_none_or(str::is_empty)) {
+    // `is_some_and` (stable 1.70) sidesteps two problems at once:
+    // `is_none_or` is 1.82+ (would break the README's 1.70 MSRV) and
+    // `map_or(true, str::is_empty)` trips `clippy::unnecessary_map_or`
+    // on toolchains that *do* have `is_none_or`. The inverted form
+    // works cleanly on both.
+    let parent_dir_usable = parent_dir_name.as_deref().is_some_and(|n| !n.is_empty());
+    if fm_name.is_none() && !parent_dir_usable {
         validation_findings.push(make_heuristic_finding(
             "AgentskillsMissingName",
             "medium",
@@ -838,8 +854,12 @@ fn walk_bundle_subdir(
         let content = match std::fs::read_to_string(&entry_path) {
             Ok(s) => s,
             Err(e) => {
+                // `read_to_string` errors cover both invalid UTF-8
+                // (`ErrorKind::InvalidData`) and ordinary I/O failures
+                // — permission denied, file removed mid-scan, etc.
+                // Don't conflate the two in the log.
                 debug!(
-                    "Skipping bundle file {}: not valid UTF-8 ({e})",
+                    "Skipping bundle file {}: failed to read as UTF-8 ({e})",
                     entry_path.display()
                 );
                 continue;
@@ -1814,16 +1834,47 @@ pub fn default_discovery_roots() -> Vec<PathBuf> {
 }
 
 /// Probe gate for `./skills/` discovery. Returns true when `dir` has at
-/// least one direct child directory containing a `SKILL.md` file.
-/// Cheap: enumerates one level of children and probes each for the
-/// expected filename. Falls back to false on any read error.
+/// least one direct child directory containing a `SKILL.md` file
+/// (exact filename — same byte-equal contract as `is_agentskills_bundle`).
+///
+/// We avoid `path.join("SKILL.md").is_file()` because `Path::is_file()`
+/// goes through `fs::metadata`, which traverses symlinks and is
+/// case-insensitive on macOS APFS / Windows — both of which would
+/// allow `Skill.md` (or worse, a symlink to `/etc/passwd`) to flip
+/// this gate true and cause `./skills/` to be walked unexpectedly.
+/// Instead we enumerate each candidate directory's contents and
+/// match `file_name == "SKILL.md"` byte-equal, skipping symlinks.
 fn is_agentskills_root_dir(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.join("SKILL.md").is_file() {
+        // Only descend into directory entries; skip symlinks at this
+        // level so a symlinked dir can't trip the probe.
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        if bundle_dir_has_skill_md(&entry.path()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true when `dir` has a direct child entry whose filename is
+/// exactly `SKILL.md` (case-sensitive byte-equal) and is a regular
+/// non-symlink file. Helper for `is_agentskills_root_dir`.
+fn bundle_dir_has_skill_md(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() != OsStr::new("SKILL.md") {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_symlink() && ft.is_file() {
             return true;
         }
     }
@@ -3107,6 +3158,26 @@ mod tests {
         // A different directory entirely.
         assert!(!is_under_bundle_sibling_dir(
             &PathBuf::from("/tmp/other-skill/SKILL.md"),
+            &roots
+        ));
+    }
+
+    #[test]
+    fn is_under_bundle_sibling_dir_is_shallow() {
+        // The bundle parser only reads files one level under each
+        // sibling dir. Files nested deeper (`<bundle>/references/sub/deep.md`)
+        // must NOT be filtered out by this check — otherwise they'd be
+        // silently dropped from both the bundle parser (shallow) and
+        // the top-level flat-skill walker (filtered).
+        let bundle_root = PathBuf::from("/tmp/my-skill");
+        let mut roots: HashSet<PathBuf> = HashSet::new();
+        roots.insert(bundle_root.clone());
+        assert!(!is_under_bundle_sibling_dir(
+            &bundle_root.join("references/sub/deep.md"),
+            &roots
+        ));
+        assert!(!is_under_bundle_sibling_dir(
+            &bundle_root.join("scripts/nested/dir/x.py"),
             &roots
         ));
     }
