@@ -184,10 +184,20 @@ jobs:
           sha256sum * > ${{ matrix.target }}-${{ matrix.arch }}_checksums.txt
         shell: bash
 
+      - name: Create APP token
+        uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            - ${{ github.repository }}
+
       - name: Upload release assets
         uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
         with:
           upload_url: ${{ github.event.release.upload_url }}
           asset_path: ./release/${{ steps.set_env.outputs.crate_release }}
@@ -197,7 +207,7 @@ jobs:
       - name: Upload checksums
         uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
         with:
           upload_url: ${{ github.event.release.upload_url }}
           asset_path: ./release/${{ matrix.target }}-${{ matrix.arch }}_checksums.txt
@@ -293,9 +303,20 @@ jobs:
       - name: Install GitHub CLI
         run: sudo apt install gh -y
 
+      - name: Create APP token
+        uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            - ${{ github.repository }}
+            - ${{ env.DEVOPS_REPO }}
+
       - name: Trigger private repo workflow
         env:
-          GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           gh workflow run ${{ env.RELEASE_WORKFLOW }} \
             --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \

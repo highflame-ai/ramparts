@@ -43,9 +43,20 @@ jobs:
       - name: Install GitHub CLI
         run: sudo apt install gh -y
 
+      - name: Create APP token
+        uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            - ${{ github.repository }}
+            - ${{ env.DEVOPS_REPO }}
+
       - name: Trigger private repo workflow
         env:
-          GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           gh workflow run ${{ env.CICD_WORKFLOW }} \
             --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \
