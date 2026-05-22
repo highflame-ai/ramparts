@@ -18,17 +18,26 @@ docs/proxy/*TEST*_RESULTS*.md
 **/*.rs.bk
 *.pdb
 
-# Cargo. `Cargo.lock` is INTENTIONALLY committed: ramparts ships as a
-# binary crate (and a workspace with a binary at root + path-only
-# `ramparts-common`), and applications/binaries should commit the lock
-# file for reproducible builds + accurate dependency advisories. Only
-# library-only crates should gitignore `Cargo.lock`.
+# Cargo. The root `Cargo.lock` is INTENTIONALLY committed: ramparts
+# ships as a binary crate (and a workspace with a binary at root +
+# path-only `ramparts-common`), and applications/binaries should
+# commit the lock file for reproducible builds + accurate dependency
+# advisories. Only library-only crates should gitignore `Cargo.lock`.
 #
-# Listing both `Cargo.lock` here AND committing it causes release-plz
-# to abort with "Cargo.lock is present in your .gitignore and is also
-# committed" — so we drop the .gitignore entry to be consistent with
-# what's actually in the repo. (.cargo/ stays gitignored because it's
-# the per-user config directory, not the workspace lockfile.)
+# We use a paired `Cargo.lock` + `!/Cargo.lock` pattern so that:
+# - the ROOT lockfile is un-ignored and tracked (release-plz needs
+#   this; it aborts when the lockfile is both .gitignored and
+#   committed)
+# - any per-workspace-member lockfile (e.g. `common/Cargo.lock`)
+#   that gets created by running `cargo` directly inside the member
+#   directory stays gitignored — workspace members don't need their
+#   own lockfiles and committing stale ones causes drift.
+Cargo.lock
+!/Cargo.lock
+
+# Project-local Cargo config overrides (e.g. `.cargo/config.toml`).
+# Kept out of the repo so contributors can use local-only registry
+# / target / build flags without polluting the canonical config.
 .cargo
 
 # IDE files
