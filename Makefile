@@ -24,10 +24,17 @@ RUSTUP := rustup
 # Clippy strict-gate flags. Promote dead_code + unused_* warnings to
 # errors so PRs can't leave orphaned functions, fields, imports, or
 # unneeded `mut` keywords behind. Mirrors the gate enforced in
-# highflame-firehog's pr-check.yml so the bar is consistent across
-# the Highflame Rust services. `--all-targets` covers tests + benches
-# (without it, test code is silently unlinted).
-CLIPPY_STRICT_FLAGS := -D warnings -D dead_code -D unused_imports -D unused_variables -D unused_mut
+# highflame-firehog's pr-check.yml; `--all-targets` covers tests +
+# benches (without it, test code is silently unlinted).
+#
+# `-D unused` is the lint group that includes dead_code,
+# unused_imports, unused_variables, unused_mut, unused_must_use,
+# unused_assignments, unused_macros, and friends. `-D warnings`
+# alone would also catch these (they're warn-by-default), but
+# keeping `-D unused` explicit documents the intent so a future
+# reader doesn't accidentally `#[allow(dead_code)]`-pepper the
+# codebase under the impression it's a soft hint.
+CLIPPY_STRICT_FLAGS := -D warnings -D unused
 
 # ============================================================================
 # ARCHITECTURE DETECTION
