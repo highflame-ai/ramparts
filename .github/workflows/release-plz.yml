@@ -67,11 +67,17 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
-          # `app-id` was deprecated in create-github-app-token v3
-          # in favor of `client-id`. The deprecation prints a warning
-          # in the job log every run; use the new name. Both fields
-          # accept the same `HIGHFLAME_GITHUB_APP_ID` secret value.
-          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          # `app-id` is the deprecated alias for `client-id` in
+          # `create-github-app-token@v3`. Kept here because the
+          # existing `HIGHFLAME_GITHUB_APP_ID` secret holds the
+          # numeric App ID, not the alphanumeric Client ID — those
+          # are different identifiers on GitHub Apps. Using
+          # `client-id:` with the numeric value would fail JWT auth
+          # at runtime. Eat the deprecation warning until the
+          # secret is split (add `HIGHFLAME_GITHUB_APP_CLIENT_ID`)
+          # and the cutover is intentional. Same pattern used in
+          # release.yml.
+          app-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
           private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
 
       - name: Install Rust toolchain

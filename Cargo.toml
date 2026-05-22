@@ -10,14 +10,15 @@ keywords = ["mcp", "scanner", "skills", "llm", "security"]
 categories = ["command-line-utilities", "development-tools::testing"]
 include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
 
-# Cargo-release configuration for semantic versioning
-[package.metadata.release]
-allow-branch = ["main", "master"]
-tag = true
-push = true
-tag-name = "v{version}"
-sign-commit = false
-sign-tag = false
+# NOTE: A previous `[package.metadata.release]` block configured
+# `cargo-release` here (with `tag-name = "v{version}"`). It's been
+# removed because ramparts now uses **release-plz** (see
+# `release-plz.toml` + `.github/workflows/release-plz.yml`) and the
+# `v`-prefixed tag convention from cargo-release conflicts with
+# release-plz's bare-semver tags (which `release.yml`'s regex
+# `^[0-9]+\.[0-9]+\.[0-9]+$` enforces). If anyone ran `cargo release`
+# locally with the old block in place, they'd cut `v0.9.0` tags that
+# release.yml would then reject as malformed.
 
 [features]
 default = ["yara-x-scanning"]

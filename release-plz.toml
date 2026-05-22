@@ -43,19 +43,23 @@ pr_name = "feat: release {{ version }}"
 # polishing the draft.
 [changelog]
 header = """# Changelog\n\n"""
+# Each bullet links to the commit via a literal
+# `https://github.com/<owner>/<repo>/commit/<sha>` URL — simpler
+# than defining a Tera macro for it. (An earlier draft of this
+# template used `{{ self::commit_link(commit=commit) }}` but the
+# `commit_link` macro was never defined — git-cliff has no such
+# built-in — so release-plz would have failed at render time the
+# first time a release PR tried to fire.)
 body = """
 ## What changed in {{ version }}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}\
-- {{ commit.message | split(pat="\n") | first | trim }} \
-  ([{{ commit.id | truncate(length=7, end="") }}]({{ self::commit_link(commit=commit) }}))
+- {{ commit.message | split(pat="\n") | first | trim }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/highflame-ai/ramparts/commit/{{ commit.id }}))
 {% endfor %}\
 {% endfor %}\n
 """
 trim = true
-# Tera macro for commit URLs — keeps the body template readable.
-postprocessors = []
 
 # Map Conventional Commits types -> sections in the release body.
 # Order matters: features first, then fixes, then everything else.
