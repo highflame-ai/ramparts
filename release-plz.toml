@@ -96,16 +96,22 @@ git_release_draft = true
 
 [[package]]
 name = "ramparts-common"
-# Path-only workspace member referenced as `{ path = "common" }`;
-# never published to crates.io. release-plz still bumps its
-# `Cargo.toml` version so the workspace stays consistent (root and
-# common always at the same version — verified by the
-# `Stamp release version into Cargo.toml files` step in release.yml).
-publish = false
+# Published to crates.io alongside `ramparts` so downstream
+# `cargo install ramparts` can resolve the dependency. The root
+# crate's `[dependencies] ramparts-common = { path = "common",
+# version = "..." }` declares the required version; `cargo
+# publish` strips the `path` and ships only the `version`
+# constraint, which then must be findable on crates.io. Without
+# this, the next `ramparts` publish fails with
+# "dependency `ramparts-common` does not specify a version" (when
+# `version` is missing) or "could not find `ramparts-common` in
+# registry `crates.io`" (when `version` is set but the crate
+# isn't published). release-plz handles dependency ordering and
+# publishes `ramparts-common` first, then `ramparts`.
+publish = true
 changelog_update = false
 
-# No GitHub release for this crate — only the `ramparts` package
-# gets one. Otherwise release-plz would create two parallel draft
-# releases per release PR and the maintainer would have to polish
-# both, which is just noise.
+# No GitHub release for the `common` package — the maintainer
+# polishes ONE release body (on the root crate) per cycle. Two
+# parallel drafts per release-plz PR would just be noise.
 git_release_enable = false

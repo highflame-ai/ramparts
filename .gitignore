@@ -11,7 +11,18 @@ mcp_test_requests.json
 run_mcp_test.py
 test_mcp_client.py
 test_mcp_ecosystem.py
-examples/
+# Ignore CONTENTS of examples/ but not the directory itself — `dir/*`
+# form (not `dir/`) so the un-ignore rules below can re-include
+# specific committed files. With `dir/`, git wouldn't even descend
+# into the directory and the negations would be silently ignored.
+examples/*
+# Allowlist the user-facing example files that ARE intentionally
+# committed. Without these un-ignore lines, release-plz aborts on
+# the "tracked AND gitignored" check (same constraint as the
+# `Cargo.lock` block below).
+!examples/config_example.json
+!examples/servers.txt
+!examples/stdio_example.md
 testing/
 docs/proxy/*TEST*_RESULTS*.md
 /dist/
@@ -38,7 +49,12 @@ Cargo.lock
 # Project-local Cargo config overrides (e.g. `.cargo/config.toml`).
 # Kept out of the repo so contributors can use local-only registry
 # / target / build flags without polluting the canonical config.
-.cargo
+# `.cargo/audit.toml` is allowlisted because it's the project-wide
+# `cargo audit` policy and intentionally committed. Use `.cargo/*`
+# (not `.cargo/`) so git descends into the directory and honors
+# the un-ignore.
+.cargo/*
+!.cargo/audit.toml
 
 # IDE files
 .vscode/
