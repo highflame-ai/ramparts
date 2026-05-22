@@ -245,6 +245,9 @@ Scan a single skill file or every `*.md` skill under a directory.
 Options:
       --format <FORMAT>     Output format [default: from config.yaml]
                             [possible values: text, table, json, raw, sarif]
+                            Mutually exclusive with --json / --sarif.
+      --json                Shortcut for --format json.
+      --sarif               Shortcut for --format sarif (GitHub Code Scanning).
       --report              Generate detailed markdown report
       --timeout <SECONDS>   Overall scan timeout
   -h, --help                Print help information
@@ -259,8 +262,12 @@ ramparts skills scan ./.claude/commands/deploy.md
 # common build dirs like .git, node_modules, target are skipped)
 ramparts skills scan ./.claude/commands
 
-# SARIF output for GitHub Code Scanning
+# SARIF output for GitHub Code Scanning (either form works)
 ramparts skills scan ./.claude/commands --format sarif > skills.sarif
+ramparts skills scan ./.claude/commands --sarif        > skills.sarif
+
+# JSON output, piped to jq for filtering
+ramparts skills scan ./.claude/commands --json | jq '.yara_results'
 ```
 
 ### `skills scan-config`
@@ -294,6 +301,10 @@ ramparts skills scan-config
 ```bash
 Options:
       --format <FORMAT>     Output format [default: from config.yaml]
+                            [possible values: text, table, json, raw, sarif]
+                            Mutually exclusive with --json / --sarif.
+      --json                Shortcut for --format json.
+      --sarif               Shortcut for --format sarif.
       --report              Generate detailed markdown report
       --timeout <SECONDS>   Overall scan timeout
 ```

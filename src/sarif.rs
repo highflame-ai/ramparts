@@ -119,7 +119,13 @@ fn uri_base_ids(url: &str) -> Value {
     } else {
         "MCP_SERVER"
     };
-    json!({ key: { "uri": url } })
+    // `(key)` (with parens) is `serde_json::json!`'s dynamic-key
+    // syntax. Without the parens it would emit the literal field
+    // name `"key"` and ignore the variable — caught on PR #114 by
+    // Copilot. The whole point of this function is to swap
+    // `SKILL_ROOT` vs `MCP_SERVER` per scan type, so the dynamic
+    // expansion is load-bearing.
+    json!({ (key): { "uri": url } })
 }
 
 fn build_rule_from_yara(yara: &YaraScanResult) -> Value {
