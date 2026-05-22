@@ -643,6 +643,30 @@ async fn handle_skills_scan_command(
         std::process::exit(1);
     }
 
+    // agentskills.io bundle filter (two-pass). Pass 1: identify
+    // bundle roots — every parent of a `SKILL.md` we discovered.
+    // Pass 2: drop any discovered path that lives under one of those
+    // bundles' `scripts/`/`references/`/`assets/` subdirectories,
+    // because the bundle parser pulls those siblings in as synthetic
+    // resources. Without this filter, a bundle's `references/api.md`
+    // would also be parsed as a standalone flat skill, leading to
+    // duplicate findings and a misleading skill name.
+    let bundle_roots: std::collections::HashSet<std::path::PathBuf> = skill_paths
+        .iter()
+        .filter_map(|p| skills::bundle_root_of(p).map(std::path::Path::to_path_buf))
+        .collect();
+    if !bundle_roots.is_empty() {
+        let before = skill_paths.len();
+        skill_paths.retain(|p| !skills::is_under_bundle_sibling_dir(p, &bundle_roots));
+        let dropped = before - skill_paths.len();
+        if dropped > 0 {
+            debug!(
+                "Dropped {dropped} agentskills.io bundle-sibling path(s) from top-level walk \
+                 (will be picked up by bundle parser)"
+            );
+        }
+    }
+
     debug!("Found {} skill file(s) to scan", skill_paths.len());
 
     // Each skill yields a prompt (for LLM/YARA analysis) plus zero or more
@@ -652,11 +676,33 @@ async fn handle_skills_scan_command(
     // analyzers, the per-skill heuristic findings are appended to
     // `result.yara_results`, and a final cross-skill pass detects
     // collisions across the whole set (skills declaring the same name).
+    //
+    // agentskills.io bundles also produce a list of synthetic
+    // `MCPResource` entries (one per bundled script/reference) that we
+    // funnel through the YARA pre-scan via a scratch `ScanData`. They
+    // never reach `result.resources` — see the rewrite step below.
     let mut prompts: Vec<types::MCPPrompt> = Vec::with_capacity(skill_paths.len());
     let mut prompt_paths: Vec<std::path::PathBuf> = Vec::with_capacity(skill_paths.len());
     let mut parser_findings: Vec<types::YaraScanResult> = Vec::new();
+    let mut bundle_resources: Vec<types::MCPResource> = Vec::new();
+    // Resolved bundle names (skill names from a `SKILL.md` parse). Used
+    // below to scope the post-scan target_type rewrite — we only flip
+    // resource-typed findings to prompt-typed when the finding's
+    // target_name corresponds to one of *our* synthesized bundle
+    // resources. Otherwise a future change that surfaces non-bundle
+    // resource findings here would get silently retyped.
+    let mut bundle_prompt_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for p in &skill_paths {
-        if let Some(parsed) = skills::parse_skill_file(p) {
+        if skills::is_agentskills_bundle(p) {
+            if let Some((parsed, resources)) = skills::parse_agentskills_bundle(p) {
+                bundle_prompt_names.insert(parsed.prompt.name.clone());
+                prompts.push(parsed.prompt);
+                prompt_paths.push(p.clone());
+                parser_findings.extend(parsed.heuristic_findings);
+                bundle_resources.extend(resources);
+            }
+        } else if let Some(parsed) = skills::parse_skill_file(p) {
             prompts.push(parsed.prompt);
             prompt_paths.push(p.clone());
             parser_findings.extend(parsed.heuristic_findings);
@@ -716,11 +762,41 @@ async fn handle_skills_scan_command(
         // we move them back out after the YARA pass so the LLM analyzer
         // and the final renderer see the same prompt set.
         scan_data.prompts = std::mem::take(&mut result.prompts);
+        // Synthetic resources for agentskills.io bundled scripts/refs.
+        // Local scratch only — never copied into `result.resources`
+        // (would bloat JSON output with kilobytes of raw script source
+        // and trigger the wrong "Resource Security" assessment line).
+        scan_data.resources = std::mem::take(&mut bundle_resources);
         match scanner::YaraScanner::new("rules", ScanPhase::PreScan) {
             Ok(yara) => {
                 let mut chain = scanner::ScannerChain::new();
                 chain.add(Box::new(yara));
                 chain.run_pre_scan(&mut scan_data);
+                // Rewrite resource-typed findings whose target_name is
+                // a synthetic bundle resource (`<bundle_name>/...`) to
+                // prompt-typed. The terminal renderer
+                // (`print_skill_table_result`) filters yara_results to
+                // `target_type == "prompt"`, so without this rewrite
+                // bundled-script findings would be invisible in the
+                // default output. The match is scoped to the bundle
+                // names we resolved during parsing — non-bundle
+                // resource findings (a future caller might surface
+                // them through the same scratch) stay resource-typed
+                // and aren't silently absorbed.
+                for finding in scan_data.yara_results.iter_mut() {
+                    if finding.target_type != "resource" {
+                        continue;
+                    }
+                    let from_bundle = bundle_prompt_names.iter().any(|name| {
+                        finding
+                            .target_name
+                            .strip_prefix(name.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                    });
+                    if from_bundle {
+                        finding.target_type = "prompt".to_string();
+                    }
+                }
                 result
                     .yara_results
                     .extend(std::mem::take(&mut scan_data.yara_results));
@@ -733,6 +809,7 @@ async fn handle_skills_scan_command(
             }
         }
         result.prompts = std::mem::take(&mut scan_data.prompts);
+        // Discard scan_data.resources — synthetic, intermediate only.
     }
 
     // Append heuristic findings produced during parsing (overbroad

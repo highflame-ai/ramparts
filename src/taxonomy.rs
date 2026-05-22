@@ -145,6 +145,16 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         "SkillNameCollision" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
         "SkillEmbeddedPayload" => vec![OwaspTag::new("MCP01"), OwaspTag::new("MCP10")],
 
+        // agentskills.io spec-validation findings — all map to MCP02
+        // (supply chain / hidden behavior). A bundle whose name doesn't
+        // match its directory, has an invalid name, or has unknown
+        // frontmatter fields is a candidate for deceptive shipping or
+        // unintended-behavior surprise.
+        "AgentskillsNameMismatch"
+        | "AgentskillsInvalidName"
+        | "AgentskillsMissingName"
+        | "AgentskillsUnknownFrontmatterField" => vec![OwaspTag::new("MCP02")],
+
         _ => Vec::new(),
     }
 }

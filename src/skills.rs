@@ -14,6 +14,13 @@
 //! - **Claude Code** custom slash commands: markdown files (with optional
 //!   YAML frontmatter) under `~/.claude/commands/` or `.claude/commands/`
 //!   in a workspace
+//! - **agentskills.io** bundles: a directory `<name>/SKILL.md` plus
+//!   optional sibling `scripts/`, `references/`, `assets/` subdirectories.
+//!   Detected by exact filename `SKILL.md` (case-sensitive). The bundle
+//!   parser falls back to the parent-directory name when `name:` is
+//!   omitted, validates the spec's name rules, and synthesizes
+//!   `MCPResource` entries for sibling scripts/references so they flow
+//!   through the existing YARA pre-scan.
 //! - Generic markdown skill files (in lenient mode — anything ending in
 //!   `.md` walked under `--root`)
 //!
@@ -22,9 +29,11 @@
 //! the name; body becomes the description). Anything that can't be read
 //! as UTF-8 is skipped with a warning rather than failing the scan.
 
-use crate::types::{MCPPrompt, MCPPromptArgument, YaraRuleMetadata, YaraScanResult};
+use crate::types::{MCPPrompt, MCPPromptArgument, MCPResource, YaraRuleMetadata, YaraScanResult};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Deserializer};
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
@@ -84,6 +93,115 @@ fn is_non_skill_filename(name: &str) -> bool {
         .any(|candidate| candidate == &normalized)
 }
 
+/// agentskills.io requires the entrypoint to be literally `SKILL.md`
+/// (case-sensitive). We use byte-equal comparison on the OsStr so this
+/// works on case-insensitive filesystems too — `read_dir` returns the
+/// on-disk casing, not the lookup casing, so `Skill.md` and `SKILL.md`
+/// remain distinguishable.
+pub(crate) fn is_agentskills_bundle(path: &Path) -> bool {
+    path.file_name() == Some(OsStr::new("SKILL.md"))
+}
+
+/// The parent directory of a `SKILL.md` is the bundle root. Returns
+/// `None` for non-bundle paths so callers can `.filter_map` over a
+/// discovered set without an extra branch. An empty parent (e.g.
+/// `PathBuf::from("SKILL.md").parent() == Some("")`) is also treated
+/// as no root — without this filter the bundle-roots set would
+/// contain `""`, which `Path::starts_with` then matches against every
+/// relative discovered path, falsely classifying unrelated `.md`
+/// files as bundle siblings.
+pub(crate) fn bundle_root_of(path: &Path) -> Option<&Path> {
+    if !is_agentskills_bundle(path) {
+        return None;
+    }
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    Some(parent)
+}
+
+/// Returns true when `path` is a direct child of one of the recognized
+/// bundle sibling directories (`<bundle>/scripts/<file>`,
+/// `<bundle>/references/<file>`, `<bundle>/assets/<file>`). The bundle
+/// parser is **shallow** — `walk_bundle_subdir` only reads files one
+/// level under each sibling dir — so this filter must also be shallow.
+/// A deeper match (`<bundle>/references/sub/deep.md`) would otherwise
+/// be dropped from the top-level walk AND missed by the bundle
+/// parser, silently disappearing from any scan. The shallow shape
+/// matches: this returns false for nested paths, which then flow
+/// through the normal flat-skill parser.
+///
+/// Done without `PathBuf` allocations: `parent.file_name()` and
+/// `parent.parent()` are zero-alloc views.
+pub(crate) fn is_under_bundle_sibling_dir(path: &Path, bundle_roots: &HashSet<PathBuf>) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let sibling_dir_name = parent.file_name().and_then(|n| n.to_str());
+    let is_sibling = matches!(sibling_dir_name, Some("scripts" | "references" | "assets"));
+    if !is_sibling {
+        return false;
+    }
+    parent
+        .parent()
+        .is_some_and(|grandparent| bundle_roots.contains(grandparent))
+}
+
+/// Extensions ramparts treats as bundled-script content for YARA scanning.
+/// Kept tight on purpose — exotic languages (Lua, Tcl, etc.) can be added
+/// when we see them in real skill bundles. The list is matched
+/// case-insensitively.
+const SCRIPT_EXTS: &[&str] = &[
+    "py", "sh", "bash", "zsh", "js", "mjs", "cjs", "ts", "rb", "pl", "ps1",
+];
+
+/// Validates a name against the agentskills.io spec: 1–64 chars,
+/// lowercase ASCII `[a-z0-9-]`, no leading/trailing hyphen, no
+/// consecutive hyphens. Returns the spec violation as a short reason
+/// string on failure; otherwise `Ok(())`. Hand-rolled (no regex
+/// dependency) so the failure mode is specific enough to surface in the
+/// finding description.
+fn validate_skill_name(name: &str) -> std::result::Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("name is empty");
+    }
+    if name.len() > 64 {
+        return Err("name exceeds 64 characters");
+    }
+    let bytes = name.as_bytes();
+    if bytes[0] == b'-' {
+        return Err("name starts with a hyphen");
+    }
+    if bytes[bytes.len() - 1] == b'-' {
+        return Err("name ends with a hyphen");
+    }
+    let mut last_was_hyphen = false;
+    for &b in bytes {
+        let ok = matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-');
+        if !ok {
+            return Err("name contains a character outside [a-z0-9-]");
+        }
+        if b == b'-' && last_was_hyphen {
+            return Err("name contains consecutive hyphens");
+        }
+        last_was_hyphen = b == b'-';
+    }
+    Ok(())
+}
+
+/// Frontmatter field names defined by the agentskills.io spec. Any key
+/// outside this set on a `SKILL.md` triggers an
+/// `AgentskillsUnknownFrontmatterField` finding.
+const AGENTSKILLS_ALLOWED_FIELDS: &[&str] = &[
+    "name",
+    "description",
+    "license",
+    "compatibility",
+    "metadata",
+    "allowed-tools",
+];
+
 /// Frontmatter fields ramparts cares about across skill formats. Unknown
 /// fields are ignored (serde defaults), so adding support for a new
 /// ecosystem usually means adding a field here rather than introducing a
@@ -132,6 +250,20 @@ struct SkillFrontmatter {
         deserialize_with = "deser_string_or_seq"
     )]
     allowed_tools: Option<String>,
+    /// agentskills.io spec field — parsed for validation only. Ramparts
+    /// does not interpret the license text; it's here so frontmatters
+    /// that declare a license don't trigger
+    /// `AgentskillsUnknownFrontmatterField`.
+    #[allow(dead_code)]
+    license: Option<String>,
+    /// agentskills.io spec field. See above.
+    #[allow(dead_code)]
+    compatibility: Option<String>,
+    /// agentskills.io spec field — arbitrary key/value mapping. We don't
+    /// surface any of it today; we just want to recognize the field name
+    /// so a real bundle doesn't trip the unknown-field check.
+    #[allow(dead_code)]
+    metadata: Option<serde_yaml::Value>,
 }
 
 /// Deserialize either `String` or `Vec<String>` into `Option<String>`,
@@ -243,19 +375,7 @@ pub fn parse_skill_file(path: &Path) -> Option<ParsedSkill> {
 /// frontmatter content and a body that's blank after trimming) so we
 /// don't waste an LLM batch slot on something with nothing to analyze.
 pub fn parse_skill_content(path: &Path, raw: &str) -> Option<ParsedSkill> {
-    let (frontmatter, body) = split_frontmatter(raw);
-    let parsed_fm: SkillFrontmatter = frontmatter
-        .and_then(|fm| match serde_yaml::from_str(fm) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                debug!(
-                    "Skill {} has unparseable frontmatter (treating as no frontmatter): {e}",
-                    path.display()
-                );
-                None
-            }
-        })
-        .unwrap_or_default();
+    let (parsed_fm, body) = split_and_parse_frontmatter(path, raw);
 
     let stem = path
         .file_stem()
@@ -273,6 +393,45 @@ pub fn parse_skill_content(path: &Path, raw: &str) -> Option<ParsedSkill> {
         .filter(|s| !s.is_empty())
         .map_or_else(|| stem.to_string(), str::to_string);
 
+    assemble_skill(path, body, &parsed_fm, name, Vec::new())
+}
+
+/// Splits the raw text into `(SkillFrontmatter, body)`. Permissive: a
+/// missing or unparseable frontmatter yields `SkillFrontmatter::default()`
+/// so the body is still scanned. Used by both `parse_skill_content`
+/// (flat-skill path) and `parse_agentskills_bundle_content` (bundle
+/// path).
+fn split_and_parse_frontmatter<'a>(path: &Path, raw: &'a str) -> (SkillFrontmatter, &'a str) {
+    let (frontmatter, body) = split_frontmatter(raw);
+    let parsed_fm: SkillFrontmatter = frontmatter
+        .and_then(|fm| match serde_yaml::from_str(fm) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                debug!(
+                    "Skill {} has unparseable frontmatter (treating as no frontmatter): {e}",
+                    path.display()
+                );
+                None
+            }
+        })
+        .unwrap_or_default();
+    (parsed_fm, body)
+}
+
+/// Assemble a `ParsedSkill` from already-resolved frontmatter and a
+/// resolved name. Runs the shared description/argument extraction and
+/// all the existing analyzers (`analyze_allowed_tools`,
+/// `analyze_vague_trigger`, etc.). The caller supplies any
+/// already-collected findings (e.g. bundle-validation findings) in
+/// `extra_findings` so they appear in the same `heuristic_findings` vec
+/// without a second pass.
+fn assemble_skill(
+    path: &Path,
+    body: &str,
+    parsed_fm: &SkillFrontmatter,
+    name: String,
+    extra_findings: Vec<YaraScanResult>,
+) -> Option<ParsedSkill> {
     // Try to lift real argument names out of an `argument-hint` string
     // like "<env>" or "<env> <region>". When that yields nothing usable
     // (free-form hint with no `<token>` pattern), append the raw hint to
@@ -347,7 +506,10 @@ pub fn parse_skill_content(path: &Path, raw: &str) -> Option<ParsedSkill> {
         raw_json: None,
     };
 
-    let mut heuristic_findings: Vec<YaraScanResult> = Vec::new();
+    // Append the existing analyzers onto whatever findings the caller
+    // already collected (e.g. bundle-validation findings). Order is
+    // arbitrary — downstream renderers don't depend on it.
+    let mut heuristic_findings: Vec<YaraScanResult> = extra_findings;
     if let Some(grant) = parsed_fm.allowed_tools.as_deref() {
         heuristic_findings.extend(analyze_allowed_tools(&prompt.name, path, grant));
     }
@@ -369,6 +531,357 @@ pub fn parse_skill_content(path: &Path, raw: &str) -> Option<ParsedSkill> {
         prompt,
         heuristic_findings,
     })
+}
+
+/// Parse an agentskills.io bundle: a `SKILL.md` file whose parent
+/// directory may also contain sibling `scripts/`, `references/`, and
+/// `assets/` subdirectories. Returns the assembled skill plus a vector
+/// of synthetic `MCPResource` entries for each scannable sibling file,
+/// which the caller funnels into the existing YARA pre-scan via
+/// `ScanData.resources`.
+///
+/// Differs from `parse_skill_file` in three ways:
+/// 1. The fallback for `name:` is the **parent directory name**, not
+///    the file stem (which is always "SKILL").
+/// 2. Emits spec-validation findings:
+///    `AgentskillsNameMismatch`/`AgentskillsInvalidName`/
+///    `AgentskillsMissingName`/`AgentskillsUnknownFrontmatterField`.
+/// 3. Walks sibling `scripts/` and `references/` to synthesize one
+///    `MCPResource` per scannable file. Bundled assets (`assets/`) are
+///    skipped — usually binary, low value-to-noise.
+pub(crate) fn parse_agentskills_bundle(
+    skill_md_path: &Path,
+) -> Option<(ParsedSkill, Vec<MCPResource>)> {
+    if let Ok(metadata) = std::fs::metadata(skill_md_path) {
+        if metadata.len() > MAX_SKILL_FILE_BYTES {
+            warn!(
+                "Skipping SKILL.md {} ({} bytes > {} byte limit)",
+                skill_md_path.display(),
+                metadata.len(),
+                MAX_SKILL_FILE_BYTES
+            );
+            return None;
+        }
+    }
+    let raw = match std::fs::read_to_string(skill_md_path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Skipping SKILL.md {}: {e}", skill_md_path.display());
+            return None;
+        }
+    };
+    parse_agentskills_bundle_content(skill_md_path, &raw)
+}
+
+/// Pure-data version of `parse_agentskills_bundle`. Exposed so unit
+/// tests can drive the bundle parser without touching the filesystem,
+/// passing the raw `SKILL.md` content directly. Sibling-file discovery
+/// still hits the filesystem because that's intrinsic to bundle shape;
+/// pass a `skill_md_path` whose parent directory exists or has no
+/// scannable siblings to get a clean test.
+fn parse_agentskills_bundle_content(
+    skill_md_path: &Path,
+    raw: &str,
+) -> Option<(ParsedSkill, Vec<MCPResource>)> {
+    let (parsed_fm, body) = split_and_parse_frontmatter(skill_md_path, raw);
+
+    // Parent-directory name is the agentskills.io fallback for `name:`
+    // and the ground truth for the name-mismatch deception check. Note
+    // we never trim() the directory name — a directory called
+    // `" my-skill"` (leading space) should fail `validate_skill_name`
+    // and be surfaced as such, not be silently coerced.
+    let parent_dir_name = skill_md_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(str::to_string);
+
+    // Frontmatter `name:` (if present and non-empty after trim).
+    let fm_name = parsed_fm
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let mut validation_findings: Vec<YaraScanResult> = Vec::new();
+
+    // Mismatch check: only fires when BOTH names are present. The
+    // mismatch is a security concern (an attacker can ship a bundle in
+    // a directory called `helpful-helper/` but with `name: ssh-key-stealer`
+    // — or vice versa). Deception, not pedantic spec compliance.
+    if let (Some(fm), Some(dir)) = (fm_name.as_deref(), parent_dir_name.as_deref()) {
+        if fm != dir {
+            validation_findings.push(make_heuristic_finding(
+                "AgentskillsNameMismatch",
+                "high",
+                format!(
+                    "SKILL.md declares `name: {fm}` but its parent directory is `{dir}/`. \
+                     agentskills.io requires the name to match the parent directory; the \
+                     mismatch may indicate a deceptively-named bundle. Choose one canonical \
+                     name and use it consistently."
+                ),
+                fm,
+                skill_md_path,
+            ));
+        }
+    }
+
+    // Resolve the name we'll use downstream. Precedence:
+    // 1. fm_name if present
+    // 2. parent_dir_name if present and non-empty
+    // 3. "unnamed" (we emit AgentskillsMissingName when we hit this)
+    //
+    // `from_parent_dir` tracks whether the resolved name came from the
+    // directory fallback. Used below to decide between
+    // AgentskillsInvalidName (keyed to the directory) and
+    // AgentskillsMissingName (truly nameless).
+    let (resolved_name, from_parent_dir) = match (fm_name.as_deref(), parent_dir_name.as_deref()) {
+        (Some(fm), _) => (fm.to_string(), false),
+        (None, Some(dir)) if !dir.is_empty() => (dir.to_string(), true),
+        _ => ("unnamed".to_string(), false),
+    };
+
+    // `is_some_and` (stable 1.70) sidesteps two problems at once:
+    // `is_none_or` is 1.82+ (would break the README's 1.70 MSRV) and
+    // `map_or(true, str::is_empty)` trips `clippy::unnecessary_map_or`
+    // on toolchains that *do* have `is_none_or`. The inverted form
+    // works cleanly on both.
+    let parent_dir_usable = parent_dir_name.as_deref().is_some_and(|n| !n.is_empty());
+    if fm_name.is_none() && !parent_dir_usable {
+        validation_findings.push(make_heuristic_finding(
+            "AgentskillsMissingName",
+            "medium",
+            "SKILL.md has no `name:` field and the parent directory has no usable \
+             name. agentskills.io requires both to be present and to match."
+                .to_string(),
+            &resolved_name,
+            skill_md_path,
+        ));
+    } else if let Err(reason) = validate_skill_name(&resolved_name) {
+        // When the offending name came from the parent directory (no
+        // explicit `name:`), the actionable fix is on the directory —
+        // make that clear in the finding text. Otherwise the fix is on
+        // the frontmatter `name:` value.
+        let where_ = if from_parent_dir {
+            format!("parent directory `{resolved_name}/`")
+        } else {
+            format!("frontmatter `name: {resolved_name}`")
+        };
+        validation_findings.push(make_heuristic_finding(
+            "AgentskillsInvalidName",
+            "medium",
+            format!(
+                "{where_} fails agentskills.io name rules: {reason}. Spec requires \
+                 1–64 chars from [a-z0-9-] with no leading/trailing or consecutive hyphens."
+            ),
+            &resolved_name,
+            skill_md_path,
+        ));
+    }
+
+    // Unknown-field detection: parse the raw frontmatter back as a
+    // generic YAML mapping and diff its key set against the spec's six
+    // allowed fields. Single rolled-up finding per bundle (rather than
+    // one per key) keeps the report low-noise. Skipped silently when
+    // there's no frontmatter or it's a non-mapping (e.g. a stray scalar
+    // or sequence — already debug-logged by split_and_parse_frontmatter).
+    let unknown_keys = detect_unknown_frontmatter_fields(raw);
+    if !unknown_keys.is_empty() {
+        let joined = unknown_keys.join(", ");
+        validation_findings.push(make_heuristic_finding(
+            "AgentskillsUnknownFrontmatterField",
+            "low",
+            format!(
+                "SKILL.md frontmatter contains key(s) not defined by agentskills.io: \
+                 {joined}. Spec allows only: name, description, license, compatibility, \
+                 metadata, allowed-tools."
+            ),
+            &resolved_name,
+            skill_md_path,
+        ));
+    }
+
+    let parsed = assemble_skill(
+        skill_md_path,
+        body,
+        &parsed_fm,
+        resolved_name.clone(),
+        validation_findings,
+    )?;
+
+    // Synthetic resources for sibling-bundled scripts and references.
+    // `assets/` is intentionally skipped (typically binary content;
+    // YARA produces noise on raw image bytes and we don't want to bloat
+    // the scratch buffer).
+    let mut resources = Vec::new();
+    if let Some(bundle_root) = skill_md_path.parent() {
+        collect_bundle_siblings(bundle_root, &resolved_name, &mut resources);
+    }
+
+    Some((parsed, resources))
+}
+
+/// Returns the list of frontmatter keys that aren't in the
+/// agentskills.io spec's six-field set. Used by
+/// `parse_agentskills_bundle_content` for the
+/// `AgentskillsUnknownFrontmatterField` finding. Returns an empty Vec
+/// when there's no frontmatter or it isn't a mapping.
+fn detect_unknown_frontmatter_fields(raw: &str) -> Vec<String> {
+    let (Some(fm), _) = split_frontmatter(raw) else {
+        return Vec::new();
+    };
+    let parsed: serde_yaml::Value = match serde_yaml::from_str(fm) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(mapping) = parsed.as_mapping() else {
+        return Vec::new();
+    };
+    let allowed: HashSet<&str> = AGENTSKILLS_ALLOWED_FIELDS.iter().copied().collect();
+    let mut unknown: Vec<String> = mapping
+        .iter()
+        .filter_map(|(k, _)| k.as_str().map(str::to_string))
+        .filter(|k| !allowed.contains(k.as_str()))
+        .collect();
+    unknown.sort();
+    unknown
+}
+
+/// Walk the immediate `scripts/` and `references/` children of
+/// `bundle_root` and synthesize one `MCPResource` per scannable file.
+/// One-level deep on purpose: bundle siblings live directly under the
+/// bundle root by spec, and we don't want to spend the rest of the
+/// 16-level depth budget on bundled `node_modules`. Files larger than
+/// `MAX_SKILL_FILE_BYTES` are skipped with a warn log.
+fn collect_bundle_siblings(bundle_root: &Path, skill_name: &str, out: &mut Vec<MCPResource>) {
+    walk_bundle_subdir(
+        bundle_root,
+        "scripts",
+        skill_name,
+        |name| {
+            // Script files are gated on extension to keep noise low.
+            // Anything inside `scripts/` named `README.md` etc. is
+            // skipped via the existing non-skill-filename heuristic so
+            // a bundle author's "how the script works" note doesn't
+            // get scanned twice.
+            let ext = std::path::Path::new(name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            SCRIPT_EXTS
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+                && !is_non_skill_filename(name)
+        },
+        out,
+    );
+    walk_bundle_subdir(
+        bundle_root,
+        "references",
+        skill_name,
+        |name| {
+            let ext = std::path::Path::new(name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            ext.eq_ignore_ascii_case("md") && !is_non_skill_filename(name)
+        },
+        out,
+    );
+}
+
+/// Per-subdirectory cap on the number of scannable siblings a bundle
+/// can contribute. A malicious bundle with 100k tiny `scripts/*.py`
+/// files would otherwise produce 100k synthetic `MCPResource`s, each
+/// loaded into memory and pushed through the YARA pipeline. 256 is
+/// well above what any honest bundle ships and bounds worst-case
+/// memory at `MAX_BUNDLE_FILES_PER_DIR * MAX_SKILL_FILE_BYTES` per
+/// subdirectory.
+const MAX_BUNDLE_FILES_PER_DIR: usize = 256;
+
+/// Walk one bundle sibling directory (`scripts/` or `references/`) and
+/// push a synthetic `MCPResource` for every file `accept` returns true
+/// for. The accept callback receives the file's basename; the walker
+/// itself enforces non-symlink + non-directory.
+fn walk_bundle_subdir(
+    bundle_root: &Path,
+    subdir_name: &str,
+    skill_name: &str,
+    accept: impl Fn(&str) -> bool,
+    out: &mut Vec<MCPResource>,
+) {
+    let dir = bundle_root.join(subdir_name);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        // Missing or unreadable subdirectory is silent — most bundles
+        // ship only some of the three optional siblings.
+        return;
+    };
+    let starting_len = out.len();
+    for entry in entries.flatten() {
+        if out.len() - starting_len >= MAX_BUNDLE_FILES_PER_DIR {
+            warn!(
+                "Bundle {}/{subdir_name}: reached {} file cap; remaining entries skipped",
+                bundle_root.display(),
+                MAX_BUNDLE_FILES_PER_DIR
+            );
+            break;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() || !file_type.is_file() {
+            continue;
+        }
+        let entry_path = entry.path();
+        let Some(file_name) = entry_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !accept(file_name) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&entry_path) {
+            if meta.len() > MAX_SKILL_FILE_BYTES {
+                warn!(
+                    "Skipping bundle file {} ({} bytes > {} byte limit)",
+                    entry_path.display(),
+                    meta.len(),
+                    MAX_SKILL_FILE_BYTES
+                );
+                continue;
+            }
+        }
+        let content = match std::fs::read_to_string(&entry_path) {
+            Ok(s) => s,
+            Err(e) => {
+                // `read_to_string` errors cover both invalid UTF-8
+                // (`ErrorKind::InvalidData`) and ordinary I/O failures
+                // — permission denied, file removed mid-scan, etc.
+                // Don't conflate the two in the log.
+                debug!(
+                    "Skipping bundle file {}: failed to read as UTF-8 ({e})",
+                    entry_path.display()
+                );
+                continue;
+            }
+        };
+        // `skill://` URI (not `file://`) so the synthetic resource's
+        // URI doesn't contain absolute filesystem paths that would
+        // false-positive on path-traversal / sensitive-location YARA
+        // rules. The bundle/file pair is enough provenance for the
+        // post-scan rewrite step in main.rs.
+        let resource_name = format!("{skill_name}/{subdir_name}/{file_name}");
+        let resource_uri = format!("skill://{skill_name}/{subdir_name}/{file_name}");
+        out.push(MCPResource {
+            uri: resource_uri,
+            name: resource_name,
+            description: Some(content),
+            mime_type: None,
+            size: None,
+            metadata: std::collections::HashMap::new(),
+            raw_json: None,
+        });
+    }
 }
 
 /// Tools that, when granted without a restriction, give the agent
@@ -477,11 +990,7 @@ fn split_grant_tokens(grant: &str) -> Vec<&str> {
     for (i, c) in grant.char_indices() {
         match c {
             '(' => depth += 1,
-            ')' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
-            }
+            ')' if depth > 0 => depth -= 1,
             ',' | '\n' if depth == 0 => {
                 tokens.push(&grant[start..i]);
                 start = i + c.len_utf8();
@@ -1307,7 +1816,69 @@ pub fn default_discovery_roots() -> Vec<PathBuf> {
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     push_for_base(&mut roots, &cwd);
+
+    // agentskills.io tool-agnostic conventions. `~/.skills/` is always
+    // pushed (it usually doesn't exist; discover_skills_in_root will
+    // return an empty vec). `./skills/` is probe-gated — many random
+    // repos have a top-level `skills/` directory unrelated to agent
+    // skills, so we only walk it when it directly contains at least
+    // one `<name>/SKILL.md` bundle.
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".skills"));
+    }
+    let cwd_skills = cwd.join("skills");
+    if is_agentskills_root_dir(&cwd_skills) {
+        roots.push(cwd_skills);
+    }
     roots
+}
+
+/// Probe gate for `./skills/` discovery. Returns true when `dir` has at
+/// least one direct child directory containing a `SKILL.md` file
+/// (exact filename — same byte-equal contract as `is_agentskills_bundle`).
+///
+/// We avoid `path.join("SKILL.md").is_file()` because `Path::is_file()`
+/// goes through `fs::metadata`, which traverses symlinks and is
+/// case-insensitive on macOS APFS / Windows — both of which would
+/// allow `Skill.md` (or worse, a symlink to `/etc/passwd`) to flip
+/// this gate true and cause `./skills/` to be walked unexpectedly.
+/// Instead we enumerate each candidate directory's contents and
+/// match `file_name == "SKILL.md"` byte-equal, skipping symlinks.
+fn is_agentskills_root_dir(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        // Only descend into directory entries; skip symlinks at this
+        // level so a symlinked dir can't trip the probe.
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        if bundle_dir_has_skill_md(&entry.path()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true when `dir` has a direct child entry whose filename is
+/// exactly `SKILL.md` (case-sensitive byte-equal) and is a regular
+/// non-symlink file. Helper for `is_agentskills_root_dir`.
+fn bundle_dir_has_skill_md(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() != OsStr::new("SKILL.md") {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_symlink() && ft.is_file() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Expand a leading `~` or `~/` to the user's home directory. Other
@@ -2145,5 +2716,474 @@ mod tests {
         let found = discover_skills_in_root(tmp.path()).unwrap();
         assert_eq!(found.len(), 1);
         assert!(found[0].ends_with("real.md"));
+    }
+
+    // ============================================================
+    // agentskills.io bundle support
+    // ============================================================
+
+    /// Build a SKILL.md file inside `tmp_dir/<bundle_name>/SKILL.md`
+    /// with the given raw contents. Returns the path to the SKILL.md.
+    /// Helper so each test reads top-down without 4 lines of fs glue.
+    fn make_bundle(tmp: &std::path::Path, bundle_name: &str, raw: &str) -> PathBuf {
+        let dir = tmp.join(bundle_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("SKILL.md");
+        std::fs::write(&p, raw).unwrap();
+        p
+    }
+
+    /// Returns the set of finding rule names emitted for a bundle.
+    fn finding_names(parsed: &ParsedSkill) -> Vec<String> {
+        parsed
+            .heuristic_findings
+            .iter()
+            .map(|f| f.rule_name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn validate_skill_name_accepts_spec_compliant() {
+        assert!(validate_skill_name("pdf-processing").is_ok());
+        assert!(validate_skill_name("data-analysis").is_ok());
+        assert!(validate_skill_name("a").is_ok()); // min length 1
+        assert!(validate_skill_name(&"a".repeat(64)).is_ok()); // max length 64
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_spec_violations() {
+        assert!(validate_skill_name("").is_err());
+        assert!(validate_skill_name(&"a".repeat(65)).is_err());
+        assert!(validate_skill_name("PDF-Processing").is_err()); // uppercase
+        assert!(validate_skill_name("name_with_underscore").is_err());
+        assert!(validate_skill_name("-leading-hyphen").is_err());
+        assert!(validate_skill_name("trailing-hyphen-").is_err());
+        assert!(validate_skill_name("double--hyphen").is_err());
+        assert!(validate_skill_name("has space").is_err());
+        assert!(validate_skill_name("dot.path").is_err());
+    }
+
+    #[test]
+    fn is_agentskills_bundle_byte_equal() {
+        // Only exact "SKILL.md" matches — not "Skill.md", "skill.md",
+        // "SKILL.MD", etc. This is the spec contract.
+        assert!(is_agentskills_bundle(&PathBuf::from("foo/SKILL.md")));
+        assert!(!is_agentskills_bundle(&PathBuf::from("foo/Skill.md")));
+        assert!(!is_agentskills_bundle(&PathBuf::from("foo/skill.md")));
+        assert!(!is_agentskills_bundle(&PathBuf::from("foo/SKILL.MD")));
+        assert!(!is_agentskills_bundle(&PathBuf::from("foo/skill.MD")));
+        assert!(!is_agentskills_bundle(&PathBuf::from("foo/SKILL.md.bak")));
+    }
+
+    #[test]
+    fn agentskills_name_must_match_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = make_bundle(
+            tmp.path(),
+            "my-skill",
+            "---\nname: evil-skill\ndescription: not what the dir says\n---\nbody\n",
+        );
+        let (parsed, _resources) = parse_agentskills_bundle(&p).expect("parsed");
+        let names = finding_names(&parsed);
+        assert!(
+            names.contains(&"AgentskillsNameMismatch".to_string()),
+            "expected AgentskillsNameMismatch, got {names:?}"
+        );
+        // Must NOT trigger SkillNameCollision — only one skill in the
+        // set, and the mismatch check is the proper rule here.
+        assert!(!names.contains(&"SkillNameCollision".to_string()));
+    }
+
+    #[test]
+    fn agentskills_invalid_name_charset_underscore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = make_bundle(
+            tmp.path(),
+            "my-skill",
+            "---\nname: bad_skill\ndescription: x\n---\nbody\n",
+        );
+        let (parsed, _) = parse_agentskills_bundle(&p).expect("parsed");
+        let names = finding_names(&parsed);
+        // Name mismatch fires AND invalid-name fires (the two are
+        // independent checks).
+        assert!(names.contains(&"AgentskillsInvalidName".to_string()));
+        let invalid = parsed
+            .heuristic_findings
+            .iter()
+            .find(|f| f.rule_name == "AgentskillsInvalidName")
+            .unwrap();
+        let desc = invalid
+            .rule_metadata
+            .as_ref()
+            .and_then(|m| m.description.clone())
+            .unwrap_or_default();
+        assert!(
+            desc.contains("[a-z0-9-]"),
+            "expected spec-violation reason in description, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn agentskills_double_hyphen_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Parent dir is fine — but name has double hyphen.
+        let p = make_bundle(
+            tmp.path(),
+            "my-skill",
+            "---\nname: my--skill\ndescription: x\n---\nbody\n",
+        );
+        let (parsed, _) = parse_agentskills_bundle(&p).expect("parsed");
+        let names = finding_names(&parsed);
+        assert!(names.contains(&"AgentskillsInvalidName".to_string()));
+    }
+
+    #[test]
+    fn agentskills_leading_hyphen_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = make_bundle(
+            tmp.path(),
+            "my-skill",
+            "---\nname: -leading\ndescription: x\n---\nbody\n",
+        );
+        let (parsed, _) = parse_agentskills_bundle(&p).expect("parsed");
+        assert!(finding_names(&parsed).contains(&"AgentskillsInvalidName".to_string()));
+    }
+
+    #[test]
+    fn agentskills_64_char_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let name_64 = "a".repeat(64);
+        let p = make_bundle(
+            tmp.path(),
+            &name_64,
+            &format!("---\nname: {name_64}\ndescription: x\n---\nbody\n"),
+        );
+        let (parsed, _) = parse_agentskills_bundle(&p).expect("parsed");
+        assert!(!finding_names(&parsed).contains(&"AgentskillsInvalidName".to_string()));
+
+        // 65 chars: invalid.
+        let name_65 = "a".repeat(65);
+        let p = make_bundle(
+            tmp.path(),
+            &name_65,
+            &format!("---\nname: {name_65}\ndescription: x\n---\nbody\n"),
+        );
+        let (parsed, _) = parse_agentskills_bundle(&p).expect("parsed");
+        assert!(finding_names(&parsed).contains(&"AgentskillsInvalidName".to_string()));
+    }
+
+    #[test]
+    fn agentskills_unknown_fields_rolled_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = make_bundle(
+            tmp.path(),
+            "my-skill",
+            "---\nname: my-skill\ndescription: x\nfoo: 1\nbar: 2\n---\nbody\n",
+        );
+        let (parsed, _) = parse_agentskills_bundle(&p).expect("parsed");
+        let unknowns: Vec<_> = parsed
+            .heuristic_findings
+            .iter()
+            .filter(|f| f.rule_name == "AgentskillsUnknownFrontmatterField")
+            .collect();
+        assert_eq!(unknowns.len(), 1, "expected exactly one rolled-up finding");
+        let desc = unknowns[0]
+            .rule_metadata
+            .as_ref()
+            .and_then(|m| m.description.clone())
+            .unwrap_or_default();
+        assert!(desc.contains("foo") && desc.contains("bar"));
+    }
+
+    #[test]
+    fn agentskills_spec_allowed_fields_dont_trip_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = make_bundle(
+            tmp.path(),
+            "my-skill",
+            "---\nname: my-skill\ndescription: x\nlicense: Apache-2.0\n\
+             compatibility: requires git\nmetadata:\n  author: me\nallowed-tools: Read\n\
+             ---\nbody\n",
+        );
+        let (parsed, _) = parse_agentskills_bundle(&p).expect("parsed");
+        assert!(!finding_names(&parsed).contains(&"AgentskillsUnknownFrontmatterField".to_string()));
+    }
+
+    #[test]
+    fn agentskills_lowercase_skill_md_not_bundle() {
+        // A file named `Skill.md` is NOT a bundle entry-point. The
+        // `is_agentskills_bundle` check is byte-equal — so this file
+        // gets the lenient flat-skill parse path and none of the
+        // bundle-mode validation findings.
+        let path = PathBuf::from("foo/Skill.md");
+        assert!(!is_agentskills_bundle(&path));
+    }
+
+    #[test]
+    fn agentskills_parent_dir_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = make_bundle(
+            tmp.path(),
+            "pdf-processing",
+            "---\ndescription: parse PDFs\n---\nbody about pdfs\n",
+        );
+        let (parsed, _) = parse_agentskills_bundle(&p).expect("parsed");
+        assert_eq!(parsed.prompt.name, "pdf-processing");
+        let names = finding_names(&parsed);
+        assert!(!names.contains(&"AgentskillsNameMismatch".to_string()));
+        assert!(!names.contains(&"AgentskillsInvalidName".to_string()));
+        assert!(!names.contains(&"AgentskillsMissingName".to_string()));
+    }
+
+    #[test]
+    fn agentskills_parent_dir_invalid_emits_invalid_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Parent dir has an underscore — fails name validation.
+        let p = make_bundle(
+            tmp.path(),
+            "pdf_processing",
+            "---\ndescription: parse PDFs\n---\nbody\n",
+        );
+        let (parsed, _) = parse_agentskills_bundle(&p).expect("parsed");
+        let invalid: Vec<_> = parsed
+            .heuristic_findings
+            .iter()
+            .filter(|f| f.rule_name == "AgentskillsInvalidName")
+            .collect();
+        assert_eq!(invalid.len(), 1);
+        let desc = invalid[0]
+            .rule_metadata
+            .as_ref()
+            .and_then(|m| m.description.clone())
+            .unwrap_or_default();
+        assert!(
+            desc.contains("parent directory"),
+            "expected parent-directory wording, got: {desc}"
+        );
+        // Mutually exclusive with MissingName.
+        assert!(!finding_names(&parsed).contains(&"AgentskillsMissingName".to_string()));
+    }
+
+    #[test]
+    fn agentskills_bundle_walks_scripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("my-skill");
+        std::fs::create_dir_all(bundle.join("scripts")).unwrap();
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bundle.join("scripts/run.py"),
+            "import os\nos.system('ls')\n",
+        )
+        .unwrap();
+        // README in scripts/ should be filtered by NON_SKILL_FILENAME_STEMS.
+        std::fs::write(bundle.join("scripts/README.md"), "doc").unwrap();
+
+        let (_, resources) = parse_agentskills_bundle(&bundle.join("SKILL.md")).expect("parsed");
+        let names: Vec<_> = resources.iter().map(|r| r.name.clone()).collect();
+        assert!(names.contains(&"my-skill/scripts/run.py".to_string()));
+        // README is wrong extension for scripts anyway (not in SCRIPT_EXTS).
+        assert!(!names.iter().any(|n| n.contains("README")));
+    }
+
+    #[test]
+    fn agentskills_bundle_walks_references_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("my-skill");
+        std::fs::create_dir_all(bundle.join("references")).unwrap();
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(bundle.join("references/api.md"), "# API\nstuff").unwrap();
+        std::fs::write(bundle.join("references/notes.txt"), "should skip").unwrap();
+
+        let (_, resources) = parse_agentskills_bundle(&bundle.join("SKILL.md")).expect("parsed");
+        let names: Vec<_> = resources.iter().map(|r| r.name.clone()).collect();
+        assert!(names.contains(&"my-skill/references/api.md".to_string()));
+        // .txt is not in the accept set for references.
+        assert!(!names.iter().any(|n| n.contains("notes.txt")));
+    }
+
+    #[test]
+    fn agentskills_bundle_skips_assets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("my-skill");
+        std::fs::create_dir_all(bundle.join("assets")).unwrap();
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(bundle.join("assets/logo.svg"), "<svg/>").unwrap();
+        // Even an .md asset is out of scope for v1.
+        std::fs::write(bundle.join("assets/template.md"), "tmpl").unwrap();
+
+        let (_, resources) = parse_agentskills_bundle(&bundle.join("SKILL.md")).expect("parsed");
+        assert!(resources.is_empty());
+    }
+
+    #[test]
+    fn agentskills_resource_uri_has_no_file_prefix() {
+        // Synthetic resources use `skill://` URIs to avoid triggering
+        // path-traversal YARA rules on absolute /etc/, /var/ etc.
+        // substrings that would be present in `file://...` URIs.
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("my-skill");
+        std::fs::create_dir_all(bundle.join("scripts")).unwrap();
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(bundle.join("scripts/x.py"), "print(1)").unwrap();
+        let (_, resources) = parse_agentskills_bundle(&bundle.join("SKILL.md")).expect("parsed");
+        assert_eq!(resources.len(), 1);
+        assert!(resources[0].uri.starts_with("skill://"));
+        assert!(!resources[0].uri.contains("file://"));
+    }
+
+    #[test]
+    fn agentskills_oversize_script_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("my-skill");
+        std::fs::create_dir_all(bundle.join("scripts")).unwrap();
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+        // Build a script larger than MAX_SKILL_FILE_BYTES (2 MiB). We
+        // write `print(1)\n` x N to land just over the limit without
+        // burning fixture-test time on a needlessly large write.
+        let chunk = "print(1)\n";
+        let target_bytes = (MAX_SKILL_FILE_BYTES + 1024) as usize;
+        // Hand-rolled ceil-division — `usize::div_ceil` is Rust 1.73+
+        // and the project's stated MSRV is 1.70. Clippy 1.84+ flags this
+        // pattern with `clippy::manual_div_ceil` and suggests `div_ceil`
+        // — a circular standoff with MSRV. Local allow keeps both happy.
+        #[allow(clippy::manual_div_ceil)]
+        let repetitions = (target_bytes + chunk.len() - 1) / chunk.len();
+        let big: String = chunk.repeat(repetitions);
+        std::fs::write(bundle.join("scripts/huge.py"), &big).unwrap();
+        // Also include a normal-sized script — confirms the cap is
+        // per-file and doesn't abort the whole walk.
+        std::fs::write(bundle.join("scripts/ok.py"), "print(2)").unwrap();
+
+        let (_, resources) = parse_agentskills_bundle(&bundle.join("SKILL.md")).expect("parsed");
+        let names: Vec<_> = resources.iter().map(|r| r.name.clone()).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("huge.py")),
+            "huge.py exceeded the size cap and should have been skipped"
+        );
+        assert!(names.contains(&"my-skill/scripts/ok.py".to_string()));
+    }
+
+    #[test]
+    fn agentskills_bundle_files_per_dir_cap() {
+        // Floods `scripts/` with > MAX_BUNDLE_FILES_PER_DIR tiny files;
+        // walker should stop at the cap rather than producing one
+        // resource per file (DoS guard).
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("flood-skill");
+        std::fs::create_dir_all(bundle.join("scripts")).unwrap();
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            "---\nname: flood-skill\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+        let over_cap = MAX_BUNDLE_FILES_PER_DIR + 10;
+        for i in 0..over_cap {
+            std::fs::write(bundle.join(format!("scripts/x{i}.py")), "print(1)").unwrap();
+        }
+        let (_, resources) = parse_agentskills_bundle(&bundle.join("SKILL.md")).expect("parsed");
+        assert!(
+            resources.len() <= MAX_BUNDLE_FILES_PER_DIR,
+            "expected at most {MAX_BUNDLE_FILES_PER_DIR} resources, got {}",
+            resources.len()
+        );
+    }
+
+    #[test]
+    fn bundle_root_of_rejects_empty_parent() {
+        // A SKILL.md path with no parent component must NOT contribute
+        // a bundle-root entry — otherwise the empty-string root would
+        // prefix-match every relative discovered path and corrupt the
+        // bundle-sibling filter in main.rs.
+        // Bare `SKILL.md` (no parent) yields None.
+        assert!(bundle_root_of(&PathBuf::from("SKILL.md")).is_none());
+        // `./SKILL.md` has a non-empty parent (`.`), so it IS a valid
+        // bundle root — `.` resolves to whatever the caller's CWD is,
+        // which is the meaningful interpretation.
+        assert_eq!(
+            bundle_root_of(&PathBuf::from("./SKILL.md")),
+            Some(std::path::Path::new("."))
+        );
+        assert_eq!(
+            bundle_root_of(&PathBuf::from("foo/SKILL.md")),
+            Some(std::path::Path::new("foo"))
+        );
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_non_ascii() {
+        // Multi-byte UTF-8 (en-dash, accented vowel, fullwidth digits)
+        // contains bytes outside [a-z0-9-]; the byte loop must reject.
+        assert!(validate_skill_name("a\u{2013}b").is_err()); // en-dash
+        assert!(validate_skill_name("café").is_err());
+        assert!(validate_skill_name("\u{FF11}\u{FF12}").is_err()); // ＦＦ digits
+    }
+
+    #[test]
+    fn is_under_bundle_sibling_dir_detects_scripts() {
+        let bundle_root = PathBuf::from("/tmp/my-skill");
+        let mut roots: HashSet<PathBuf> = HashSet::new();
+        roots.insert(bundle_root.clone());
+        assert!(is_under_bundle_sibling_dir(
+            &bundle_root.join("scripts/run.py"),
+            &roots
+        ));
+        assert!(is_under_bundle_sibling_dir(
+            &bundle_root.join("references/api.md"),
+            &roots
+        ));
+        assert!(is_under_bundle_sibling_dir(
+            &bundle_root.join("assets/logo.png"),
+            &roots
+        ));
+        // SKILL.md itself is the bundle entry, not a sibling.
+        assert!(!is_under_bundle_sibling_dir(
+            &bundle_root.join("SKILL.md"),
+            &roots
+        ));
+        // A different directory entirely.
+        assert!(!is_under_bundle_sibling_dir(
+            &PathBuf::from("/tmp/other-skill/SKILL.md"),
+            &roots
+        ));
+    }
+
+    #[test]
+    fn is_under_bundle_sibling_dir_is_shallow() {
+        // The bundle parser only reads files one level under each
+        // sibling dir. Files nested deeper (`<bundle>/references/sub/deep.md`)
+        // must NOT be filtered out by this check — otherwise they'd be
+        // silently dropped from both the bundle parser (shallow) and
+        // the top-level flat-skill walker (filtered).
+        let bundle_root = PathBuf::from("/tmp/my-skill");
+        let mut roots: HashSet<PathBuf> = HashSet::new();
+        roots.insert(bundle_root.clone());
+        assert!(!is_under_bundle_sibling_dir(
+            &bundle_root.join("references/sub/deep.md"),
+            &roots
+        ));
+        assert!(!is_under_bundle_sibling_dir(
+            &bundle_root.join("scripts/nested/dir/x.py"),
+            &roots
+        ));
     }
 }

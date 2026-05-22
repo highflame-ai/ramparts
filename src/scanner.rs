@@ -53,6 +53,14 @@ fn rule_name_to_file_name(rule_name: &str) -> Option<String> {
         "SkillToolChainingExfiltration" => Some("skill_tool_chaining_abuse".to_string()),
         // skill_system_manipulation.yar
         "SkillSystemManipulation" => Some("skill_system_manipulation".to_string()),
+        // NOTE: agentskills.io validation findings (AgentskillsNameMismatch,
+        // AgentskillsInvalidName, AgentskillsMissingName,
+        // AgentskillsUnknownFrontmatterField) are NOT mapped here. They're
+        // synthesized in `src/skills.rs::make_heuristic_finding`, which
+        // hard-codes `rule_file = "skill_parser"` on construction; this
+        // mapping is only consulted for YARA-scan results, so any entry
+        // would be dead code. Same goes for the other skill heuristics
+        // (OverbroadAllowedTools, VagueSkillTrigger, etc.).
         _ => None,
     }
 }

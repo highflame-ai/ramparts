@@ -207,6 +207,53 @@ without rebuilding via `RAMPARTS_SKILL_ROOTS=path1,path2,...`. The
 output flows through the same renderers you use for MCP server scans,
 so SARIF / JSON / terminal output works identically.
 
+#### agentskills.io bundles (first-class)
+
+When ramparts encounters a file named exactly `SKILL.md` (case-sensitive
+byte-equal), it switches into bundle mode for the
+[agentskills.io](https://github.com/agentskills/agentskills) spec — the
+open skill format originated by Anthropic and now adopted by ~40 agent
+clients. Bundle layout:
+
+```
+my-skill/
+├── SKILL.md          # frontmatter + body
+├── scripts/          # bundled executable code (.py / .sh / .js / .ts / …)
+├── references/       # bundled markdown docs
+└── assets/           # static resources (skipped — typically binary)
+```
+
+In bundle mode, ramparts additionally:
+
+- Falls back to the **parent directory name** for the skill's `name:` field
+  when frontmatter omits it (the spec requires both to match).
+- Validates the spec's six-field frontmatter contract (`name`, `description`,
+  `license`, `compatibility`, `metadata`, `allowed-tools`). Any other key
+  surfaces a rolled-up `AgentskillsUnknownFrontmatterField` (LOW).
+- Validates the spec's `name` rules — 1–64 chars, `[a-z0-9-]`, no
+  leading/trailing or double hyphens — and emits `AgentskillsInvalidName`
+  (MEDIUM) with the specific violation reason.
+- Surfaces `AgentskillsNameMismatch` (**HIGH**) when the frontmatter `name:`
+  doesn't match the parent directory — a deception risk (attacker ships a
+  bundle in a directory called `helpful-helper/` but with `name: ssh-key-stealer`,
+  or vice versa).
+- Walks sibling `scripts/` and `references/` (one level deep, capped at 256
+  files per subdirectory and `MAX_SKILL_FILE_BYTES` per file) and YARA-scans
+  each file. Findings render under the synthetic name
+  `<skill>/scripts/<file>` so you see exactly which sibling fired the rule.
+  `assets/` is skipped (typically binary).
+- Adds two new discovery roots for the spec's tool-agnostic locations:
+  `~/.skills/` (unconditional) and `./skills/` (probe-gated — only walked
+  when it directly contains at least one `<name>/SKILL.md` bundle, so
+  unrelated repos with a top-level `skills/` directory aren't accidentally
+  scanned).
+
+Bundled-script findings stay YARA-only by design — the LLM batch
+analyzer is tuned for prompts/skills, not arbitrary source code, so
+running it on Python tends to be noisy. The synthesized resources never
+appear in `result.resources` either, so JSON output stays clean (no
+kilobytes of raw script source leak into machine output).
+
 📖 **[CLI reference](cli.md#skills-command)** for the full flag list and
 supported skill formats.
 

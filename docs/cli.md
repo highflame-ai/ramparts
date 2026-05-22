@@ -275,6 +275,11 @@ IDE/agent ecosystems. Both the per-user (`$HOME`) and per-workspace
 - `.windsurf/commands/` — Windsurf
 - `.gemini/commands/` — Gemini
 - `.openai/commands/` — generic OpenAI agent skills
+- `~/.skills/` — tool-agnostic agentskills.io home
+- `./skills/` — tool-agnostic agentskills.io workspace location.
+  Probe-gated: only walked when it directly contains at least one
+  `<name>/SKILL.md` bundle, so unrelated repos with a top-level
+  `skills/` directory aren't accidentally scanned.
 
 Add extra roots without rebuilding via the `RAMPARTS_SKILL_ROOTS`
 environment variable (comma-separated paths; leading `~/` is expanded
@@ -315,6 +320,47 @@ The parser is permissive: missing or malformed frontmatter is treated as
 the skill name unless the frontmatter sets `name`. Anything in
 `argument-hint` becomes the prompt's argument metadata for downstream
 tools.
+
+### agentskills.io bundles
+
+When ramparts encounters a file named exactly `SKILL.md`
+(case-sensitive), it switches into bundle mode for the agentskills.io
+spec (<https://github.com/agentskills/agentskills>):
+
+```
+my-skill/
+├── SKILL.md          # frontmatter + body (required)
+├── scripts/          # bundled executable code — YARA-scanned
+├── references/       # bundled .md docs — YARA-scanned
+└── assets/           # static resources — skipped (mostly binary)
+```
+
+Bundle-mode behavior:
+
+- The frontmatter `name:` defaults to the **parent directory name**
+  rather than the file stem (which is always "SKILL"). The spec
+  requires both to match.
+- The full spec frontmatter is recognized: `name`, `description`,
+  `license`, `compatibility`, `metadata`, `allowed-tools`. Any other
+  key triggers `AgentskillsUnknownFrontmatterField` (LOW).
+- The bundle parser emits four new findings on top of the existing
+  skill heuristics:
+  - `AgentskillsNameMismatch` (HIGH, MCP02) — `name:` doesn't match
+    the parent directory name. Deception risk.
+  - `AgentskillsInvalidName` (MEDIUM, MCP02) — name violates the
+    spec's 1–64 char, `[a-z0-9-]`, no-leading/trailing/double-hyphen
+    rules.
+  - `AgentskillsMissingName` (MEDIUM, MCP02) — neither frontmatter nor
+    the parent dir provides a usable name.
+  - `AgentskillsUnknownFrontmatterField` (LOW, MCP02) — frontmatter
+    has keys outside the spec's six-field set.
+- Files under `scripts/` (`.py`/`.sh`/`.bash`/`.zsh`/`.js`/`.mjs`/
+  `.cjs`/`.ts`/`.rb`/`.pl`/`.ps1`) and `.md` files under `references/`
+  are run through the existing YARA pre-scan; findings render under
+  the synthetic name `<skill>/scripts/<file>` or
+  `<skill>/references/<file>`. The LLM batch analyzer does **not** see
+  bundled scripts.
+- `assets/` is skipped (typically binary).
 
 ### What Skills Get Tagged
 

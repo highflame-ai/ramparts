@@ -138,8 +138,8 @@ ramparts skills scan ./.claude/commands --format sarif > skills.sarif
 ```
 
 In addition to running every existing rule against skill bodies,
-the parser emits **16 skill-specific findings** the live-MCP pipeline
-can't produce. These split into three groups:
+the parser emits **20 skill-specific findings** the live-MCP pipeline
+can't produce. These split into four groups:
 
 **Skill-targeted YARA rules over the body content (9 rules)**:
 
@@ -199,9 +199,54 @@ can't produce. These split into three groups:
   Markdown image data URIs (`data:image/...;base64,...`) are
   excluded.
 
+**agentskills.io bundle validation (4 findings)**:
+
+Activated when ramparts encounters an exact `SKILL.md` filename
+(case-sensitive byte-equal). Bundle mode walks sibling `scripts/` and
+`references/` directories one level deep, YARA-scans every script and
+reference file (cap: 256 files per subdir, `MAX_SKILL_FILE_BYTES` per
+file), and adds these spec-validation findings on top of the
+groups above. All four map to **OWASP MCP02** (supply chain /
+hidden behavior).
+
+- `AgentskillsNameMismatch` (**HIGH**) — frontmatter `name:` is
+  present and does not match the parent directory name. The
+  [agentskills.io spec](https://github.com/agentskills/agentskills)
+  requires both to match; a mismatch is a deception signal (attacker
+  ships a bundle in a directory called `helpful-helper/` but with
+  `name: ssh-key-stealer`, or vice versa).
+- `AgentskillsInvalidName` (**MEDIUM**) — resolved name (from
+  frontmatter or the parent-dir fallback) violates the spec's name
+  rules: 1–64 chars, lowercase `[a-z0-9-]`, no leading or trailing
+  hyphen, no consecutive hyphens. Finding text identifies whether
+  the violation is on the frontmatter `name:` value or on the parent
+  directory's basename, so the fix location is obvious.
+- `AgentskillsMissingName` (**MEDIUM**) — bundle has no `name:` field
+  and the parent directory has no usable name (mutually exclusive
+  with `AgentskillsInvalidName`).
+- `AgentskillsUnknownFrontmatterField` (**LOW**) — frontmatter
+  contains key(s) outside the spec's six-field set (`name`,
+  `description`, `license`, `compatibility`, `metadata`,
+  `allowed-tools`). Single rolled-up finding per bundle listing all
+  unknown keys — potential smuggling vector or just a typo.
+
+Bundled scripts (Python, Bash, JS, TypeScript, Ruby, Perl, PowerShell)
+and reference markdown files are funneled through the existing YARA
+pre-scan as synthetic resources in a local scratch buffer, then
+re-tagged as prompt-typed findings before merging. The terminal,
+JSON, and SARIF renderers all show the bundled-file findings under
+their parent skill (`my-skill (4 findings) ... [HIGH] SecretsLeakage
+in scripts/exfil.py`). Synthetic resources are discarded after the
+scan — they never appear in `result.resources`, so JSON output stays
+clean.
+
 `scan-config` walks the per-user (`$HOME`) and per-workspace (CWD)
 variants of every supported ecosystem dotdir
-(`.claude`, `.cursor`, `.codex`, `.windsurf`, `.gemini`, `.openai`).
+(`.claude`, `.cursor`, `.codex`, `.windsurf`, `.gemini`, `.openai`)
+plus the tool-agnostic agentskills.io locations (`~/.skills/`
+unconditionally; `./skills/` probe-gated by the presence of at least
+one `<name>/SKILL.md` bundle, so unrelated repos with a top-level
+`skills/` directory aren't accidentally scanned).
 Operators can supply additional roots via the
 **`RAMPARTS_SKILL_ROOTS`** environment variable (comma-separated
 paths, leading `~/` expanded).
