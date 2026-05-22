@@ -47,12 +47,17 @@ jobs:
         uses: actions/create-github-app-token@v3
         id: token
         with:
-          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          # `app-id` (deprecated) kept on purpose — `HIGHFLAME_GITHUB_APP_ID`
+          # holds the numeric App ID, not the alphanumeric Client ID.
+          # See release.yml for the full rationale.
+          app-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
           private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          # Newline-separated BARE repo names (no `owner/` prefix, no
+          # `- ` list dash). See release.yml for the full rationale.
           repositories: |
-            - ${{ github.repository }}
-            - ${{ env.DEVOPS_REPO }}
+            ${{ github.event.repository.name }}
+            ${{ env.DEVOPS_REPO }}
 
       - name: Trigger private repo workflow
         env:
