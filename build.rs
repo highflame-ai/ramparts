@@ -24,19 +24,24 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Capture git commit information.
+    // Capture git commit information. Defaults are `"unknown"` for
+    // all three so that:
     //
-    // Commit-SHA defaults are EMPTY (not "unknown") so the consumers
-    // in `src/banner.rs` and `src/utils.rs` (markdown report
-    // header) can use a single `.is_empty()` check to mean
-    // "built outside a git checkout". The previous "unknown"
-    // default made the `is_empty()` check always false, so non-git
-    // builds printed `v0.8.0 (unknown)` instead of just `v0.8.0`
-    // (caught on PR #114 by Copilot). `git_branch` still defaults
-    // to "unknown" — only used for display, and there's no
-    // `is_empty()`-style consumer.
-    let git_commit = get_git_output(&["rev-parse", "--short", "HEAD"], "");
-    let git_commit_full = get_git_output(&["rev-parse", "HEAD"], "");
+    // - Downstream JSON / SARIF consumers see the literal string
+    //   `"unknown"` for non-git builds (e.g. `cargo install ramparts`
+    //   off crates.io) — backward-compatible with how
+    //   `ScanResult.ramparts_commit` has always been populated.
+    //   Empty strings serialize to `""` which some consumers don't
+    //   handle gracefully (`if (result.ramparts_commit)` would
+    //   branch incorrectly).
+    //
+    // - The display-side consumers in `src/banner.rs` and
+    //   `src/utils.rs` (markdown report header) check both
+    //   `is_empty()` AND `== "unknown"` to mean "no commit info" and
+    //   suppress the `(<sha>)` suffix. The defense-in-depth check
+    //   handles either default value cleanly.
+    let git_commit = get_git_output(&["rev-parse", "--short", "HEAD"], "unknown");
+    let git_commit_full = get_git_output(&["rev-parse", "HEAD"], "unknown");
     let git_branch = get_git_output(&["rev-parse", "--abbrev-ref", "HEAD"], "unknown");
     let git_dirty = Command::new("git")
         .args(["diff", "--quiet"])

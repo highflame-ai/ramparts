@@ -17,7 +17,12 @@ pub fn display_banner() {
     let version = env!("CARGO_PKG_VERSION");
     let git_commit_short = env!("GIT_COMMIT_SHORT");
 
-    let build = if git_commit_short.is_empty() {
+    // Suppress the `(<sha>)` suffix when there's no real commit info.
+    // `build.rs` defaults `GIT_COMMIT_SHORT` to "unknown" for non-git
+    // builds (e.g. `cargo install ramparts` from crates.io tarball),
+    // but check both `""` and `"unknown"` so this renders correctly
+    // even if build.rs's default ever changes.
+    let build = if git_commit_short.is_empty() || git_commit_short == "unknown" {
         format!("v{version}")
     } else {
         format!("v{version} ({git_commit_short})")

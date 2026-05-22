@@ -2133,7 +2133,10 @@ pub fn generate_markdown_report(results: &[ScanResult]) -> Result<String> {
     // results in a single report come from the same scanner invocation.
     if let Some(first) = results.first() {
         if !first.ramparts_version.is_empty() {
-            let build = if first.ramparts_commit.is_empty() {
+            // Same is_empty-or-unknown guard as src/banner.rs:20 —
+            // build.rs defaults the commit to "unknown" for non-git
+            // builds; suppress the `(<sha>)` suffix either way.
+            let build = if first.ramparts_commit.is_empty() || first.ramparts_commit == "unknown" {
                 format!("v{}", first.ramparts_version)
             } else {
                 format!("v{} ({})", first.ramparts_version, first.ramparts_commit)

@@ -262,7 +262,11 @@ pub struct ScanResult {
     #[serde(default)]
     pub ramparts_version: String,
     /// Short git commit ramparts was built from (e.g. `c70cdce`).
-    /// Empty when built outside a git checkout.
+    /// The literal string `"unknown"` when built outside a git
+    /// checkout (e.g. from a crates.io tarball via `cargo install
+    /// ramparts`). Consumers should treat both `""` (legacy) and
+    /// `"unknown"` (current) as "no commit info"; never branch on
+    /// `if (ramparts_commit)` truthiness in a downstream language.
     #[serde(default)]
     pub ramparts_commit: String,
     /// IDE source that provided this server configuration

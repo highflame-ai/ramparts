@@ -311,11 +311,27 @@ jobs:
         uses: actions/create-github-app-token@v3
         id: token
         with:
-          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          # `app-id` is the deprecated alias for `client-id` in
+          # `create-github-app-token@v3`. Kept on purpose because the
+          # existing `HIGHFLAME_GITHUB_APP_ID` secret holds the
+          # numeric App ID, not the alphanumeric Client ID — those
+          # are different identifiers on GitHub Apps. Switching to
+          # `client-id:` without first adding a separate
+          # `HIGHFLAME_GITHUB_APP_CLIENT_ID` secret would break
+          # JWT-signed auth at runtime. Eat the deprecation warning
+          # until the secret is split and the cutover is intentional.
+          app-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
           private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          # `repositories:` is a newline-separated list of BARE repo
+          # names (no `owner/` prefix), NOT a YAML list and NOT
+          # `owner/repo` form. The action validates the input against
+          # the `owner:` field above and rejects `owner/repo` form
+          # with the same "owner '- ...' doesn't match" error a
+          # leading `- ` caused. Use `github.event.repository.name`
+          # for the bare name (yields `ramparts` here).
           repositories: |
-            - ${{ github.repository }}
+            ${{ github.event.repository.name }}
 
       - name: Upload release assets
         uses: actions/upload-release-asset@v1
@@ -379,12 +395,18 @@ jobs:
         uses: actions/create-github-app-token@v3
         id: token
         with:
-          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          # `app-id` (deprecated) kept on purpose — see the other
+          # app-token block above for the rationale.
+          app-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
           private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          # Newline-separated BARE repo names (not YAML list, not
+          # `owner/repo`). Same constraint as the other app-token
+          # block above. `DEVOPS_REPO` is already bare; use
+          # `github.event.repository.name` for the current repo.
           repositories: |
-            - ${{ github.repository }}
-            - ${{ env.DEVOPS_REPO }}
+            ${{ github.event.repository.name }}
+            ${{ env.DEVOPS_REPO }}
 
       - name: Trigger private repo workflow
         env:
