@@ -1,0 +1,107 @@
+# release-plz configuration.
+#
+# We use release-plz in **full mode**: on every push to main, it
+# (a) opens / updates a release PR that bumps the workspace
+# Cargo.toml versions, and (b) when that PR has been merged, tags
+# the release, publishes the `ramparts` crate to crates.io, and
+# creates a DRAFT GitHub release with auto-generated commit-bullet
+# notes in the body.
+#
+# The maintainer then polishes the draft release body — adding the
+# narrative themes, migration guide, what's-next — and clicks
+# "Publish release". That fires the GitHub `release: published`
+# event, which triggers `release.yml` to build the multi-arch
+# binaries + attach them + run the private downstream deploy
+# trigger.
+#
+# Why drafts: hand-authored narrative beats commit-list bullets for
+# release notes, but it's nice to start from a complete bullet list
+# (so you don't accidentally forget a feature). Draft mode gives
+# the maintainer that starting point and a hold-and-edit window.
+
+[workspace]
+# Don't auto-open a release PR if there are no version-bumping
+# commits since the last tag.
+release_always = false
+
+# Strip the `v` prefix from git tags — ramparts uses bare semver
+# (`0.8.0`, not `v0.8.0`) per the existing release.yml regex.
+git_tag_name = "{{ version }}"
+
+# The release-PR title that shows up in the GitHub UI. Default would
+# read "chore: release v0.9.0" which doesn't pass Highflame's
+# commit-prefix check (only feat:/fix:/devops:/Merge/Revert are
+# allowed). Use `feat:` so the PR's merge commit passes CI.
+pr_name = "feat: release {{ version }}"
+
+# Workspace-level changelog template. Even though we set
+# `changelog_update = false` per package (no `CHANGELOG.md` written
+# to disk), the same template populates the auto-generated release
+# body that lands in the draft GitHub release. Keeping it minimal:
+# group by Conventional Commits type, link each entry to its
+# commit. Maintainer adds narrative on top of these bullets when
+# polishing the draft.
+[changelog]
+header = """# Changelog\n\n"""
+body = """
+## What changed in {{ version }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}\
+- {{ commit.message | split(pat="\n") | first | trim }} \
+  ([{{ commit.id | truncate(length=7, end="") }}]({{ self::commit_link(commit=commit) }}))
+{% endfor %}\
+{% endfor %}\n
+"""
+trim = true
+# Tera macro for commit URLs — keeps the body template readable.
+postprocessors = []
+
+# Map Conventional Commits types -> sections in the release body.
+# Order matters: features first, then fixes, then everything else.
+# `devops:`, `Merge`, `Revert`, `build(deps)`, `[Snyk]`, `Bump`
+# (Highflame-conventional non-CC prefixes) get classified by their
+# regex `group` below; anything that doesn't match goes to "other".
+commit_parsers = [
+    { message = "^feat", group = "Features" },
+    { message = "^fix", group = "Bug fixes" },
+    { message = "^devops", group = "DevOps" },
+    { message = "^build\\(deps\\)", group = "Dependencies" },
+    { message = "^\\[Snyk\\]|^Bump", group = "Dependencies" },
+    { message = "^Merge|^Revert", skip = true },
+    { message = ".*", group = "Other" },
+]
+
+[[package]]
+name = "ramparts"
+# The published crate. release-plz updates the version in
+# `Cargo.toml` AND publishes to crates.io as part of its `release`
+# command (full-mode flow).
+publish = true
+
+# Don't write a CHANGELOG.md file. The same changelog template
+# above still populates the auto-generated draft release body —
+# that's the user-facing surface we actually want.
+changelog_update = false
+
+# Create the GitHub release as a DRAFT. The maintainer polishes
+# the auto-generated bullet body (adds narrative themes, migration
+# guidance, what's-next) before publishing. Publishing fires
+# `release.yml` which builds + attaches the multi-arch binaries.
+git_release_draft = true
+
+[[package]]
+name = "ramparts-common"
+# Path-only workspace member referenced as `{ path = "common" }`;
+# never published to crates.io. release-plz still bumps its
+# `Cargo.toml` version so the workspace stays consistent (root and
+# common always at the same version — verified by the
+# `Stamp release version into Cargo.toml files` step in release.yml).
+publish = false
+changelog_update = false
+
+# No GitHub release for this crate — only the `ramparts` package
+# gets one. Otherwise release-plz would create two parallel draft
+# releases per release PR and the maintainer would have to polish
+# both, which is just noise.
+git_release_enable = false
