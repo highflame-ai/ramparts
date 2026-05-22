@@ -585,10 +585,9 @@ async fn handle_skills_command(
                     .collect::<Vec<_>>()
                     .join(", ");
                 error!("No skill discovery roots found. Looked at: {looked_at}");
-                return Err(format!(
-                    "No skill discovery roots found. Looked at: {looked_at}"
-                )
-                .into());
+                return Err(
+                    format!("No skill discovery roots found. Looked at: {looked_at}").into(),
+                );
             }
             handle_skills_scan_command(existing, format, report, timeout, scanner_config).await
         }
