@@ -575,15 +575,20 @@ async fn handle_skills_command(
             let existing: Vec<std::path::PathBuf> =
                 candidates.iter().filter(|p| p.exists()).cloned().collect();
             if existing.is_empty() {
-                error!(
-                    "No skill discovery roots found. Looked at: {}",
-                    candidates
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                std::process::exit(1);
+                // Return an error rather than `std::process::exit(1)` so
+                // the tokio runtime can shut down cleanly (running other
+                // tasks' destructors etc.). The top-level `main` turns
+                // the returned Err into a non-zero exit code.
+                let looked_at = candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                error!("No skill discovery roots found. Looked at: {looked_at}");
+                return Err(format!(
+                    "No skill discovery roots found. Looked at: {looked_at}"
+                )
+                .into());
             }
             handle_skills_scan_command(existing, format, report, timeout, scanner_config).await
         }
@@ -639,8 +644,10 @@ async fn handle_skills_scan_command(
     }
 
     if skill_paths.is_empty() {
-        error!("No skill files found in: {:?}", roots);
-        std::process::exit(1);
+        // See the note on the previous `process::exit` site above.
+        let msg = format!("No skill files found in: {roots:?}");
+        error!("{msg}");
+        return Err(msg.into());
     }
 
     // agentskills.io bundle filter (two-pass). Pass 1: identify
@@ -710,8 +717,9 @@ async fn handle_skills_scan_command(
     }
 
     if prompts.is_empty() {
-        error!("All discovered skill files failed to parse");
-        std::process::exit(1);
+        let msg = "All discovered skill files failed to parse";
+        error!("{msg}");
+        return Err(msg.into());
     }
 
     // Cross-skill pass: look for name collisions across the parsed set.
