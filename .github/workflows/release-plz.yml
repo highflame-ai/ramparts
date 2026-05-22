@@ -1,11 +1,26 @@
-name: Release-plz (auto-version-bump PRs)
+name: Release-plz (auto-bump + draft release)
 
-# Runs on every push to main. If there are `feat:` / `fix:` /
-# `feat!:` commits since the last tag, release-plz opens (or
-# updates) a release PR that bumps Cargo.toml versions for both
-# workspace members. Merging that PR triggers the existing
-# `release.yml` workflow (on the GitHub release-published event)
-# which handles binary builds + crate publish.
+# Runs on every push to main. Two phases run sequentially:
+#
+# 1. `release-pr` — opens / updates a "feat: release X.Y.Z" PR that
+#    bumps both workspace Cargo.toml files when there are `feat:` /
+#    `fix:` / `feat!:` commits since the last tag.
+#
+# 2. `release` — when a previous release PR has just been merged
+#    (release-plz detects this via the Cargo.toml version diff
+#    between HEAD and the previous tag), release-plz:
+#    a. publishes the `ramparts` crate to crates.io
+#    b. creates the git tag
+#    c. creates a DRAFT GitHub release with auto-generated bullets
+#       (sourced from commits since the last tag) in the body
+#
+#    The release lands as a draft so the maintainer can polish the
+#    notes — add narrative themes, migration guidance, what's-next
+#    — before publishing. When the maintainer clicks "Publish
+#    release", the GitHub `release: published` event fires and the
+#    `release.yml` workflow runs the multi-arch binary builds +
+#    downstream deploy trigger. crate publish itself has moved here
+#    (release-plz handles it during step a above).
 #
 # Concurrency: only one release-plz run at a time on main; in-flight
 # runs cancel when a newer commit lands so the open release PR
@@ -24,8 +39,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       # release-plz needs to push commits onto the release branch
-      # (to update the open PR when new commits land on main) and
-      # open / update PRs.
+      # (to update the open PR when new commits land on main),
+      # open / update PRs, AND create git tags + GitHub releases
+      # (the `release` command requires `contents: write`).
       contents: write
       pull-requests: write
     steps:
@@ -33,8 +49,9 @@ jobs:
         uses: actions/checkout@v6
         with:
           # release-plz needs the full commit history + tag history
-          # to compute the bump and detect when the last release
-          # happened.
+          # to compute the bump, detect when the last release
+          # happened, and walk commits since that tag for the
+          # auto-generated release body bullets.
           fetch-depth: 0
           # The PR-opening step uses a Highflame GitHub App token
           # (next step). Don't persist the default GITHUB_TOKEN since
@@ -55,19 +72,25 @@ jobs:
 
       - name: Install Rust toolchain
         # release-plz depends on cargo for reading workspace
-        # metadata. Pinning to `stable` matches the
+        # metadata + running `cargo publish` when the `release`
+        # command fires. Pinning to `stable` matches the
         # `rust-toolchain.toml` we added in this PR.
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run release-plz (release-pr mode)
-        # `release-pr` mode: open / update the release PR; do not
-        # publish to crates.io or create a git tag. The publish
-        # phase stays with the existing release.yml (which fires on
-        # GitHub release-published events from human-created
-        # releases at the merged-release-PR's commit).
+      - name: "Run release-plz (full mode: PR + release)"
+        # No `command:` specified — the action runs BOTH `release-pr`
+        # and `release` in one go. `release-pr` is idempotent (opens
+        # / updates the release PR as needed); `release` is a no-op
+        # unless the workspace Cargo.toml is at a version that
+        # doesn't yet have a corresponding git tag (which happens
+        # right after a release PR is merged).
         uses: MarcoIeni/release-plz-action@v0.5
         with:
-          command: release-pr
           config: release-plz.toml
         env:
+          # PRs + tag pushes + draft GitHub release creation: app token.
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          # crates.io publish: same secret the old `cargo publish` step
+          # in `release.yml` was reading. Moved here because release-plz
+          # is the new publisher.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
