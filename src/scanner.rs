@@ -40,7 +40,27 @@ fn rule_name_to_file_name(rule_name: &str) -> Option<String> {
         | "CrossDomainContamination"
         | "DomainOutlier"
         | "MixedSecuritySchemes" => Some("cross_origin_escalation".to_string()),
-        // Add more mappings as needed
+        // skill_prompt_injection.yar rules
+        "PromptInjectionSignature"
+        | "UnicodeSteganography"
+        | "CoerciveInjection"
+        | "IndirectPromptInjection" => Some("skill_prompt_injection".to_string()),
+        // skill_authority.yar rules
+        "AutonomyAbuse" | "CapabilityInflation" => Some("skill_authority".to_string()),
+        // skill_credential_harvesting.yar
+        "SkillCredentialHarvesting" => Some("skill_credential_harvesting".to_string()),
+        // skill_tool_chaining_abuse.yar
+        "SkillToolChainingExfiltration" => Some("skill_tool_chaining_abuse".to_string()),
+        // skill_system_manipulation.yar
+        "SkillSystemManipulation" => Some("skill_system_manipulation".to_string()),
+        // NOTE: agentskills.io validation findings (AgentskillsNameMismatch,
+        // AgentskillsInvalidName, AgentskillsMissingName,
+        // AgentskillsUnknownFrontmatterField) are NOT mapped here. They're
+        // synthesized in `src/skills.rs::make_heuristic_finding`, which
+        // hard-codes `rule_file = "skill_parser"` on construction; this
+        // mapping is only consulted for YARA-scan results, so any entry
+        // would be dead code. Same goes for the other skill heuristics
+        // (OverbroadAllowedTools, VagueSkillTrigger, etc.).
         _ => None,
     }
 }
@@ -647,14 +667,18 @@ impl YaraScanner {
         results
     }
 
-    /// Format an item for YARA scanning with specialized logic per type
+    /// Format an item for YARA scanning. We feed YARA the same descriptive
+    /// text the LLM analyzer sees (`format_for_analysis`) so rules that
+    /// pattern-match on tool/prompt/skill bodies actually have content to
+    /// match against. Previously this returned just `"PROMPT: <name>"`,
+    /// which meant body-pattern rules (the new skill rules in particular,
+    /// but also `command_injection.yar` against prompts) silently never
+    /// fired because there was nothing to scan beyond the name.
     fn format_item_for_yara_scan<T>(item: &T) -> String
     where
         T: crate::security::BatchScannableItem,
     {
-        // For YARA scanning, we want a simple format without numbering
-        // to avoid confusion and focus on the actual content
-        format!("{}: {}", T::item_type().to_uppercase(), item.name())
+        item.format_for_analysis(0)
     }
 
     /// Create a YARA scan result with original rule metadata
@@ -2190,7 +2214,7 @@ pub(crate) struct ScanData {
 
 // Scan data implementation
 impl ScanData {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             server_info: None,
             tools: Vec::new(),

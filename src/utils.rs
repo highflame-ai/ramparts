@@ -115,6 +115,24 @@ pub mod performance {
 // ============================================================================
 
 pub fn print_result(result: &ScanResult, format: &str, detailed: bool) {
+    // Skill scans go through their own renderer for terminal/text formats —
+    // the live-MCP renderer's "Tools/Resources" framing collapses to garbage
+    // ("Tools scanned: 0", "Unknown MCP Server") on a skill result whose
+    // primary content is `prompts`. JSON / SARIF / raw stay shape-identical
+    // regardless of source so machine consumers see the same fields.
+    if is_skill_scan(result) {
+        match format.to_lowercase().as_str() {
+            "json" => print_json_result(result),
+            "raw" => print_raw_json_result(result),
+            "sarif" => print_sarif_result(result),
+            "text" | "table" => print_skill_table_result(result, detailed),
+            _ => {
+                eprintln!("Unknown format: {format}. Using skill table format.");
+                print_skill_table_result(result, detailed);
+            }
+        }
+        return;
+    }
     match format.to_lowercase().as_str() {
         "json" => print_json_result(result),
         "table" => print_table_result(result, detailed),
@@ -126,6 +144,353 @@ pub fn print_result(result: &ScanResult, format: &str, detailed: bool) {
             print_table_result(result, detailed);
         }
     }
+}
+
+/// True when this `ScanResult` came from `ramparts skills scan` /
+/// `skills scan-config`. The handler stamps the URL with the
+/// `skills:` scheme so renderers can branch on it.
+fn is_skill_scan(result: &ScanResult) -> bool {
+    result.url.starts_with("skills:")
+}
+
+/// Skill-aware terminal renderer. Replaces the live-MCP framing
+/// (tools / resources / "Unknown MCP Server") with per-skill grouping
+/// (skill name + source path + findings + severity counts).
+///
+/// Layout (Option C — verdict-first, compact chrome):
+///
+///   Path: <stripped of `skills:`>
+///   ✅ N skills, M findings (X HIGH, Y MEDIUM) · 1.2s
+///
+///   ⚠️ skill_a (2 findings)
+///        source: ...
+///        [HIGH] RuleName [OWASP: ...]
+///               wrapped description
+///
+///   ✅ skill_b
+///
+///   Cross-Skill Findings
+///      [MEDIUM] SkillNameCollision [OWASP: ...]
+///               ...
+///
+///   Tip: --json | --sarif | --report
+fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
+    use crate::security::SecurityIssue;
+    use crate::types::YaraScanResult;
+
+    /// Cross-skill findings have semantics that bind to multiple skill
+    /// files at once (collision across paths, etc.). Rendering them
+    /// under a single skill would either duplicate (every colliding
+    /// file shows the same finding) or confuse (only one of N
+    /// colliding files shows it). Carve them out for a dedicated
+    /// section after the per-skill loop.
+    fn is_cross_skill_rule(rule_name: &str) -> bool {
+        matches!(rule_name, "SkillNameCollision")
+    }
+
+    // Strip the `skills:` prefix so the displayed path looks normal.
+    // Multi-root scans produce `skills:[a,b](N files)` — show that
+    // verbatim minus the prefix.
+    let display_url = result.url.strip_prefix("skills:").unwrap_or(&result.url);
+
+    // Findings per-skill: yara_results target_name + prompt-issue prompt_name.
+    let yara_findings: Vec<&YaraScanResult> = result
+        .yara_results
+        .iter()
+        .filter(|y| y.target_type.as_str() == "prompt")
+        .collect();
+
+    let prompt_issues: &[SecurityIssue] = result
+        .security_issues
+        .as_ref()
+        .map_or(&[][..], |s| s.prompt_issues.as_slice());
+
+    let cross_findings: Vec<&YaraScanResult> = yara_findings
+        .iter()
+        .copied()
+        .filter(|y| is_cross_skill_rule(&y.rule_name))
+        .collect();
+
+    // First pass: compute totals + per-severity breakdown for the
+    // verdict line. We render the verdict at the top so the user sees
+    // pass/fail immediately rather than after scrolling through
+    // per-skill rows.
+    let mut total_findings = 0_usize;
+    let mut sev_counts = std::collections::BTreeMap::<String, usize>::new();
+    let mut bump = |sev: &str| {
+        let s = sev.to_uppercase();
+        *sev_counts.entry(s).or_insert(0) += 1;
+        total_findings += 1;
+    };
+    // A finding belongs to a skill when its target_name equals the
+    // skill name OR is `<skill>/scripts/<file>` / `<skill>/references/<file>`
+    // (the synthetic naming agentskills.io bundles use for their
+    // bundled-script and bundled-reference YARA findings).
+    let belongs_to_skill = |target: &str, skill: &str| -> bool {
+        if target == skill {
+            return true;
+        }
+        if let Some(rest) = target.strip_prefix(skill) {
+            return rest.starts_with('/');
+        }
+        false
+    };
+    for prompt in &result.prompts {
+        for y in yara_findings.iter().filter(|y| {
+            belongs_to_skill(&y.target_name, &prompt.name) && !is_cross_skill_rule(&y.rule_name)
+        }) {
+            bump(
+                y.rule_metadata
+                    .as_ref()
+                    .and_then(|m| m.severity.as_deref())
+                    .unwrap_or("INFO"),
+            );
+        }
+        for issue in prompt_issues
+            .iter()
+            .filter(|i| i.prompt_name.as_deref() == Some(&prompt.name))
+        {
+            bump(&issue.severity);
+        }
+    }
+    for y in &cross_findings {
+        bump(
+            y.rule_metadata
+                .as_ref()
+                .and_then(|m| m.severity.as_deref())
+                .unwrap_or("INFO"),
+        );
+    }
+
+    // Verdict line. ✅ when 0 findings, ⚠️ otherwise; ❌ when the scan
+    // itself failed (errors recorded). Severity breakdown only when
+    // there's at least one finding.
+    let prompt_count = result.prompts.len();
+    let secs = result.response_time_ms as f64 / 1000.0;
+    let icon = if !result.errors.is_empty() {
+        "❌"
+    } else if total_findings == 0 {
+        "✅"
+    } else {
+        "⚠️"
+    };
+    let breakdown = if sev_counts.is_empty() {
+        String::new()
+    } else {
+        // Render in fixed severity order so output is stable.
+        let order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"];
+        let parts: Vec<String> = order
+            .iter()
+            .filter_map(|k| sev_counts.get(*k).map(|v| format!("{v} {k}")))
+            .collect();
+        format!(" ({})", parts.join(", "))
+    };
+    println!("Path: {}", display_url.blue());
+    println!(
+        "{icon} {prompt_count} skill{} scanned, {total_findings} finding{}{breakdown} · {secs:.1}s",
+        if prompt_count == 1 { "" } else { "s" },
+        if total_findings == 1 { "" } else { "s" }
+    );
+
+    if !result.errors.is_empty() {
+        println!("\n{}", "Errors".bold().red());
+        for e in &result.errors {
+            println!("  • {e}");
+        }
+    }
+
+    for prompt in &result.prompts {
+        let yara_for_skill: Vec<&&YaraScanResult> = yara_findings
+            .iter()
+            .filter(|y| belongs_to_skill(&y.target_name, &prompt.name))
+            .filter(|y| !is_cross_skill_rule(&y.rule_name))
+            .collect();
+        let llm_for_skill: Vec<&SecurityIssue> = prompt_issues
+            .iter()
+            .filter(|i| i.prompt_name.as_deref() == Some(&prompt.name))
+            .collect();
+
+        let count = yara_for_skill.len() + llm_for_skill.len();
+
+        let head = if count == 0 {
+            format!("  {} {}", "✅".green(), prompt.name.bold())
+        } else {
+            format!(
+                "  {} {} ({} finding{})",
+                "⚠️".yellow(),
+                prompt.name.bold(),
+                count,
+                if count == 1 { "" } else { "s" },
+            )
+        };
+        println!("\n{head}");
+
+        // Best-effort source path: heuristic findings carry the path
+        // in `context = "source: <path>"`. Show it under the skill name
+        // so the user can navigate to the file.
+        if let Some(src) = yara_for_skill
+            .iter()
+            .find_map(|y| y.context.strip_prefix("source: "))
+        {
+            println!("    {} {}", "source:".dimmed(), src.dimmed());
+        }
+
+        // Counts already accumulated in the upfront verdict pass;
+        // these loops only render. Severity colorization comes from
+        // the rule metadata (YARA findings) or the SecurityIssue
+        // (LLM findings).
+        for y in &yara_for_skill {
+            let sev = y
+                .rule_metadata
+                .as_ref()
+                .and_then(|m| m.severity.as_deref())
+                .unwrap_or("INFO")
+                .to_uppercase();
+            let sev_disp = colored_severity(&sev);
+            let owasp = format_owasp_tags(&y.owasp_tags);
+            // For bundled-script/reference findings the target_name
+            // carries `<skill>/scripts/<file>` or `<skill>/references/<file>`.
+            // Surface the suffix inline so the user sees which sibling
+            // file the rule fired on without having to read the JSON.
+            let bundle_suffix = y
+                .target_name
+                .strip_prefix(&format!("{}/", prompt.name))
+                .map(|rest| format!(" in {rest}"))
+                .unwrap_or_default();
+            println!(
+                "    [{sev_disp}] {}{bundle_suffix}{owasp}",
+                y.rule_name.bold()
+            );
+            if let Some(desc) = y
+                .rule_metadata
+                .as_ref()
+                .and_then(|m| m.description.as_deref())
+            {
+                for line in wrap_for_terminal(desc, 90) {
+                    println!("        {line}");
+                }
+            }
+        }
+
+        for issue in &llm_for_skill {
+            let sev = issue.severity.to_uppercase();
+            let sev_disp = colored_severity(&sev);
+            let owasp = format_owasp_tags(&issue.owasp_tags);
+            // SecurityIssueType doesn't implement Display, so use Debug
+            // (the variant names like `PromptInjection` are already
+            // user-readable).
+            println!(
+                "    [{sev_disp}] {}{owasp} (LLM)",
+                format!("{:?}", issue.issue_type).bold()
+            );
+            for line in wrap_for_terminal(&issue.message, 90) {
+                println!("        {line}");
+            }
+        }
+    }
+
+    // Cross-skill section — findings that bind to multiple skills,
+    // not any single one (currently just SkillNameCollision; add
+    // future cross-skill rules to `is_cross_skill_rule`).
+    if !cross_findings.is_empty() {
+        println!("\n{}", "Cross-Skill Findings".bold());
+        for y in &cross_findings {
+            let sev = y
+                .rule_metadata
+                .as_ref()
+                .and_then(|m| m.severity.as_deref())
+                .unwrap_or("INFO")
+                .to_uppercase();
+            let sev_disp = colored_severity(&sev);
+            let owasp = format_owasp_tags(&y.owasp_tags);
+            println!("  [{sev_disp}] {}{owasp}", y.rule_name.bold());
+            if let Some(desc) = y
+                .rule_metadata
+                .as_ref()
+                .and_then(|m| m.description.as_deref())
+            {
+                for line in wrap_for_terminal(desc, 90) {
+                    println!("      {line}");
+                }
+            }
+        }
+    }
+
+    // Footer: discoverability hints + a one-line scan-completion
+    // marker. Output formats are surfaced here so the user knows how
+    // to pipe to CI / get richer detail without `--help`-spelunking.
+    let yara_rules = result
+        .yara_results
+        .iter()
+        .find(|y| y.rule_name == "YARA_PRE_SCAN_SUMMARY")
+        .and_then(|s| s.rules_executed.as_ref())
+        .map_or(0, std::vec::Vec::len);
+    println!();
+    println!(
+        "  {} {} YARA rule{} executed",
+        "·".dimmed(),
+        yara_rules,
+        if yara_rules == 1 { "" } else { "s" }
+    );
+    println!(
+        "  {} Tip: {}",
+        "·".dimmed(),
+        "--json | --sarif | --report".dimmed()
+    );
+}
+
+/// Map a severity label (`CRITICAL` / `HIGH` / `MEDIUM` / `LOW`) to
+/// a color-styled `ColoredString`. Pulled into a helper so the
+/// skill renderer's three rendering sites (per-skill YARA, per-skill
+/// LLM, cross-skill YARA) all colorize identically.
+fn colored_severity(sev: &str) -> colored::ColoredString {
+    match sev {
+        "CRITICAL" => sev.red().bold(),
+        "HIGH" => sev.yellow().bold(),
+        "MEDIUM" => sev.yellow(),
+        "LOW" => sev.cyan(),
+        _ => sev.normal(),
+    }
+}
+
+/// Render `[OWASP: MCP06, MCP09]` if any tags are present, empty
+/// string otherwise. Same layout as the LLM-finding tag list — kept
+/// in one place so both sites use identical formatting.
+fn format_owasp_tags(tags: &[crate::taxonomy::OwaspTag]) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    format!(
+        " [OWASP: {}]",
+        tags.iter()
+            .map(|t| t.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Wrap `text` to lines of at most `width` chars, breaking on word
+/// boundaries. Single-purpose helper for the skill renderer; not
+/// internationalized (skill content is overwhelmingly English in
+/// practice and we don't want a `unicode-segmentation` dep here).
+fn wrap_for_terminal(text: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 fn print_sarif_result(result: &ScanResult) {
@@ -687,7 +1052,11 @@ fn add_errors_info(
 fn print_table_result(result: &ScanResult, detailed: bool) {
     println!("Ramparts MCP Server Scan Result");
 
-    // Server Info
+    // Server Info. Version + commit are NOT printed here — the
+    // startup banner already shows them via `display_banner`. JSON /
+    // raw / SARIF outputs (which suppress the banner) carry the
+    // version on the `ScanResult` shape (`ramparts_version`,
+    // `ramparts_commit`).
     println!("URL: {}", result.url.blue());
     println!("Status: {}", format_status(&result.status));
     println!("Response Time: {}ms", result.response_time_ms);
@@ -1742,15 +2111,36 @@ pub fn generate_markdown_report(results: &[ScanResult]) -> Result<String> {
     let timestamp = Utc::now();
     let mut report = String::new();
 
+    // Title reflects the *current* scanner surface — ramparts scans both
+    // live MCP servers and on-disk agent skill files (`ramparts skills
+    // scan`). Reports may bundle either or both kinds of result depending
+    // on which command produced them; the title is generic-enough to
+    // cover the mixed case.
+    let scanner_label = "Ramparts MCP & Agent Skill Scanner";
+
     // Header
-    writeln!(report, "# MCP Security Scan Report")?;
+    writeln!(report, "# {scanner_label} Report")?;
     writeln!(report)?;
     writeln!(
         report,
         "**Generated:** {}",
         timestamp.format("%Y-%m-%d %H:%M:%S UTC")
     )?;
-    writeln!(report, "**Scanner:** Ramparts MCP Security Scanner")?;
+    writeln!(report, "**Scanner:** {scanner_label}")?;
+    // Carry the build identity so a reader of an archived report
+    // months later can correlate findings to a specific scanner build.
+    // First scan's `ramparts_version`/`commit` are representative — all
+    // results in a single report come from the same scanner invocation.
+    if let Some(first) = results.first() {
+        if !first.ramparts_version.is_empty() {
+            let build = if first.ramparts_commit.is_empty() {
+                format!("v{}", first.ramparts_version)
+            } else {
+                format!("v{} ({})", first.ramparts_version, first.ramparts_commit)
+            };
+            writeln!(report, "**Build:** {build}")?;
+        }
+    }
     writeln!(report)?;
 
     // Executive Summary

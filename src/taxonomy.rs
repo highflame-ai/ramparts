@@ -103,6 +103,58 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         | "DomainOutlier"
         | "MixedSecuritySchemes" => vec![OwaspTag::new("MCP05")],
 
+        // skill_prompt_injection.yar — four rules covering classic
+        // instruction-override signatures, invisible-unicode hiding,
+        // mandatory-execution coercion, and indirect prompt injection
+        // via untrusted external content.
+        "PromptInjectionSignature" | "UnicodeSteganography" | "IndirectPromptInjection" => {
+            vec![OwaspTag::new("MCP01")]
+        }
+        "CoerciveInjection" => vec![OwaspTag::new("MCP01"), OwaspTag::new("MCP02")],
+
+        // skill_authority.yar — autonomy bypass + capability inflation.
+        "AutonomyAbuse" => vec![OwaspTag::new("MCP03")],
+        "CapabilityInflation" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
+
+        // skill_credential_harvesting.yar — vendor token formats, PEM
+        // private-key blocks, active credential-theft verbs.
+        "SkillCredentialHarvesting" => {
+            vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
+        }
+
+        // skill_tool_chaining_abuse.yar — credential read + network
+        // egress to known exfil destinations, attacker-named hosts.
+        "SkillToolChainingExfiltration" => {
+            vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
+        }
+
+        // skill_system_manipulation.yar — destructive ops, privilege
+        // escalation, PATH hijack, critical-file writes.
+        "SkillSystemManipulation" => {
+            vec![OwaspTag::new("MCP03"), OwaspTag::new("MCP04")]
+        }
+
+        // Synthetic findings emitted by the skill parser (src/skills.rs)
+        // for structural risks the YARA passes can't see (frontmatter
+        // grants, missing triggers, network-egress tool grants).
+        "OverbroadAllowedTools" => vec![OwaspTag::new("MCP03")],
+        "VagueSkillTrigger" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
+        "GenericSkillTrigger" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
+        "DataExfiltrationGrant" => vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")],
+        "SkillSensitiveFileReference" => vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")],
+        "SkillNameCollision" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
+        "SkillEmbeddedPayload" => vec![OwaspTag::new("MCP01"), OwaspTag::new("MCP10")],
+
+        // agentskills.io spec-validation findings — all map to MCP02
+        // (supply chain / hidden behavior). A bundle whose name doesn't
+        // match its directory, has an invalid name, or has unknown
+        // frontmatter fields is a candidate for deceptive shipping or
+        // unintended-behavior surprise.
+        "AgentskillsNameMismatch"
+        | "AgentskillsInvalidName"
+        | "AgentskillsMissingName"
+        | "AgentskillsUnknownFrontmatterField" => vec![OwaspTag::new("MCP02")],
+
         _ => Vec::new(),
     }
 }
@@ -149,6 +201,15 @@ mod tests {
             "CrossDomainContamination",
             "DomainOutlier",
             "MixedSecuritySchemes",
+            "PromptInjectionSignature",
+            "UnicodeSteganography",
+            "CoerciveInjection",
+            "IndirectPromptInjection",
+            "AutonomyAbuse",
+            "CapabilityInflation",
+            "SkillCredentialHarvesting",
+            "SkillToolChainingExfiltration",
+            "SkillSystemManipulation",
         ] {
             assert!(
                 !tags_for_yara_rule(name).is_empty(),

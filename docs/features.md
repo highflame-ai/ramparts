@@ -166,6 +166,97 @@ ramparts scan-config --format sarif > ramparts.sarif
 Each finding includes its OWASP MCP Top 10 ID as a SARIF tag and a
 numeric `security-severity` (0–10) so the right severity badge renders.
 
+### Skill Scanning
+
+Ramparts also scans **agent skills** — markdown files containing prompt
+instructions that an agent loads and executes by name (Claude Code's
+`.claude/commands/*.md`, Cursor agent skills, etc.). Same threat model
+as MCP prompts (untrusted instructions an agent may follow), so the
+existing security pipeline applies directly:
+
+```bash
+# Scan a directory of skills
+ramparts skills scan ./.claude/commands
+
+# Discover and scan from well-known locations (~/.claude/commands etc.)
+ramparts skills scan-config
+
+# SARIF output for code-scanning ingestion
+ramparts skills scan ./.claude/commands --format sarif > skills.sarif
+```
+
+The parser handles YAML frontmatter (`description`, `argument-hint`,
+`name`, `allowed-tools` in both inline-string and YAML-list shapes)
+plus a markdown body, treats each skill as an MCP prompt, and runs
+LLM analysis + YARA + OWASP tagging over it. On top of that, it
+emits structural findings the regex/LLM pipeline can't see:
+
+- `OverbroadAllowedTools` — bare `Bash`, `Bash(*)`, `Bash(*:*)`, etc.
+- `DataExfiltrationGrant` — `WebFetch` / `WebSearch` / `Fetch` /
+  `Browse` grants that let the skill talk to the network
+- `VagueSkillTrigger` — substantive body with a missing or one-word
+  `description` (easy to mis-invoke)
+- `SkillSensitiveFileReference` — Claude Code `@<path>` references
+  pointing at SSH/AWS/GnuPG/kube/docker credentials, `.env`,
+  `.netrc`, certificates, etc.
+
+`scan-config` walks `~/<dotdir>/{commands,skills}` and the same paths
+under the current workspace for every supported ecosystem (Claude
+Code, Cursor, Codex, Windsurf, Gemini, OpenAI). Add extra roots
+without rebuilding via `RAMPARTS_SKILL_ROOTS=path1,path2,...`. The
+output flows through the same renderers you use for MCP server scans,
+so SARIF / JSON / terminal output works identically.
+
+#### agentskills.io bundles (first-class)
+
+When ramparts encounters a file named exactly `SKILL.md` (case-sensitive
+byte-equal), it switches into bundle mode for the
+[agentskills.io](https://github.com/agentskills/agentskills) spec — the
+open skill format originated by Anthropic and now adopted by ~40 agent
+clients. Bundle layout:
+
+```
+my-skill/
+├── SKILL.md          # frontmatter + body
+├── scripts/          # bundled executable code (.py / .sh / .js / .ts / …)
+├── references/       # bundled markdown docs
+└── assets/           # static resources (skipped — typically binary)
+```
+
+In bundle mode, ramparts additionally:
+
+- Falls back to the **parent directory name** for the skill's `name:` field
+  when frontmatter omits it (the spec requires both to match).
+- Validates the spec's six-field frontmatter contract (`name`, `description`,
+  `license`, `compatibility`, `metadata`, `allowed-tools`). Any other key
+  surfaces a rolled-up `AgentskillsUnknownFrontmatterField` (LOW).
+- Validates the spec's `name` rules — 1–64 chars, `[a-z0-9-]`, no
+  leading/trailing or double hyphens — and emits `AgentskillsInvalidName`
+  (MEDIUM) with the specific violation reason.
+- Surfaces `AgentskillsNameMismatch` (**HIGH**) when the frontmatter `name:`
+  doesn't match the parent directory — a deception risk (attacker ships a
+  bundle in a directory called `helpful-helper/` but with `name: ssh-key-stealer`,
+  or vice versa).
+- Walks sibling `scripts/` and `references/` (one level deep, capped at 256
+  files per subdirectory and `MAX_SKILL_FILE_BYTES` per file) and YARA-scans
+  each file. Findings render under the synthetic name
+  `<skill>/scripts/<file>` so you see exactly which sibling fired the rule.
+  `assets/` is skipped (typically binary).
+- Adds two new discovery roots for the spec's tool-agnostic locations:
+  `~/.skills/` (unconditional) and `./skills/` (probe-gated — only walked
+  when it directly contains at least one `<name>/SKILL.md` bundle, so
+  unrelated repos with a top-level `skills/` directory aren't accidentally
+  scanned).
+
+Bundled-script findings stay YARA-only by design — the LLM batch
+analyzer is tuned for prompts/skills, not arbitrary source code, so
+running it on Python tends to be noisy. The synthesized resources never
+appear in `result.resources` either, so JSON output stays clean (no
+kilobytes of raw script source leak into machine output).
+
+📖 **[CLI reference](cli.md#skills-command)** for the full flag list and
+supported skill formats.
+
 ### Replay Mode
 
 Scan once, render many times. The `replay` subcommand reads a previously

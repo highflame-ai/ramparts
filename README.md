@@ -1,10 +1,10 @@
 <div align="center">
 
-# Ramparts: mcp (model context protocol) scanner
+# Ramparts: security scanner for MCP servers and AI agent skills
 
 <img src="assets/ramparts.png" alt="Ramparts Banner" width="250" />
 
-*A fast, lightweight security scanner for Model Context Protocol (MCP) servers with built-in vulnerability detection.*
+*A fast, lightweight security scanner for the agent stack — Model Context Protocol (MCP) servers AND AI agent skills (Claude Code commands, [agentskills.io](https://github.com/agentskills/agentskills) bundles, Cursor / Codex / Windsurf / Gemini equivalents) — with built-in vulnerability detection.*
 
 [![Crates.io](https://img.shields.io/crates/v/ramparts)](https://crates.io/crates/ramparts)
 [![GitHub stars](https://img.shields.io/github/stars/highflame-ai/ramparts?style=social)](https://github.com/highflame-ai/ramparts)
@@ -18,47 +18,50 @@
 
 ## Overview
 
-**Ramparts** is a scanner designed for the **Model Context Protocol (MCP)** ecosystem. As AI agents and LLMs increasingly rely on external tools and resources through MCP servers, ensuring the security of these connections has become critical.   
+**Ramparts** scans the two surfaces an AI agent trusts most: the **MCP servers** it talks to over the network, and the **skill files** it loads from disk and executes by name. Both deliver untrusted instructions and tool grants into the agent's loop; ramparts applies the same security pipeline (YARA, LLM analysis, OWASP MCP Top 10 tagging) to both.
 
-The Model Context Protocol (MCP) is an open standard that enables AI assistants to securely connect to external data sources and tools. It allows AI agents to access databases, file systems, and APIs through toolcalling to retrieve real-time information and interact with external or internal services.
+- **MCP scanning** covers the [Model Context Protocol](https://modelcontextprotocol.io) — the open standard that lets AI assistants connect to databases, file systems, and APIs via tool-calling. Ramparts discovers a server's tools/resources/prompts and audits them for prompt injection, tool poisoning, secret leakage, path traversal, command injection, cross-origin escalation, supply-chain CVEs (via OSV.dev), and more.
+- **Skill scanning** covers the markdown/YAML files an agent loads as named capabilities — Claude Code custom slash commands, Cursor / Codex / Windsurf / Gemini equivalents, and **first-class support for [agentskills.io](https://github.com/agentskills/agentskills) bundles** (`<name>/SKILL.md` directories with sibling `scripts/`, `references/`, `assets/`). Each skill body becomes a synthetic MCP prompt that runs through the same analyzers; bundled scripts get scanned through YARA, name-vs-directory mismatches surface as HIGH-severity deception findings, and the agentskills.io name/charset rules are validated.
 
 Ramparts is under active development. Read our [launch blog](https://www.getjavelin.com/blogs/ramparts-mcp-scan).
 
 ### The Security Challenge
 
-MCP servers expose powerful capabilities—file systems, databases, APIs, and system commands—that can become attack vectors like tool poisoning, command injection, and data exfiltration without proper security analysis. - 📚 **[Security Features & Attack Vectors](docs/security-features.md)** 
-
-
+The MCP-and-skills attack surface is broad. MCP servers expose file systems, databases, APIs, and system commands — turning into attack vectors via tool poisoning, command injection, and data exfiltration without proper analysis. Agent skills carry the same risk profile (untrusted instructions an agent may follow) plus their own twists: skill-file `allowed-tools` grants that hand out unrestricted `Bash`, sensitive `@<path>` references that inline credentials into prompt context, name collisions that let one skill shadow another in the agent's router, and bundled scripts that ship arbitrary executable code. 📚 **[Security Features & Attack Vectors](docs/security-features.md)** documents every detector ramparts ships with — across both MCP and skill scanning.
 
 ### What Ramparts Does
 
-Ramparts provides **security scanning** of MCP servers by:
+Ramparts provides **security scanning** of the MCP-and-skill ecosystem by:
 
-1. **Discovering Capabilities**: Scans all MCP endpoints to identify available tools, resources, and prompts
-2. **Multi-Transport Support**: Supports HTTP, SSE, stdio, and subprocess transports with intelligent fallback
-3. **Session Management**: Handles stateful MCP servers with automatic session ID management
-4. **Static Analysis**: Performs yara-based checks for common vulnerabilities
-5. **Cross-Origin Analysis**: Detects when tools span multiple domains, which could enable context hijacking or injection attacks
-6. **LLM-Powered Analysis**: Uses AI models to detect sophisticated security issues
-7. **Risk Assessment**: Categorizes findings by severity and provides actionable recommendations
+1. **MCP server discovery & analysis** — scans MCP endpoints for tools/resources/prompts; multi-transport (HTTP, SSE, stdio, subprocess) with intelligent fallback and session management
+2. **Skill scanning** — same threat model applied to agent skill files on disk (Claude Code commands, agentskills.io bundles incl. bundled `scripts/` + `references/`, Cursor / Codex / Windsurf / Gemini variants)
+3. **Static analysis (YARA)** — 25+ pre/post-scan rules across both surfaces, including 9 skill-targeted rules (prompt-injection variants, credential harvesting, tool-chaining exfil, system manipulation, authority abuse)
+4. **LLM-powered analysis** — sophisticated semantic issues no static rule can spot (tool descriptions that lie about behavior, sneaky permission requests, etc.)
+5. **Cross-origin analysis** — detects tools spanning multiple domains, a context-hijacking / injection vector
+6. **Supply-chain coverage** — queries OSV.dev for known CVEs in npx/uvx-launched stdio MCP servers
+7. **Structural skill heuristics** — overbroad `allowed-tools` grants, vague/generic triggers, sensitive `@<path>` references, embedded base64/hex payloads, skill-name collisions
+8. **agentskills.io spec validation** — directory-vs-`name:` mismatch (deception), spec name-rule violations, unknown frontmatter fields
+9. **OWASP MCP Top 10 tagging** — every finding mapped to a versioned OWASP MCP Top 10 entry; visible in terminal, JSON, SARIF, and markdown report output
+10. **Multiple output formats** — terminal, JSON, **SARIF 2.1.0** (for GitHub Advanced Security / GitLab / Azure DevOps), and a detailed markdown report
 >
 > **💡 Jump directly to detailed Rampart features?**
 > [**📚 Detailed Features**](docs/features.md)
 
 ## Who Ramparts is For
 
-- **Developers**: Scan MCP servers for vulnerabilities in your development environment (Cursor, Windsurf, Claude Code) or production deployments.  
-- **MCP users**: Scan third-party servers before connecting, validate local servers before production.  
-- **MCP developers**: Ensure your tools, resources, and prompts don't expose vulnerabilities to AI agents.
+- **MCP users** — scan third-party MCP servers before connecting; validate local servers before production
+- **MCP developers** — ensure your tools/resources/prompts don't expose vulnerabilities to AI agents
+- **Skill authors** — validate agentskills.io bundles against the spec before publishing; catch overbroad tool grants and sensitive-file references in your `.claude/commands/` or bundled `scripts/`
+- **Agent operators** — scan the skills your team has authored or installed; check that no bundle has been swapped under a deceptive directory name; surface findings in your existing SARIF/code-scanning workflow
 
 ## Use Cases
 
-- **Security Audits**: Comprehensive assessment of MCP server security posture
-- **Development**: Testing MCP servers during development and testing phases  
-- **CI/CD Integration**: Automated security scanning in deployment pipelines
-- **Compliance**: Meeting security requirements for AI agent deployments
+- **Security audits** — full assessment of an MCP server's posture or a skill repo's safety
+- **Development** — fast feedback loop while building MCP servers or authoring skills
+- **CI/CD integration** — gate PRs that add skills or change MCP server configs (SARIF flows directly into GitHub code-scanning, GitLab, Azure DevOps)
+- **Compliance** — meet AI-agent deployment security requirements with OWASP MCP Top 10-tagged evidence
 
-> **💡 Caution**: Ramparts analyzes MCP server metadata and static configurations. For comprehensive security, combine with runtime MCP guardrails and adopt a layered security approach. The MCP threat landscape is rapidly evolving, and rampart is not perfect and inaccuracies are inevitable.
+> **💡 Caution**: Ramparts analyzes static metadata, configurations, and skill files. For comprehensive security, combine with runtime MCP guardrails and adopt a layered security approach. The MCP+skills threat landscape is rapidly evolving, and ramparts is not perfect — inaccuracies are inevitable.
 
 ## Quick Start
 
@@ -67,26 +70,64 @@ Ramparts provides **security scanning** of MCP servers by:
 cargo install ramparts
 ```
 
-**Scan an MCP server**
+Ramparts has two top-level scan surfaces. Pick whichever (or both) match what
+you're securing.
+
+### 1. Scan MCP servers
+
 ```bash
+# A specific MCP server (HTTP)
 ramparts scan https://api.githubcopilot.com/mcp/ --auth-headers "Authorization: Bearer $TOKEN"
 
-# Generate detailed markdown report (scan_YYYYMMDD_HHMMSS.md)
-ramparts scan https://api.githubcopilot.com/mcp/ --auth-headers "Authorization: Bearer $TOKEN" --report
-
-# Scan stdio/subprocess MCP servers
+# stdio / subprocess MCP servers
 ramparts scan "stdio:npx:mcp-server-commands"
 ramparts scan "stdio:python3:/path/to/mcp_server.py"
-```
 
-**Scan your IDE's MCP configurations**
-```bash
-# Automatically discovers and scans MCP servers from Cursor, Windsurf, VS Code, Claude Desktop, Claude Code
+# Auto-discover and scan every MCP server in your IDE configs
+# (Cursor, Windsurf, VS Code, Claude Desktop, Claude Code, Cline)
 ramparts scan-config
 
-# With detailed report generation
+# Generate a detailed markdown report (scan_YYYYMMDD_HHMMSS.md)
 ramparts scan-config --report
+
+# Or walk a checked-in configs-only repo (great for CI)
+ramparts scan-config --root ./ide-configs
 ```
+
+### 2. Scan AI agent skills
+
+```bash
+# A single skill file or every *.md skill under a directory
+ramparts skills scan ./.claude/commands
+
+# An agentskills.io bundle directory — picks up SKILL.md +
+# walks sibling scripts/ and references/ through YARA
+ramparts skills scan ./my-skill-bundle
+
+# Auto-discover skills across every supported ecosystem at the user
+# and workspace level (.claude/, .cursor/, .codex/, .windsurf/,
+# .gemini/, .openai/, ~/.skills/, probe-gated ./skills/).
+# Add extra roots without rebuilding via RAMPARTS_SKILL_ROOTS=path1,path2.
+ramparts skills scan-config
+
+# SARIF output for code-scanning ingestion
+ramparts skills scan ./.claude/commands --format sarif > skills.sarif
+```
+
+**Skill formats supported out of the box:**
+
+- **Claude Code custom slash commands** — flat `.md` files under
+  `.claude/commands/` (per-user and per-workspace)
+- **[agentskills.io](https://github.com/agentskills/agentskills) bundles** —
+  `<name>/SKILL.md` directories with optional sibling `scripts/` (`.py` / `.sh`
+  / `.bash` / `.zsh` / `.js` / `.mjs` / `.cjs` / `.ts` / `.rb` / `.pl` / `.ps1`),
+  `references/` (`.md`), and `assets/`. Bundle mode also validates the spec's
+  `name:` field against the parent directory name, the 1–64 char
+  `[a-z0-9-]` rule, and surfaces name-vs-directory mismatches as
+  HIGH-severity deception findings (`AgentskillsNameMismatch`).
+- **Cursor / OpenAI Codex / Windsurf / Gemini** skill repos that ship the same
+  markdown + YAML frontmatter shape — supported via shared frontmatter fields
+  and the per-ecosystem dotdir discovery roots.
 
 > **💡 Did you know you can start Ramparts as a server?** Run `ramparts server` to get a REST API for continuous monitoring and CI/CD integration. See 📚 **[Ramparts Server Mode](docs/api.md)** 
 
@@ -153,14 +194,43 @@ ramparts scan-config --report
 📄 Detailed report generated: scan_20250804_073225.md
 ```
 
+**Skill scan (agentskills.io bundle):**
+```bash
+ramparts skills scan ./my-skill
+```
+
+```
+Path: ./my-skill
+❌ 1 skill scanned, 4 findings (2 CRITICAL, 2 HIGH) · 0.6s
+
+  ⚠️ evil-skill (4 findings)
+    source: ./my-skill/SKILL.md
+    [HIGH] SecretsLeakage in scripts/exfil.py [OWASP: MCP06, MCP09]
+        Detects potential exposure of sensitive information like API keys, passwords, and tokens
+    [CRITICAL] SSHKeyExposure in scripts/exfil.py [OWASP: MCP06]
+        Detects SSH keys, authorized_keys files, and SSH configuration access
+    [CRITICAL] SSHKeyExposure in references/api.md [OWASP: MCP06]
+        Detects SSH keys, authorized_keys files, and SSH configuration access
+    [HIGH] AgentskillsNameMismatch [OWASP: MCP02]
+        SKILL.md declares `name: evil-skill` but its parent directory is `my-skill/`.
+        agentskills.io requires the name to match the parent directory; the mismatch may
+        indicate a deceptively-named bundle.
+```
+
+(`AgentskillsNameMismatch` is from agentskills.io spec validation; the
+`SecretsLeakage` / `SSHKeyExposure` rows are bundled-script YARA findings —
+ramparts walked `scripts/exfil.py` and `references/api.md` automatically.)
+
 ## Contributing
 
-We welcome contributions to Ramparts mcp scan. If you have suggestions, bug reports, or feature requests, please open an issue on our GitHub repository.
+We welcome contributions to Ramparts. If you have suggestions, bug reports, or feature requests, please open an issue on our GitHub repository.
 
 ## Documentation
-- 🔍 **[Troubleshooting Guide](docs/troubleshooting.md)** - Solutions to common issues
-- ⚙️ **[Configuration Reference](docs/configuration.md)** - Complete configuration file documentation
-- 📖 **[CLI Reference](docs/cli.md)** - All commands, options, and usage examples
+- 📖 **[CLI Reference](docs/cli.md)** — All commands (scan, scan-config, skills scan, skills scan-config, replay, server, mcp-stdio), options, and usage examples
+- 🛡️ **[Security Features & Attack Vectors](docs/security-features.md)** — Every detector ramparts ships with, across MCP + skill scanning
+- ⚙️ **[Configuration Reference](docs/configuration.md)** — Complete config file documentation + skill discovery root config
+- 🔍 **[Troubleshooting Guide](docs/troubleshooting.md)** — Solutions to common issues
+- 📚 **[Detailed Features](docs/features.md)** — How each capability works under the hood
 
 ## Additional Resources
 - [Need Support?](https://github.com/highflame-ai/ramparts/issues)
