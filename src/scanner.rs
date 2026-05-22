@@ -53,6 +53,11 @@ fn rule_name_to_file_name(rule_name: &str) -> Option<String> {
         "SkillToolChainingExfiltration" => Some("skill_tool_chaining_abuse".to_string()),
         // skill_system_manipulation.yar
         "SkillSystemManipulation" => Some("skill_system_manipulation".to_string()),
+        // agentskills.io spec validation (no .yar file — synthesized in src/skills.rs)
+        "AgentskillsNameMismatch"
+        | "AgentskillsInvalidName"
+        | "AgentskillsMissingName"
+        | "AgentskillsUnknownFrontmatterField" => Some("agentskills_validation".to_string()),
         _ => None,
     }
 }
