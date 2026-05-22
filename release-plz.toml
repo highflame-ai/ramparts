@@ -1,0 +1,60 @@
+# release-plz configuration.
+#
+# We use release-plz in **release-PR mode only**: on every push to main,
+# release-plz checks the commit history since the last tag and, when
+# a `feat:` / `fix:` / `feat!:` commit is found, opens (or updates) a
+# release PR that bumps the workspace Cargo.toml `version` fields and
+# computes the new git tag.
+#
+# Merging that PR triggers the existing `release.yml` (on
+# `release: published`) which handles the multi-arch binary build,
+# `cargo publish` to crates.io, and the downstream deploy trigger.
+#
+# We deliberately do NOT enable release-plz's `release` command
+# (auto-publish + tag creation) — keeping that flow in the existing
+# release.yml means the multi-arch binaries get attached to the
+# release in the same workflow that publishes the crate. release-plz
+# would need significant extra wiring to replicate that.
+
+[workspace]
+# Don't auto-open a release PR if there are no version-bumping
+# commits since the last tag. The default behaviour we want.
+release_always = false
+
+# Strip the `v` prefix from git tags — ramparts uses bare semver
+# (`0.8.0`, not `v0.8.0`) per the existing release.yml regex.
+git_tag_name = "{{ version }}"
+
+# The release-PR title that shows up in the GitHub UI. Default would
+# read "chore: release v0.9.0" which doesn't pass Highflame's
+# commit-prefix check (only feat:/fix:/devops:/Merge/Revert are
+# allowed). Use `feat:` for minor/major bumps and `fix:` for patches
+# so the PR's merge commit passes CI.
+pr_name = "feat: release {{ version }}"
+
+[[package]]
+name = "ramparts"
+# The published crate. release-plz updates the version in
+# `Cargo.toml` based on commits since the last tag.
+publish = true
+
+# Don't touch CHANGELOG. ramparts keeps hand-authored per-release
+# changelogs under `docs/CHANGELOG-v*.md` with richer context than
+# autogen produces. release-plz manages Cargo.toml versions only.
+changelog_update = false
+
+# Don't open a release PR for fix-only windows when the changelog
+# would be empty — the GitHub release notes (auto-generated from the
+# commit log) are sufficient. Set to true to release every patch.
+# Leaving the default (false) so a `fix:`-only window does open a PR.
+# release_always defaults to false too; safe.
+
+[[package]]
+name = "ramparts-common"
+# Path-only workspace member referenced as `{ path = "common" }`;
+# never published to crates.io. We still want release-plz to bump
+# its `Cargo.toml` version so the workspace stays consistent (root
+# and common always at the same version — verified by the
+# `Stamp release version into Cargo.toml files` step in release.yml).
+publish = false
+changelog_update = false

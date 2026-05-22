@@ -1,0 +1,73 @@
+name: Release-plz (auto-version-bump PRs)
+
+# Runs on every push to main. If there are `feat:` / `fix:` /
+# `feat!:` commits since the last tag, release-plz opens (or
+# updates) a release PR that bumps Cargo.toml versions for both
+# workspace members. Merging that PR triggers the existing
+# `release.yml` workflow (on the GitHub release-published event)
+# which handles binary builds + crate publish.
+#
+# Concurrency: only one release-plz run at a time on main; in-flight
+# runs cancel when a newer commit lands so the open release PR
+# always reflects the tip of main.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz:
+    runs-on: ubuntu-24.04
+    permissions:
+      # release-plz needs to push commits onto the release branch
+      # (to update the open PR when new commits land on main) and
+      # open / update PRs.
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          # release-plz needs the full commit history + tag history
+          # to compute the bump and detect when the last release
+          # happened.
+          fetch-depth: 0
+          # The PR-opening step uses a Highflame GitHub App token
+          # (next step). Don't persist the default GITHUB_TOKEN since
+          # that token can't trigger CI on the auto-opened PR.
+          persist-credentials: false
+
+      - name: Create Highflame GitHub App token
+        # release-plz must open the release PR using a token that
+        # CAN trigger CI workflows on the auto-opened PR. The default
+        # GITHUB_TOKEN can't — PRs opened with it don't trigger
+        # `on: pull_request` workflows. Same app-token pattern the
+        # existing release.yml uses for its private-repo trigger.
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
+
+      - name: Install Rust toolchain
+        # release-plz depends on cargo for reading workspace
+        # metadata. Pinning to `stable` matches the
+        # `rust-toolchain.toml` we added in this PR.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz (release-pr mode)
+        # `release-pr` mode: open / update the release PR; do not
+        # publish to crates.io or create a git tag. The publish
+        # phase stays with the existing release.yml (which fires on
+        # GitHub release-published events from human-created
+        # releases at the merged-release-PR's commit).
+        uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release-pr
+          config: release-plz.toml
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
