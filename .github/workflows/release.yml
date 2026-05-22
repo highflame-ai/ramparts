@@ -83,12 +83,37 @@ jobs:
       - name: Validate semver against commit history (convco)
         shell: bash
         run: |-
+          set -euo pipefail
           CONVCO_VERSION="0.6.3"
           curl -fsSL "https://github.com/convco/convco/releases/download/v${CONVCO_VERSION}/convco-ubuntu.zip" -o /tmp/convco.zip
           unzip -q /tmp/convco.zip -d /tmp/convco-bin
           sudo install -m 0755 /tmp/convco-bin/convco /usr/local/bin/convco
-          EXPECTED="$(convco version --bump --prefix '')"
+
+          # Critical: at release-publish time the just-pushed tag is
+          # already at HEAD. `convco version --bump` would then see it
+          # as "the latest tag" and report zero bump (no commits past
+          # HEAD), making the check trivially pass on every release.
+          # Delete the tag from the LOCAL clone before computing — the
+          # remote still has it (the GitHub release isn't affected) —
+          # so convco sees the PREVIOUS tag as the latest and computes
+          # the bump from commits between previous-tag and HEAD. That's
+          # what we actually want to validate.
           ACTUAL="${{ env.RELEASE_NAME }}"
+          if git rev-parse --verify --quiet "refs/tags/${ACTUAL}" >/dev/null; then
+            git tag -d "${ACTUAL}" >/dev/null
+            echo "Removed local tag ${ACTUAL} so convco computes the bump from the previous tag."
+          else
+            # Tag wasn't fetched into the local clone. Warn loudly —
+            # convco's output may be off but the comparison still
+            # catches gross under-bumps.
+            echo "::warning::Local tag ${ACTUAL} not found; convco computation may be skewed."
+          fi
+
+          EXPECTED="$(convco version --bump --prefix '')"
+          if [[ -z "${EXPECTED}" ]]; then
+            echo "::error::convco returned an empty recommendation. Cannot validate."
+            exit 1
+          fi
           echo "Published tag : ${ACTUAL}"
           echo "convco --bump : ${EXPECTED}"
           HIGHEST="$(printf '%s\n%s\n' "${EXPECTED}" "${ACTUAL}" | sort -V | tail -1)"
