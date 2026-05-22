@@ -38,9 +38,14 @@ name = "ramparts"
 # `Cargo.toml` based on commits since the last tag.
 publish = true
 
-# Don't touch CHANGELOG. ramparts keeps hand-authored per-release
-# changelogs under `docs/CHANGELOG-v*.md` with richer context than
-# autogen produces. release-plz manages Cargo.toml versions only.
+# Don't touch CHANGELOG. ramparts release notes live in the GitHub
+# release body, hand-authored by the maintainer (assisted by Claude
+# session-time drafting from the PR history since the last tag) when
+# the release is created. Auto-generated commit-list bullets would
+# be lower quality than the narrative the maintainer writes, and
+# duplicating into a CHANGELOG.md file gives readers a worse surface
+# (an in-repo doc nobody thinks to check) than the GitHub release
+# page itself. release-plz manages Cargo.toml versions only.
 changelog_update = false
 
 # Don't open a release PR for fix-only windows when the changelog
