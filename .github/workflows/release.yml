@@ -37,18 +37,71 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
+      # Tag format gate. Previously this step was conditioned on
+      # `steps.validate_branch.outputs.enable_branch_build == 'true'`,
+      # but `validate_branch` was never a real step in this job — the
+      # gate evaluated to false and the validation silently skipped on
+      # every release. Removed the conditional; the format check now
+      # actually runs. (Same bug + fix as zeroid's release.yml.)
       - name: Validate Release Tag
-        if: ${{ steps.validate_branch.outputs.enable_branch_build == 'true' }}
         id: validate_tag
         shell: bash
         run: |-
           if [[ "${{ env.RELEASE_NAME }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
             echo "Valid version format: ${{ env.RELEASE_NAME }}"
-            echo "enable_tag_build=true" >> ${GITHUB_OUTPUT}
           else
             echo "Invalid version format: ${{ env.RELEASE_NAME }}"
-            echo "enable_tag_build=false" >> ${GITHUB_OUTPUT}
+            echo "Expected bare semver (X.Y.Z); got: ${{ env.RELEASE_NAME }}"
             exit 1
+          fi
+
+      # convco (Rust equivalent of caarlos0/svu — same Conventional
+      # Commits model) computes the semver bump implied by commit
+      # messages since the last tag. Highflame's commit-prefix
+      # convention maps cleanly onto Conventional Commits for the
+      # bumps: `feat:` -> minor, `fix:` -> patch, `feat!:` /
+      # `BREAKING CHANGE:` -> major. `devops:`, `build(deps)`,
+      # `[Snyk]`, `Bump`, `Merge`, `Revert` aren't in convco's default
+      # type table and don't move version numbers — matches our intent
+      # (housekeeping, not user-visible).
+      #
+      # Behavior: fail if the published tag is BELOW convco's
+      # recommendation — that means a `feat:` commit was missed and
+      # we'd be silently shipping a feature as a patch. Allow tags AT
+      # OR ABOVE the recommendation so a maintainer can manually force
+      # a higher bump (e.g., release a major from a fix-only window).
+      # Note: convco's pre-1.0 bump heuristic is more conservative than
+      # svu's; this is fine here because the check is one-way (fail on
+      # too-low) — false negatives (a missed under-bump) hurt less than
+      # false positives (blocking a correct release).
+      #
+      # ramparts uses bare semver tags (X.Y.Z, no `v` prefix); convco's
+      # `--prefix ""` outputs the same shape so no string munging is
+      # needed. Installed from the prebuilt binary release rather than
+      # `cargo install convco` so the job doesn't burn a few minutes
+      # compiling the tool on every release.
+      - name: Validate semver against commit history (convco)
+        shell: bash
+        run: |-
+          CONVCO_VERSION="0.6.3"
+          curl -fsSL "https://github.com/convco/convco/releases/download/v${CONVCO_VERSION}/convco-ubuntu.zip" -o /tmp/convco.zip
+          unzip -q /tmp/convco.zip -d /tmp/convco-bin
+          sudo install -m 0755 /tmp/convco-bin/convco /usr/local/bin/convco
+          EXPECTED="$(convco version --bump --prefix '')"
+          ACTUAL="${{ env.RELEASE_NAME }}"
+          echo "Published tag : ${ACTUAL}"
+          echo "convco --bump : ${EXPECTED}"
+          HIGHEST="$(printf '%s\n%s\n' "${EXPECTED}" "${ACTUAL}" | sort -V | tail -1)"
+          if [[ "${ACTUAL}" != "${EXPECTED}" && "${HIGHEST}" != "${ACTUAL}" ]]; then
+            echo "::error::Release tag ${ACTUAL} is below convco's computed next version ${EXPECTED}."
+            echo "::error::This usually means a feat: commit since the last tag implied a minor bump."
+            echo "::error::Either retag at ${EXPECTED} or higher, or audit recent commit prefixes."
+            exit 1
+          fi
+          if [[ "${ACTUAL}" != "${EXPECTED}" ]]; then
+            echo "::notice::Release tag ${ACTUAL} is ahead of convco's recommendation (${EXPECTED}). Treating as an intentional manual bump."
+          else
+            echo "Release tag matches convco recommendation."
           fi
 
       - name: Setting up the Crate Version

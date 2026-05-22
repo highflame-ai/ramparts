@@ -21,6 +21,14 @@ RUST_VERSION := $(shell rustc --version | cut -d' ' -f2)
 CARGO := cargo
 RUSTUP := rustup
 
+# Clippy strict-gate flags. Promote dead_code + unused_* warnings to
+# errors so PRs can't leave orphaned functions, fields, imports, or
+# unneeded `mut` keywords behind. Mirrors the gate enforced in
+# highflame-firehog's pr-check.yml so the bar is consistent across
+# the Highflame Rust services. `--all-targets` covers tests + benches
+# (without it, test code is silently unlinted).
+CLIPPY_STRICT_FLAGS := -D warnings -D dead_code -D unused_imports -D unused_variables -D unused_mut
+
 # ============================================================================
 # ARCHITECTURE DETECTION
 # ============================================================================
@@ -154,8 +162,8 @@ build: ## Build for current architecture (auto-detected) with quality checks
 	@echo "Checking code formatting..."
 	@$(CARGO) fmt --all -- --check || (echo "❌ Code formatting check failed. Run 'make fmt' to fix." && exit 1)
 	@echo "✅ Code formatting check passed"
-	@echo "Running clippy linting..."
-	@$(CARGO) clippy --all-features -- -D warnings || (echo "❌ Clippy check failed. Fix the warnings above." && exit 1)
+	@echo "Running clippy linting (strict gate)..."
+	@$(CARGO) clippy --all-features --all-targets -- $(CLIPPY_STRICT_FLAGS) || (echo "❌ Clippy check failed. Fix the warnings above." && exit 1)
 	@echo "✅ Clippy check passed"
 	@$(CARGO) clippy --all-targets --all-features -- -W clippy::all -W clippy::pedantic -A clippy::missing_docs_in_private_items -A clippy::module_name_repetitions
 	@echo "✅ Extended Clippy check passed"
@@ -191,9 +199,9 @@ test: ## Run tests (all features)
 	@echo "Tests complete"
 
 .PHONY: lint
-lint: ## Run clippy linting (all features)
-	@echo "Running clippy (all features)..."
-	@$(CARGO) clippy --all-features -- -D warnings
+lint: ## Run clippy linting (strict gate — same as CI)
+	@echo "Running clippy (strict gate, all features, all targets)..."
+	@$(CARGO) clippy --all-features --all-targets -- $(CLIPPY_STRICT_FLAGS)
 	@echo "Clippy complete"
 
 .PHONY: fmt
@@ -467,8 +475,8 @@ ci-check: ## Run all CI quality checks (format, clippy, tests, audit)
 	@$(CARGO) fmt --all -- --check || (echo "❌ Code formatting check failed. Run 'make fmt' to fix." && exit 1)
 	@echo "✅ Code formatting check passed"
 	@echo ""
-	@echo "🔍 Running clippy linting..."
-	@$(CARGO) clippy --all-features -- -D warnings || (echo "❌ Clippy check failed. Fix the warnings above." && exit 1)
+	@echo "🔍 Running clippy linting (strict gate)..."
+	@$(CARGO) clippy --all-features --all-targets -- $(CLIPPY_STRICT_FLAGS) || (echo "❌ Clippy check failed. Fix the warnings above." && exit 1)
 	@echo "✅ Clippy check passed"
 	@echo ""
 	@echo "🧪 Running tests..."
