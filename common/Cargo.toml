@@ -1,9 +1,9 @@
 [package]
 name = "ramparts-common"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["Sharath Rajasekar <sharath@highflame.com>"]
-description = "Common types and utilities for Ramparts MCP tools"
+description = "Shared types and utilities for the Ramparts MCP-server and agent-skill scanner."
 license = "Apache-2.0"
 repository = "https://github.com/highflame-ai/ramparts"
 

@@ -89,12 +89,23 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run Clippy linter
+      # Strict lint pass — same gate as highflame-firehog. `-D warnings`
+      # makes everything fatal; `-D unused` is the lint group that
+      # covers dead_code, unused_imports, unused_variables, unused_mut,
+      # unused_must_use, unused_assignments, and friends. `-D warnings`
+      # alone would catch these (they're warn-by-default) but `-D unused`
+      # is explicit about intent: a forgotten helper / leftover stub /
+      # unneeded `mut` should fail CI rather than accumulate on main.
+      # `--all-targets` covers tests + benches (without it, test code is
+      # silently unlinted); `--all-features` lints feature-gated code
+      # too. The Windows branch drops `--all-features` because the
+      # yara-x feature requires platform-specific YARA bindings.
+      - name: Run Clippy linter (strict)
         run: |
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cargo clippy --no-default-features -- -D warnings
+            cargo clippy --no-default-features --all-targets -- -D warnings -D unused
           else
-            cargo clippy --all-features -- -D warnings
+            cargo clippy --all-features --all-targets -- -D warnings -D unused
           fi
         shell: bash
 
