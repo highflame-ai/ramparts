@@ -129,17 +129,56 @@ jobs:
             echo "Release tag matches convco recommendation."
           fi
 
-      - name: Setting up the Crate Version
+      # Stamp the release version into every place a version literal
+      # appears. Today that's the root Cargo.toml and `common/Cargo.toml`
+      # (the `ramparts-common` workspace member). Both files need to
+      # match — drifting versions inside a single workspace either
+      # break `cargo publish` outright or ship a confusing mix of
+      # `[[package]]` entries in the eventual crate metadata.
+      #
+      # `Cargo.lock` is refreshed implicitly by the downstream `cargo
+      # build` / `cargo publish` steps (Cargo regenerates lock entries
+      # for workspace members whenever their Cargo.toml `version`
+      # changes), so we don't sed it here.
+      #
+      # The hardcoded `"version": "0.2.0"` literals in
+      # `src/server.rs` (health-endpoint JSON) are intentionally NOT
+      # patched here — those are a source-level bug that should be
+      # refactored to use `env!("CARGO_PKG_VERSION")` instead of being
+      # papered over at release time. Tracked separately.
+      - name: Stamp release version into Cargo.toml files
         shell: bash
         run: |-
-          sed -i 's/^version = ".*"/version = "${{ env.RELEASE_NAME }}"/' Cargo.toml
+          set -euo pipefail
+          for f in Cargo.toml common/Cargo.toml; do
+            if [[ ! -f "$f" ]]; then
+              echo "::error::Expected $f to exist; aborting release."
+              exit 1
+            fi
+            sed -i 's/^version = ".*"/version = "${{ env.RELEASE_NAME }}"/' "$f"
+            actual="$(grep -m1 '^version = ' "$f" | cut -d'"' -f2)"
+            if [[ "$actual" != "${{ env.RELEASE_NAME }}" ]]; then
+              echo "::error::$f version did not update to ${{ env.RELEASE_NAME }} (got: $actual)"
+              exit 1
+            fi
+            echo "Stamped $f -> $actual"
+          done
 
-      - name: Upload cargo-toml
+      # The downstream `highflame-artifact` and `highflame-crate` jobs
+      # run on separate runners, so the in-place edits above don't
+      # propagate via the working directory. We bundle the patched
+      # files into an artifact those jobs download to overlay before
+      # building/publishing. Preserves the relative path
+      # (`common/Cargo.toml`) so the workspace structure is intact
+      # when the artifact unpacks.
+      - name: Upload version-stamped Cargo.toml files
         uses: actions/upload-artifact@v7
         if: always()
         with:
           name: cargo-toml
-          path: Cargo.toml
+          path: |
+            Cargo.toml
+            common/Cargo.toml
           retention-days: 1
 
   highflame-artifact:
