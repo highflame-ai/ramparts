@@ -222,11 +222,23 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
         *sev_counts.entry(s).or_insert(0) += 1;
         total_findings += 1;
     };
+    // A finding belongs to a skill when its target_name equals the
+    // skill name OR is `<skill>/scripts/<file>` / `<skill>/references/<file>`
+    // (the synthetic naming agentskills.io bundles use for their
+    // bundled-script and bundled-reference YARA findings).
+    let belongs_to_skill = |target: &str, skill: &str| -> bool {
+        if target == skill {
+            return true;
+        }
+        if let Some(rest) = target.strip_prefix(skill) {
+            return rest.starts_with('/');
+        }
+        false
+    };
     for prompt in &result.prompts {
-        for y in yara_findings
-            .iter()
-            .filter(|y| y.target_name == prompt.name && !is_cross_skill_rule(&y.rule_name))
-        {
+        for y in yara_findings.iter().filter(|y| {
+            belongs_to_skill(&y.target_name, &prompt.name) && !is_cross_skill_rule(&y.rule_name)
+        }) {
             bump(
                 y.rule_metadata
                     .as_ref()
@@ -290,7 +302,7 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
     for prompt in &result.prompts {
         let yara_for_skill: Vec<&&YaraScanResult> = yara_findings
             .iter()
-            .filter(|y| y.target_name == prompt.name)
+            .filter(|y| belongs_to_skill(&y.target_name, &prompt.name))
             .filter(|y| !is_cross_skill_rule(&y.rule_name))
             .collect();
         let llm_for_skill: Vec<&SecurityIssue> = prompt_issues
@@ -336,7 +348,19 @@ fn print_skill_table_result(result: &ScanResult, _detailed: bool) {
                 .to_uppercase();
             let sev_disp = colored_severity(&sev);
             let owasp = format_owasp_tags(&y.owasp_tags);
-            println!("    [{sev_disp}] {}{owasp}", y.rule_name.bold());
+            // For bundled-script/reference findings the target_name
+            // carries `<skill>/scripts/<file>` or `<skill>/references/<file>`.
+            // Surface the suffix inline so the user sees which sibling
+            // file the rule fired on without having to read the JSON.
+            let bundle_suffix = y
+                .target_name
+                .strip_prefix(&format!("{}/", prompt.name))
+                .map(|rest| format!(" in {rest}"))
+                .unwrap_or_default();
+            println!(
+                "    [{sev_disp}] {}{bundle_suffix}{owasp}",
+                y.rule_name.bold()
+            );
             if let Some(desc) = y
                 .rule_metadata
                 .as_ref()
