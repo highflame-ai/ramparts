@@ -353,30 +353,109 @@ jobs:
           asset_name: ${{ matrix.target }}-${{ matrix.arch }}_checksums.txt
           asset_content_type: text/plain
 
-  # NOTE: the cargo-publish job that used to live here has been
-  # removed. release-plz now publishes to crates.io as part of its
-  # full-mode flow — when a release-plz PR is merged, release-plz
-  # tags + publishes the crate + creates the GitHub release (as a
-  # draft, see release-plz.toml). The maintainer polishes the draft
-  # release notes and clicks "Publish release", which fires this
-  # workflow on `release: published` and builds the multi-arch
-  # binaries that get attached.
+  # Publish both workspace members to crates.io. Runs as part of
+  # Mode 2 (release-published → release.yml). `ramparts-common`
+  # publishes first because the root `ramparts` crate has it as a
+  # path-and-version dependency — crates.io rejects a `ramparts`
+  # publish that references an unpublished `ramparts-common`.
   #
-  # If you need to bypass release-plz and publish a release
-  # manually (e.g., release-plz workflow is broken), do it from a
-  # checkout of the release tag:
-  #
-  #   git checkout 0.X.0
-  #   cargo publish --allow-dirty
-  #
-  # The sed step above (`Stamp release version into Cargo.toml
-  # files`) is the safety net that bridges manual tags whose
-  # Cargo.toml wasn't pre-bumped by release-plz.
+  # `cargo publish --allow-dirty` because the validate step above
+  # seds Cargo.toml in the runner workspace; cargo treats that as
+  # a dirty tree even though the only edit is the version bump.
+  highflame-crate:
+    needs:
+      - highflame-validate
+      - highflame-artifact
+    permissions:
+      contents: 'read'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download version-stamped Cargo.toml files
+        # Picks up both `Cargo.toml` AND `common/Cargo.toml`
+        # produced by the validate job's sed step. Preserves the
+        # `common/` path because the upload-artifact step bundles
+        # them with paths.
+        uses: actions/download-artifact@v7
+        with:
+          name: cargo-toml
+
+      - name: Check Cargo.toml files
+        shell: bash
+        run: |-
+          echo "---root Cargo.toml---"
+          cat Cargo.toml
+          echo "---common/Cargo.toml---"
+          cat common/Cargo.toml
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install YARA (Ubuntu)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y yara libyara-dev
+
+      - name: Cache dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-publish-
+
+      - name: Publish ramparts-common to crates.io
+        # MUST run before the ramparts publish: the root crate's
+        # `Cargo.toml` declares `ramparts-common = { path = "common",
+        # version = "X.Y.Z" }`. `cargo publish` strips the `path`
+        # and ships only the `version` constraint, so when the
+        # `ramparts` publish hits crates.io's resolver it expects
+        # `ramparts-common@X.Y.Z` to be available.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |-
+          cd common
+          cargo publish --allow-dirty
+
+      - name: Wait for ramparts-common to be queryable
+        # crates.io's sparse-index update is usually fast but not
+        # instantaneous after a publish. Poll the package's
+        # `/api/v1/crates/ramparts-common/<version>` endpoint until
+        # it 200s (or fail after a minute). Without this, the
+        # `ramparts` publish below can fail with "could not find
+        # `ramparts-common` in registry" — a race condition.
+        shell: bash
+        run: |-
+          VERSION="$(grep -m 1 '^version' common/Cargo.toml | cut -d'"' -f2)"
+          echo "waiting for ramparts-common@${VERSION} to appear on crates.io..."
+          for i in $(seq 1 30); do
+            if curl -fsS "https://crates.io/api/v1/crates/ramparts-common/${VERSION}" >/dev/null 2>&1; then
+              echo "ramparts-common@${VERSION} is queryable after ${i} attempt(s)."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::ramparts-common@${VERSION} did not appear on crates.io after 60s."
+          exit 1
+
+      - name: Publish ramparts to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |-
+          cargo publish --allow-dirty
 
   highflame-trigger:
     needs:
       - reusable-vars
       - highflame-artifact
+      - highflame-crate
     permissions:
       contents: 'read'
       id-token: 'write'

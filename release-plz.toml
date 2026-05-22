@@ -1,55 +1,56 @@
 # release-plz configuration.
 #
-# We use release-plz in **full mode**: on every push to main, it
-# (a) opens / updates a release PR that bumps the workspace
-# Cargo.toml versions, and (b) when that PR has been merged, tags
-# the release, publishes the `ramparts` crate to crates.io, and
-# creates a DRAFT GitHub release with auto-generated commit-bullet
-# notes in the body.
+# **PR-only mode** (Mode 1 of the dual-mode release pipeline). On
+# every push to main, release-plz reads commits since the last
+# tag and, if any are `feat:` / `fix:` / `feat!:` /
+# `BREAKING CHANGE:`, opens (or updates) a release PR that bumps
+# `Cargo.toml`, `common/Cargo.toml`, and `Cargo.lock`. That's all
+# it does.
 #
-# The maintainer then polishes the draft release body — adding the
-# narrative themes, migration guide, what's-next — and clicks
-# "Publish release". That fires the GitHub `release: published`
-# event, which triggers `release.yml` to build the multi-arch
-# binaries + attach them + run the private downstream deploy
-# trigger.
+# release-plz does NOT:
+#   - publish to crates.io
+#   - create git tags
+#   - create GitHub releases
 #
-# Why drafts: hand-authored narrative beats commit-list bullets for
-# release notes, but it's nice to start from a complete bullet list
-# (so you don't accidentally forget a feature). Draft mode gives
-# the maintainer that starting point and a hold-and-edit window.
+# All of those belong to Mode 2: the maintainer creates a GitHub
+# release manually (typically at the merged-release-PR's commit,
+# matching the version release-plz proposed), which fires
+# `release.yml` — that workflow builds multi-arch binaries,
+# publishes ramparts-common + ramparts to crates.io, and triggers
+# the downstream private-repo deploy.
+#
+# Why split: hand-authored release notes beat commit-list bullets,
+# and the maintainer wants the discretion to ship a tagged release
+# at a time of their choosing (not the moment a release PR lands).
+# release-plz proposes; the maintainer disposes.
 
 [workspace]
 # Don't auto-open a release PR if there are no version-bumping
-# commits since the last tag.
+# commits since the last tag. Default behavior; explicit here for
+# clarity.
 release_always = false
 
 # Strip the `v` prefix from git tags — ramparts uses bare semver
-# (`0.8.0`, not `v0.8.0`) per the existing release.yml regex.
+# (`0.8.1`, not `v0.8.1`). `release.yml`'s regex enforces this
+# (`^[0-9]+\.[0-9]+\.[0-9]+$`).
 git_tag_name = "{{ version }}"
 
-# The release-PR title that shows up in the GitHub UI. Default would
-# read "chore: release v0.9.0" which doesn't pass Highflame's
-# commit-prefix check (only feat:/fix:/devops:/Merge/Revert are
-# allowed). Use `feat:` so the PR's merge commit passes CI.
+# The release-PR title that shows up in the GitHub UI. Highflame's
+# commit-prefix check only allows feat:/fix:/devops:/Merge/Revert,
+# so the default "chore: release v0.9.0" would fail CI on merge.
+# Use `feat:` so the PR's squash-merge commit passes the gate.
 pr_name = "feat: release {{ version }}"
 
-# Workspace-level changelog template. Even though we set
-# `changelog_update = false` per package (no `CHANGELOG.md` written
-# to disk), the same template populates the auto-generated release
-# body that lands in the draft GitHub release. Keeping it minimal:
-# group by Conventional Commits type, link each entry to its
-# commit. Maintainer adds narrative on top of these bullets when
-# polishing the draft.
+# Workspace-level changelog template. Used to populate the body of
+# the release PR (the bullet list of "what's in this release").
+# `changelog_update = false` per-package below keeps `CHANGELOG.md`
+# out of the repo — the same template content lives only in the
+# release PR description.
 [changelog]
 header = """# Changelog\n\n"""
 # Each bullet links to the commit via a literal
 # `https://github.com/<owner>/<repo>/commit/<sha>` URL — simpler
-# than defining a Tera macro for it. (An earlier draft of this
-# template used `{{ self::commit_link(commit=commit) }}` but the
-# `commit_link` macro was never defined — git-cliff has no such
-# built-in — so release-plz would have failed at render time the
-# first time a release PR tried to fire.)
+# than defining a Tera macro for it.
 body = """
 ## What changed in {{ version }}
 {% for group, commits in commits | group_by(attribute="group") %}
@@ -61,7 +62,7 @@ body = """
 """
 trim = true
 
-# Map Conventional Commits types -> sections in the release body.
+# Map Conventional Commits types -> sections in the release PR body.
 # Order matters: features first, then fixes, then everything else.
 # `devops:`, `Merge`, `Revert`, `build(deps)`, `[Snyk]`, `Bump`
 # (Highflame-conventional non-CC prefixes) get classified by their
@@ -78,40 +79,31 @@ commit_parsers = [
 
 [[package]]
 name = "ramparts"
-# The published crate. release-plz updates the version in
-# `Cargo.toml` AND publishes to crates.io as part of its `release`
-# command (full-mode flow).
+# `publish = true` tells release-plz "this is a publishable crate"
+# (i.e. include it in the release PR's version bump). It does NOT
+# trigger an actual `cargo publish` — release-plz's `release-pr`
+# command never touches the registry. crates.io publish happens
+# in `release.yml` (Mode 2) when the maintainer creates a release
+# in the GitHub UI.
 publish = true
 
-# Don't write a CHANGELOG.md file. The same changelog template
-# above still populates the auto-generated draft release body —
-# that's the user-facing surface we actually want.
+# Don't write a CHANGELOG.md file. The bullet content from the
+# `[changelog]` template above lives only in the release PR's
+# body — and from there the maintainer copies whatever they want
+# into the GitHub release notes when they cut the release.
 changelog_update = false
 
-# Create the GitHub release as a DRAFT. The maintainer polishes
-# the auto-generated bullet body (adds narrative themes, migration
-# guidance, what's-next) before publishing. Publishing fires
-# `release.yml` which builds + attaches the multi-arch binaries.
-git_release_draft = true
+# `git_release_*` settings are no-ops in PR-only mode (release-plz
+# doesn't create GitHub releases). Omitted for clarity.
 
 [[package]]
 name = "ramparts-common"
-# Published to crates.io alongside `ramparts` so downstream
-# `cargo install ramparts` can resolve the dependency. The root
-# crate's `[dependencies] ramparts-common = { path = "common",
-# version = "..." }` declares the required version; `cargo
-# publish` strips the `path` and ships only the `version`
-# constraint, which then must be findable on crates.io. Without
-# this, the next `ramparts` publish fails with
-# "dependency `ramparts-common` does not specify a version" (when
-# `version` is missing) or "could not find `ramparts-common` in
-# registry `crates.io`" (when `version` is set but the crate
-# isn't published). release-plz handles dependency ordering and
-# publishes `ramparts-common` first, then `ramparts`.
+# Workspace member that ships alongside `ramparts` (the root crate
+# depends on it via path + version). Marked `publish = true` so
+# release-plz bumps its version in the release PR — `cargo
+# publish` of either crate would fail if their versions diverge.
+# The actual crates.io publish happens in `release.yml`'s
+# highflame-crate job, which publishes ramparts-common BEFORE
+# ramparts (dep order).
 publish = true
 changelog_update = false
-
-# No GitHub release for the `common` package — the maintainer
-# polishes ONE release body (on the root crate) per cycle. Two
-# parallel drafts per release-plz PR would just be noise.
-git_release_enable = false
