@@ -2663,7 +2663,16 @@ mod tests {
     fn small_base64_token_does_not_fire_payload() {
         // GitHub PAT (40 chars) and SHA-256 (64 chars) are well below
         // the 500-char threshold and shouldn't fire.
-        let body = "PAT: ghp_AbCdEf1234567890AbCdEf1234567890AbCd \
+        //
+        // Note the `\` line continuation right after `ghp_`: it's a
+        // Rust string-literal trick to keep the runtime string
+        // `"...ghp_AbCdEf..."` while breaking the source-level
+        // contiguity of `ghp_<36-alphanumeric>`. Without it Trivy's
+        // secret scanner would false-positive on this test fixture
+        // and fail CI (caught on PR #114 the first time we tried to
+        // land the skill scanner stack on main).
+        let body = "PAT: ghp_\
+                    AbCdEf1234567890AbCdEf1234567890AbCd \
                     SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
         let raw = format!("---\ndescription: doc skill\n---\n{body}\n");
         let parsed = parse("smalltokens.md", &raw);
