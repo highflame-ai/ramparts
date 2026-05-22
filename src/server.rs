@@ -192,7 +192,7 @@ async fn health_check() -> Json<Value> {
         "status": "healthy",
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "service": "ramparts-server",
-        "version": "0.2.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "protocol_version": "2025-06-18"
     }))
 }
@@ -221,7 +221,7 @@ async fn protocol_info() -> Json<Value> {
             ]
         },
         "server": {
-            "version": "0.2.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "stdio_support": true,
             "mcp_compliance": "2025-06-18"
         }
@@ -231,7 +231,7 @@ async fn protocol_info() -> Json<Value> {
 async fn api_docs() -> Json<Value> {
     Json(json!({
         "service": "Ramparts Microservice",
-        "version": "0.2.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "protocol_version": "2025-06-18",
         "endpoints": {
             "GET /v1/ramparts/health": "Health check with protocol info",
