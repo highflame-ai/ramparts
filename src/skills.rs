@@ -3062,7 +3062,12 @@ mod tests {
         // burning fixture-test time on a needlessly large write.
         let chunk = "print(1)\n";
         let target_bytes = (MAX_SKILL_FILE_BYTES + 1024) as usize;
-        let repetitions = target_bytes.div_ceil(chunk.len());
+        // Hand-rolled ceil-division — `usize::div_ceil` is Rust 1.73+
+        // and the project's stated MSRV is 1.70. Clippy 1.84+ flags this
+        // pattern with `clippy::manual_div_ceil` and suggests `div_ceil`
+        // — a circular standoff with MSRV. Local allow keeps both happy.
+        #[allow(clippy::manual_div_ceil)]
+        let repetitions = (target_bytes + chunk.len() - 1) / chunk.len();
         let big: String = chunk.repeat(repetitions);
         std::fs::write(bundle.join("scripts/huge.py"), &big).unwrap();
         // Also include a normal-sized script — confirms the cap is
