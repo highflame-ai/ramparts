@@ -791,17 +791,29 @@ async fn handle_skills_scan_command(
                 // resource findings (a future caller might surface
                 // them through the same scratch) stay resource-typed
                 // and aren't silently absorbed.
+                // O(N) using `split_once` to extract the bundle name
+                // in one pass and a single HashSet lookup, rather than
+                // the previous O(N x M) where M was the number of
+                // bundle names. Synthetic resource names are always
+                // shaped `<bundle>/<subdir>/<file>` (see
+                // `skills::walk_bundle_subdir`), so the slash is
+                // guaranteed if the finding came from a bundle.
+                //
+                // The rewrite target stays `"prompt"` (NOT `"member"`).
+                // `target_type` is a 3-value enum in `types.rs:37`
+                // (`tool` / `prompt` / `resource`), and the renderers
+                // in `utils.rs:200,806,882` filter on `"prompt"` to
+                // pick up skill findings — rewriting to anything else
+                // would make these findings invisible in terminal /
+                // JSON / markdown report output.
                 for finding in scan_data.yara_results.iter_mut() {
                     if finding.target_type != "resource" {
                         continue;
                     }
-                    let from_bundle = bundle_prompt_names.iter().any(|name| {
-                        finding
-                            .target_name
-                            .strip_prefix(name.as_str())
-                            .is_some_and(|rest| rest.starts_with('/'))
-                    });
-                    if from_bundle {
+                    let Some((bundle_name, _)) = finding.target_name.split_once('/') else {
+                        continue;
+                    };
+                    if bundle_prompt_names.contains(bundle_name) {
                         finding.target_type = "prompt".to_string();
                     }
                 }
