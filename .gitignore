@@ -18,8 +18,17 @@ docs/proxy/*TEST*_RESULTS*.md
 **/*.rs.bk
 *.pdb
 
-# Cargo
-Cargo.lock
+# Cargo. `Cargo.lock` is INTENTIONALLY committed: ramparts ships as a
+# binary crate (and a workspace with a binary at root + path-only
+# `ramparts-common`), and applications/binaries should commit the lock
+# file for reproducible builds + accurate dependency advisories. Only
+# library-only crates should gitignore `Cargo.lock`.
+#
+# Listing both `Cargo.lock` here AND committing it causes release-plz
+# to abort with "Cargo.lock is present in your .gitignore and is also
+# committed" — so we drop the .gitignore entry to be consistent with
+# what's actually in the repo. (.cargo/ stays gitignored because it's
+# the per-user config directory, not the workspace lockfile.)
 .cargo
 
 # IDE files

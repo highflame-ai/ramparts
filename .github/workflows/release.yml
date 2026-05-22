@@ -314,8 +314,14 @@ jobs:
           client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
           private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          # `repositories:` is a newline-separated list of bare repo
+          # specs, NOT a YAML list — a leading `- ` makes the action
+          # parse it as part of the value (it then complains:
+          # "owner '- highflame-ai' doesn't match resolved owner
+          # 'highflame-ai'"). Fixed post-#114 merge in
+          # devops/fix-release-pipeline.
           repositories: |
-            - ${{ github.repository }}
+            ${{ github.repository }}
 
       - name: Upload release assets
         uses: actions/upload-release-asset@v1
@@ -382,9 +388,12 @@ jobs:
           client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
           private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          # Newline-separated bare repo specs (NO leading `- `, despite
+          # YAML appearances). Same bug + fix as the other app-token
+          # block above.
           repositories: |
-            - ${{ github.repository }}
-            - ${{ env.DEVOPS_REPO }}
+            ${{ github.repository }}
+            ${{ env.DEVOPS_REPO }}
 
       - name: Trigger private repo workflow
         env:
