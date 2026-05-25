@@ -1,4 +1,4 @@
-name: Release Build - Ramparts and Highflame Ramparts Server
+name: Release Build - Ramparts
 
 on:
   release:
@@ -10,10 +10,6 @@ env:
   RELEASE_BRANCH: "main"
   REGEX_PATTERN: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
   RELEASE_NAME: ${{ github.event.release.name }}
-  DEVOPS_REPO: "highflame-cloud"
-  DEVOPS_BRANCH: "main"
-  RELEASE_TRIGGER: "enable"
-  RELEASE_WORKFLOW: "trigger-release-deploy-ramparts-server.yml"
 
 jobs:
   reusable-vars:
@@ -372,46 +368,3 @@ jobs:
   # The sed step above (`Stamp release version into Cargo.toml
   # files`) is the safety net that bridges manual tags whose
   # Cargo.toml wasn't pre-bumped by release-plz.
-
-  highflame-trigger:
-    needs:
-      - reusable-vars
-      - highflame-artifact
-    permissions:
-      contents: 'read'
-      id-token: 'write'
-    runs-on: ubuntu-24.04
-    if: (needs.reusable-vars.outputs.RELEASE_TRIGGER == 'enable')
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Install GitHub CLI
-        run: sudo apt install gh -y
-
-      - name: Create APP token
-        uses: actions/create-github-app-token@v3
-        id: token
-        with:
-          # `app-id` (deprecated) kept on purpose — see the other
-          # app-token block above for the rationale.
-          app-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
-          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          # Newline-separated BARE repo names (not YAML list, not
-          # `owner/repo`). Same constraint as the other app-token
-          # block above. `DEVOPS_REPO` is already bare; use
-          # `github.event.repository.name` for the current repo.
-          repositories: |
-            ${{ github.event.repository.name }}
-            ${{ env.DEVOPS_REPO }}
-
-      - name: Trigger private repo workflow
-        env:
-          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
-        run: |
-          gh workflow run ${{ env.RELEASE_WORKFLOW }} \
-            --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \
-            --ref ${{ env.DEVOPS_BRANCH }} -f RELEASE_TAG=${{ env.RELEASE_NAME }}
