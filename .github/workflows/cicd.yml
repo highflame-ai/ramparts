@@ -1,10 +1,9 @@
 name: CICD Build - Highflame Ramparts Server
 
-on: 
+on:
   push:
     branches:
       - "main"
-      - "devops-trigger"
     paths-ignore:
       - "**/*CHANGELOG.md"
       - "*CHANGELOG.md"
