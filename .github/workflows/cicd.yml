@@ -1,6 +1,6 @@
 name: CICD Build - Highflame Ramparts Server
 
-on:
+on: 
   push:
     branches:
       - "main"
