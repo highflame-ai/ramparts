@@ -15,7 +15,7 @@ concurrency:
 
 env:
   DEVOPS_REPO: "highflame-cloud"
-  DEVOPS_BRANCH: "main"
+  DEVOPS_BRANCH: "devops-trigger"
   CICD_TRIGGER: "enable"
   CICD_WORKFLOW: "trigger-cicd-deploy-ramparts-server.yml"
 
@@ -54,9 +54,6 @@ jobs:
           client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
           private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: |
-            - ramparts
-            - ${{ env.DEVOPS_REPO }}
 
       - name: Trigger private repo workflow
         env:
