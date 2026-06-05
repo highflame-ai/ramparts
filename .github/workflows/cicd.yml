@@ -55,7 +55,7 @@ jobs:
           private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: |
-            - ${{ github.repository }}
+            - ramparts
             - ${{ env.DEVOPS_REPO }}
 
       - name: Trigger private repo workflow
