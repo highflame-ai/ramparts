@@ -1032,8 +1032,7 @@ impl MCPScanner {
         result.tools.clone_from(&scan_data.tools);
         result.resources.clone_from(&scan_data.resources);
         result.prompts.clone_from(&scan_data.prompts);
-        result.yara_results.clone_from(&scan_data.yara_results);
-        result.errors.extend(scan_data.fetch_errors.clone());
+        result.errors.append(&mut scan_data.fetch_errors);
 
         // Load scanner configuration — fall back to defaults if missing,
         // matching `scan_single`'s behaviour.
@@ -1052,6 +1051,7 @@ impl MCPScanner {
             // batching logic scan_single uses — kept in one place so the
             // two paths produce identical prompts for the same inputs.
             result.llm_prompts = Some(Self::build_llm_prompts(&scan_data, &scanner_config));
+            result.yara_results = std::mem::take(&mut scan_data.yara_results);
         } else {
             // Real security analysis: YARA + LLM batches across tools,
             // prompts, and resources.
@@ -1103,9 +1103,9 @@ impl MCPScanner {
 
             // === POST-SCAN HOOKS ===
             self.middleware_chain.run_post_scan(&mut scan_data);
-            // Middleware may have appended new yara hits — refresh the
-            // result snapshot.
-            result.yara_results.clone_from(&scan_data.yara_results);
+            // Middleware may have appended new yara hits — move into
+            // result (no clone needed, scan_data is not used after this).
+            result.yara_results = std::mem::take(&mut scan_data.yara_results);
         }
 
         result.response_time_ms = timer.elapsed_ms();
@@ -1120,6 +1120,7 @@ impl MCPScanner {
     fn build_llm_prompts(scan_data: &ScanData, scanner_config: &ScannerConfig) -> Vec<LlmPrompt> {
         let mut prompts: Vec<LlmPrompt> = Vec::new();
         let batch_size = scanner_config.scanner.llm_batch_size as usize;
+        let security_scanner = SecurityScanner::with_config(scanner_config.clone());
 
         if !scan_data.tools.is_empty() {
             for (batch_index, chunk) in scan_data.tools.chunks(batch_size).enumerate() {
@@ -1130,9 +1131,8 @@ impl MCPScanner {
                     .collect::<String>();
                 let prompt_text = SecurityScanner::create_tools_analysis_prompt(&tools_info);
                 let item_names = chunk.iter().map(|t| t.name.clone()).collect();
-                let request_body = SecurityScanner::with_config(scanner_config.clone())
-                    .build_llm_request_body(&prompt_text);
-                let endpoint = SecurityScanner::with_config(scanner_config.clone()).get_endpoint();
+                let request_body = security_scanner.build_llm_request_body(&prompt_text);
+                let endpoint = security_scanner.get_endpoint();
                 prompts.push(LlmPrompt {
                     target_type: "tool".to_string(),
                     batch_index,
@@ -1152,9 +1152,8 @@ impl MCPScanner {
                     .collect::<String>();
                 let prompt_text = SecurityScanner::create_prompts_analysis_prompt(&prompts_info);
                 let item_names = chunk.iter().map(|p| p.name.clone()).collect();
-                let request_body = SecurityScanner::with_config(scanner_config.clone())
-                    .build_llm_request_body(&prompt_text);
-                let endpoint = SecurityScanner::with_config(scanner_config.clone()).get_endpoint();
+                let request_body = security_scanner.build_llm_request_body(&prompt_text);
+                let endpoint = security_scanner.get_endpoint();
                 prompts.push(LlmPrompt {
                     target_type: "prompt".to_string(),
                     batch_index,
@@ -1175,9 +1174,8 @@ impl MCPScanner {
                 let prompt_text =
                     SecurityScanner::create_resources_analysis_prompt(&resources_info);
                 let item_names = chunk.iter().map(|r| r.name.clone()).collect();
-                let request_body = SecurityScanner::with_config(scanner_config.clone())
-                    .build_llm_request_body(&prompt_text);
-                let endpoint = SecurityScanner::with_config(scanner_config.clone()).get_endpoint();
+                let request_body = security_scanner.build_llm_request_body(&prompt_text);
+                let endpoint = security_scanner.get_endpoint();
                 prompts.push(LlmPrompt {
                     target_type: "resource".to_string(),
                     batch_index,
