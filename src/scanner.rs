@@ -994,6 +994,203 @@ impl MCPScanner {
         })
     }
 
+    /// Run the security-analysis pipeline against pre-fetched MCP data.
+    ///
+    /// This is the analyze half of `scan_single`, factored out so callers
+    /// can drive it directly with data they fetched themselves — useful
+    /// when the live MCP server requires upstream credentials the scanner
+    /// process doesn't have but the caller does. The HTTP server exposes
+    /// this path via `POST /v1/ramparts/analyze`.
+    ///
+    /// The function runs every analysis stage `scan_single` runs:
+    ///   - pre-scan middleware hooks (mutate scan_data; cross-origin
+    ///     analysis, etc.)
+    ///   - scanner-config load (falls through to defaults if absent)
+    ///   - `return_prompts` branch (build LLM prompts and return without
+    ///     calling the LLM) OR the security-scan branch (YARA + LLM
+    ///     analysis on tools/prompts/resources)
+    ///   - post-scan middleware hooks
+    ///
+    /// `url` is recorded on the result for downstream identification only —
+    /// no network call is made with it. Pass an empty string when the
+    /// caller has no URL context (e.g. analyzing tool definitions stored
+    /// in a database).
+    pub async fn analyze_scan_data(
+        &self,
+        url: &str,
+        mut scan_data: ScanData,
+        options: &ScanOptions,
+    ) -> Result<ScanResult> {
+        let timer = Timer::start();
+        let mut result = ScanResult::new(url.to_string());
+
+        // === PRE-SCAN HOOKS ===
+        self.middleware_chain.run_pre_scan(&mut scan_data);
+
+        result.status = ScanStatus::Success;
+        result.server_info.clone_from(&scan_data.server_info);
+        result.tools.clone_from(&scan_data.tools);
+        result.resources.clone_from(&scan_data.resources);
+        result.prompts.clone_from(&scan_data.prompts);
+        result.yara_results.clone_from(&scan_data.yara_results);
+        result.errors.extend(scan_data.fetch_errors.clone());
+
+        // Load scanner configuration — fall back to defaults if missing,
+        // matching `scan_single`'s behaviour.
+        let config_manager = crate::config::ScannerConfigManager::new();
+        let scanner_config = match config_manager.load_config() {
+            Ok(config) => config,
+            Err(e) => {
+                warn!("Failed to load scanner config, using defaults: {}", e);
+                result.errors.push(format!("Config loading failed: {e}"));
+                ScannerConfig::default()
+            }
+        };
+
+        if options.return_prompts {
+            // Build LLM prompts without actually calling the LLM. Same
+            // batching logic scan_single uses — kept in one place so the
+            // two paths produce identical prompts for the same inputs.
+            result.llm_prompts = Some(Self::build_llm_prompts(&scan_data, &scanner_config));
+        } else {
+            // Real security analysis: YARA + LLM batches across tools,
+            // prompts, and resources.
+            let security_scanner = if scanner_config.security.enabled {
+                SecurityScanner::with_config(scanner_config)
+            } else {
+                SecurityScanner::default()
+            };
+            let mut security_result = SecurityScanResult::new();
+
+            match security_scanner
+                .scan_tools_batch(&scan_data.tools, options.detailed)
+                .await
+            {
+                Ok((tool_issues, analysis_details)) => {
+                    security_result.add_tool_issues(tool_issues);
+                    for (tool_name, details) in analysis_details {
+                        security_result.add_tool_analysis_details(tool_name, details);
+                    }
+                }
+                Err(e) => warn!("Failed to batch scan tools for security issues: {}", e),
+            }
+
+            if !scan_data.prompts.is_empty() {
+                match security_scanner
+                    .scan_prompts_batch(&scan_data.prompts, options.detailed)
+                    .await
+                {
+                    Ok(prompt_issues) => security_result.add_prompt_issues(prompt_issues),
+                    Err(e) => {
+                        warn!("Failed to batch scan prompts for security issues: {}", e)
+                    }
+                }
+            }
+
+            if !scan_data.resources.is_empty() {
+                match security_scanner
+                    .scan_resources_batch(&scan_data.resources, options.detailed)
+                    .await
+                {
+                    Ok(resource_issues) => security_result.add_resource_issues(resource_issues),
+                    Err(e) => {
+                        warn!("Failed to batch scan resources for security issues: {}", e);
+                    }
+                }
+            }
+
+            result.security_issues = Some(security_result);
+
+            // === POST-SCAN HOOKS ===
+            self.middleware_chain.run_post_scan(&mut scan_data);
+            // Middleware may have appended new yara hits — refresh the
+            // result snapshot.
+            result.yara_results.clone_from(&scan_data.yara_results);
+        }
+
+        result.response_time_ms = timer.elapsed_ms();
+        debug!("Analysis completed in {}ms", result.response_time_ms);
+        Ok(result)
+    }
+
+    /// Build the LLM prompts the security scanner would normally send. Used
+    /// by both `scan_single` and `analyze_scan_data` when `return_prompts`
+    /// is set — extracted so the two paths stay byte-for-byte identical for
+    /// the same inputs.
+    fn build_llm_prompts(scan_data: &ScanData, scanner_config: &ScannerConfig) -> Vec<LlmPrompt> {
+        let mut prompts: Vec<LlmPrompt> = Vec::new();
+        let batch_size = scanner_config.scanner.llm_batch_size as usize;
+
+        if !scan_data.tools.is_empty() {
+            for (batch_index, chunk) in scan_data.tools.chunks(batch_size).enumerate() {
+                let tools_info = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tool)| tool.format_for_analysis(i))
+                    .collect::<String>();
+                let prompt_text = SecurityScanner::create_tools_analysis_prompt(&tools_info);
+                let item_names = chunk.iter().map(|t| t.name.clone()).collect();
+                let request_body = SecurityScanner::with_config(scanner_config.clone())
+                    .build_llm_request_body(&prompt_text);
+                let endpoint = SecurityScanner::with_config(scanner_config.clone()).get_endpoint();
+                prompts.push(LlmPrompt {
+                    target_type: "tool".to_string(),
+                    batch_index,
+                    prompt: prompt_text,
+                    request_body: Some(request_body),
+                    endpoint,
+                    item_names,
+                });
+            }
+        }
+        if !scan_data.prompts.is_empty() {
+            for (batch_index, chunk) in scan_data.prompts.chunks(batch_size).enumerate() {
+                let prompts_info = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| p.format_for_analysis(i))
+                    .collect::<String>();
+                let prompt_text = SecurityScanner::create_prompts_analysis_prompt(&prompts_info);
+                let item_names = chunk.iter().map(|p| p.name.clone()).collect();
+                let request_body = SecurityScanner::with_config(scanner_config.clone())
+                    .build_llm_request_body(&prompt_text);
+                let endpoint = SecurityScanner::with_config(scanner_config.clone()).get_endpoint();
+                prompts.push(LlmPrompt {
+                    target_type: "prompt".to_string(),
+                    batch_index,
+                    prompt: prompt_text,
+                    request_body: Some(request_body),
+                    endpoint,
+                    item_names,
+                });
+            }
+        }
+        if !scan_data.resources.is_empty() {
+            for (batch_index, chunk) in scan_data.resources.chunks(batch_size).enumerate() {
+                let resources_info = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| r.format_for_analysis(i))
+                    .collect::<String>();
+                let prompt_text =
+                    SecurityScanner::create_resources_analysis_prompt(&resources_info);
+                let item_names = chunk.iter().map(|r| r.name.clone()).collect();
+                let request_body = SecurityScanner::with_config(scanner_config.clone())
+                    .build_llm_request_body(&prompt_text);
+                let endpoint = SecurityScanner::with_config(scanner_config.clone()).get_endpoint();
+                prompts.push(LlmPrompt {
+                    target_type: "resource".to_string(),
+                    batch_index,
+                    prompt: prompt_text,
+                    request_body: Some(request_body),
+                    endpoint,
+                    item_names,
+                });
+            }
+        }
+        prompts
+    }
+
     /// Scan a single MCP server
     pub async fn scan_single(&self, url: &str, options: ScanOptions) -> Result<ScanResult> {
         let scan_timer = Timer::start();
@@ -2202,27 +2399,37 @@ impl Clone for MCPScanner {
     }
 }
 
-// Scan data
-pub(crate) struct ScanData {
+/// Intermediate data produced by the MCP probe step before analysis runs.
+///
+/// Made `pub` (was `pub(crate)`) and serializable so external callers can
+/// drive the analyze-only path via `POST /v1/ramparts/analyze`:
+/// they hand us this struct (typically obtained by their own listing of
+/// the upstream MCP server) and we run the same security analysis stages
+/// the live-scan path uses.
+///
+/// `#[serde(default)]` keeps the JSON wire format forgiving: clients may
+/// omit any collection or `server_info` and the corresponding field
+/// defaults to empty / None.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScanData {
+    #[serde(default)]
     pub server_info: Option<MCPServerInfo>,
+    #[serde(default)]
     pub tools: Vec<MCPTool>,
+    #[serde(default)]
     pub resources: Vec<MCPResource>,
+    #[serde(default)]
     pub prompts: Vec<MCPPrompt>,
+    #[serde(default)]
     pub yara_results: Vec<YaraScanResult>,
+    #[serde(default)]
     pub fetch_errors: Vec<String>,
 }
 
 // Scan data implementation
 impl ScanData {
     pub fn new() -> Self {
-        Self {
-            server_info: None,
-            tools: Vec::new(),
-            resources: Vec::new(),
-            prompts: Vec::new(),
-            yara_results: Vec::new(),
-            fetch_errors: Vec::new(),
-        }
+        Self::default()
     }
 }
 

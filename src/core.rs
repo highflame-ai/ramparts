@@ -1,5 +1,5 @@
 use crate::config::{ScannerConfig, ScannerConfigManager};
-use crate::scanner::MCPScanner;
+use crate::scanner::{MCPScanner, ScanData};
 
 use crate::types::{config_utils, MCPTool, ScanConfigBuilder, ScanOptions, ScanResult};
 use anyhow::{anyhow, Result};
@@ -41,6 +41,37 @@ pub struct ScanRequest {
 
     // 🆕 Simplified change detection
     pub reference_url: Option<String>,
+}
+
+/// Request body for the analyze-only path (`POST /v1/ramparts/analyze`).
+///
+/// Bypasses the MCP probe step entirely — the caller provides everything
+/// the analysis pipeline needs (tools, resources, prompts, server_info).
+/// Use this when:
+///   - the caller already has fresh MCP data (e.g. fetched via a gateway
+///     that holds upstream credentials the scanner process doesn't have),
+///   - the caller wants reproducible analysis over stored / archived data,
+///   - or the upstream MCP server is unreachable but you have a snapshot.
+///
+/// `url` is recorded on the result for identification only — no network
+/// call is made with it. `scan_data.fetch_errors` is preserved into the
+/// result so callers can surface upstream-probe issues their own fetch
+/// step encountered.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AnalyzeRequest {
+    /// Recorded as `ScanResult.url` for identification. Empty string is
+    /// allowed when the caller has no URL context.
+    #[serde(default)]
+    pub url: String,
+    /// Pre-fetched MCP server state. Every field has a `#[serde(default)]`
+    /// so callers can omit anything they don't have (e.g. `prompts: []`).
+    pub scan_data: ScanData,
+    pub timeout: Option<u64>,
+    pub detailed: Option<bool>,
+    pub format: Option<String>,
+    /// If true, return the LLM prompts the scanner would send instead of
+    /// calling the LLM. Same semantics as `ScanRequest.return_prompts`.
+    pub return_prompts: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +377,70 @@ impl MCPScannerCore {
         // Perform scan
         let result = self.scanner.scan_single(&request.url, scan_options).await?;
         Ok(result)
+    }
+
+    /// Run security analysis against caller-supplied MCP data.
+    ///
+    /// Wraps `MCPScanner::analyze_scan_data` with the same envelope and
+    /// option-parsing patterns the live `scan` path uses, so callers can
+    /// pick either entry point without learning two sets of conventions.
+    /// The `ScanResponse` envelope is identical in shape — `result` holds
+    /// the analyzed `ScanResult`, the change-detection fields are always
+    /// false (no reference comparison is possible on a stateless call).
+    pub async fn analyze(&self, request: AnalyzeRequest) -> ScanResponse {
+        let timestamp = chrono::Utc::now().to_rfc3339();
+
+        // Build options from the request — same defaults the scan path
+        // uses so the analysis behaviour is identical for equivalent
+        // inputs. `http_timeout`, `auth_headers`, and `reference_url`
+        // are intentionally absent: the analyze path makes no HTTP
+        // calls and has no upstream to compare against.
+        let scanner_config = self.config_manager.load_config().unwrap_or_default();
+        let options = ScanConfigBuilder::new()
+            .timeout(
+                request
+                    .timeout
+                    .unwrap_or(scanner_config.scanner.scan_timeout),
+            )
+            .http_timeout(scanner_config.scanner.http_timeout)
+            .detailed(request.detailed.unwrap_or(scanner_config.scanner.detailed))
+            .format(
+                request
+                    .format
+                    .clone()
+                    .unwrap_or(scanner_config.scanner.format),
+            )
+            .return_prompts(request.return_prompts.unwrap_or(false))
+            .build();
+
+        match self
+            .scanner
+            .analyze_scan_data(&request.url, request.scan_data, &options)
+            .await
+        {
+            Ok(result) => ScanResponse {
+                success: true,
+                result: Some(result),
+                error: None,
+                timestamp,
+                refresh_happened: false,
+                changes_detected: false,
+                change_summary: None,
+                scan_skipped: false,
+                cache_hit: false,
+            },
+            Err(e) => ScanResponse {
+                success: false,
+                result: None,
+                error: Some(e.to_string()),
+                timestamp,
+                refresh_happened: false,
+                changes_detected: false,
+                change_summary: None,
+                scan_skipped: false,
+                cache_hit: false,
+            },
+        }
     }
 
     /// Validate scan configuration

@@ -1,7 +1,7 @@
 use crate::core::{
-    BatchScanRequest, BatchScanResponse, ListRegisteredServersResponse, MCPScannerCore,
-    RefreshToolsRequest, RefreshToolsResponse, RegisterServerRequest, RegisterServerResponse,
-    ScanRequest, ScanResponse, ValidationResponse,
+    AnalyzeRequest, BatchScanRequest, BatchScanResponse, ListRegisteredServersResponse,
+    MCPScannerCore, RefreshToolsRequest, RefreshToolsResponse, RegisterServerRequest,
+    RegisterServerResponse, ScanRequest, ScanResponse, ValidationResponse,
 };
 use axum::{
     extract::State,
@@ -79,10 +79,17 @@ impl MCPScannerServer {
 
         // Create router with routes
         let app = Router::new()
+            // Root-level k8s probe endpoints (platform convention).
+            // Dependency-free so the pod reports ready as soon as the
+            // listener is up.
+            .route("/health", get(probe_ok))
+            .route("/healthz", get(probe_ok))
+            .route("/livez", get(probe_ok))
             .route("/v1/ramparts/", get(api_docs))
             .route("/v1/ramparts/health", get(health_check))
             .route("/v1/ramparts/protocol", get(protocol_info))
             .route("/v1/ramparts/scan", post(scan_endpoint))
+            .route("/v1/ramparts/analyze", post(analyze_endpoint))
             .route("/v1/ramparts/validate", post(validate_endpoint))
             .route("/v1/ramparts/batch-scan", post(batch_scan_endpoint))
             .route("/v1/ramparts/refresh-tools", post(refresh_tools_endpoint))
@@ -187,6 +194,16 @@ fn extract_and_add_api_key(
     }
 }
 
+/// Kubernetes liveness/readiness probe handler. Serves /health, /healthz,
+/// and /livez — intentionally minimal (no upstream checks) so probe results
+/// reflect only whether the HTTP listener is alive.
+async fn probe_ok() -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "service": "ramparts-server"
+    }))
+}
+
 async fn health_check() -> Json<Value> {
     Json(json!({
         "status": "healthy",
@@ -234,9 +251,11 @@ async fn api_docs() -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol_version": "2025-06-18",
         "endpoints": {
+            "GET /health | /healthz | /livez": "Kubernetes liveness/readiness probes",
             "GET /v1/ramparts/health": "Health check with protocol info",
             "GET /v1/ramparts/protocol": "MCP protocol information",
-            "POST /v1/ramparts/scan": "Scan a single MCP server",
+            "POST /v1/ramparts/scan": "Scan a single MCP server (live probe + analysis)",
+            "POST /v1/ramparts/analyze": "Analyze pre-fetched MCP data without making any upstream calls",
             "POST /v1/ramparts/validate": "Validate scan configuration",
             "POST /v1/ramparts/batch-scan": "Scan multiple MCP servers",
             "POST /v1/ramparts/refresh-tools": "Refresh tool descriptions from MCP servers",
@@ -276,6 +295,24 @@ async fn api_docs() -> Json<Value> {
                 "detailed": true,
                 "format": "json",
                 "auth_headers": { "Authorization": "Bearer token" }
+            },
+            "POST /v1/ramparts/analyze": {
+                "url": "http://localhost:3000",
+                "format": "json",
+                "scan_data": {
+                    "server_info": null,
+                    "tools": [
+                        {
+                            "name": "run_command",
+                            "description": "Execute a shell command",
+                            "input_schema": {}
+                        }
+                    ],
+                    "resources": [],
+                    "prompts": [],
+                    "yara_results": [],
+                    "fetch_errors": []
+                }
             },
             "STDIO Example": {
                 "url": "stdio:///usr/local/bin/mcp-server",
@@ -344,6 +381,63 @@ async fn scan_endpoint(
     } else {
         error!(
             "Scan failed: {}",
+            response
+                .error
+                .as_ref()
+                .unwrap_or(&"Unknown error".to_string())
+        );
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": response.error,
+                "timestamp": response.timestamp
+            })),
+        ))
+    }
+}
+
+/// Analyze endpoint — runs security analysis against caller-supplied MCP
+/// data, skipping the live MCP probe step entirely. Use when the live
+/// server is unreachable to the scanner process (e.g. it lives behind a
+/// gateway that holds the auth) but the caller already has the data.
+///
+/// Mirrors `scan_endpoint`'s response contract — same `ScanResponse`
+/// envelope shape, same 400-on-failure pattern — so clients can switch
+/// between the two paths without learning two error formats.
+async fn analyze_endpoint(
+    State(state): State<ServerState>,
+    Json(request): Json<AnalyzeRequest>,
+) -> Result<Json<ScanResponse>, (StatusCode, Json<Value>)> {
+    // Validate timeout (same range as /scan — 1..=3600 seconds).
+    if let Some(timeout) = request.timeout {
+        if timeout == 0 || timeout > 3600 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "error": "Timeout must be between 1 and 3600 seconds",
+                    "timestamp": chrono::Utc::now().to_rfc3339()
+                })),
+            ));
+        }
+    }
+
+    debug!(
+        "Received analyze request — url={:?} tools={} resources={} prompts={}",
+        request.url,
+        request.scan_data.tools.len(),
+        request.scan_data.resources.len(),
+        request.scan_data.prompts.len()
+    );
+
+    let response = state.core.analyze(request).await;
+
+    if response.success {
+        Ok(Json(response))
+    } else {
+        error!(
+            "Analyze failed: {}",
             response
                 .error
                 .as_ref()
