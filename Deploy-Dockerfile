@@ -10,6 +10,7 @@ COPY rules /app/rules
 COPY config.yaml /app/
 
 RUN apt-get update \
+    && apt-get install -y ca-certificates \
     && groupadd -g ${APP_ID} ${APP_USER} \
     && useradd -u ${APP_ID} -g ${APP_USER} -m -s /bin/bash ${APP_USER} \
     && chown -R ${APP_USER}:${APP_USER} /app
