@@ -136,7 +136,9 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
 
         // cryptominers.yar — embedded mining payloads. The skill/tool is
         // doing something other than what it claims (tool poisoning).
-        "CryptoStratumProtocol" | "CryptoMiningPools" | "CryptoMinerSoftware"
+        "CryptoStratumProtocol"
+        | "CryptoMiningPools"
+        | "CryptoMinerSoftware"
         | "CryptoCoinjacking" => vec![OwaspTag::new("MCP02")],
 
         // malware.yar — classic malware behavior embedded in skill/tool
@@ -151,8 +153,12 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         "InfoStealer" => vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")],
 
         // webshells.yar — remote command-execution backdoors.
-        "PHPWebshellGeneric" | "PHPWebshellObfuscated" | "PHPWebshellKnown" | "PythonWebshell"
-        | "JSPWebshell" | "ASPXWebshell" => {
+        "PHPWebshellGeneric"
+        | "PHPWebshellObfuscated"
+        | "PHPWebshellKnown"
+        | "PythonWebshell"
+        | "JSPWebshell"
+        | "ASPXWebshell" => {
             vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP07")]
         }
 
