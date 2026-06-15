@@ -199,6 +199,13 @@ jobs:
             arch: x86_64
           - target: macOS-15
             arch: aarch64
+          # GitHub-hosted native arm64 runners (free for public repos).
+          # Building natively avoids cross-compiling the YARA C dep for
+          # aarch64 — the OS-keyed YARA/build steps below work unchanged.
+          - target: ubuntu-24.04-arm
+            arch: aarch64
+          - target: windows-11-arm
+            arch: aarch64
     runs-on: ${{ matrix.target }}
     steps:
       - name: Checkout code
@@ -236,6 +243,14 @@ jobs:
             echo "crate_target=aarch64-apple-darwin" >> ${GITHUB_OUTPUT}
             echo "crate_release=ramparts-macos-aarch64" >> ${GITHUB_OUTPUT}
             echo "crate_ext=" >> ${GITHUB_OUTPUT}
+          elif [[ ${{ matrix.target }} == "ubuntu-24.04-arm" && ${{ matrix.arch }} == "aarch64" ]] ; then
+            echo "crate_target=aarch64-unknown-linux-gnu" >> ${GITHUB_OUTPUT}
+            echo "crate_release=ramparts-linux-aarch64" >> ${GITHUB_OUTPUT}
+            echo "crate_ext=" >> ${GITHUB_OUTPUT}
+          elif [[ ${{ matrix.target }} == "windows-11-arm" && ${{ matrix.arch }} == "aarch64" ]] ; then
+            echo "crate_target=aarch64-pc-windows-msvc" >> ${GITHUB_OUTPUT}
+            echo "crate_release=ramparts-windows-aarch64.exe" >> ${GITHUB_OUTPUT}
+            echo "crate_ext=.exe" >> ${GITHUB_OUTPUT}
           else
             echo "Not matching the target...!"
             exit 1
