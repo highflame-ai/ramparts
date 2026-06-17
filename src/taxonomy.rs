@@ -134,6 +134,42 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
             vec![OwaspTag::new("MCP03"), OwaspTag::new("MCP04")]
         }
 
+        // cryptominers.yar — embedded mining payloads. The skill/tool is
+        // doing something other than what it claims (tool poisoning).
+        "CryptoStratumProtocol"
+        | "CryptoMiningPools"
+        | "CryptoMinerSoftware"
+        | "CryptoCoinjacking" => vec![OwaspTag::new("MCP02")],
+
+        // malware.yar — classic malware behavior embedded in skill/tool
+        // content (ported from NVIDIA SkillSpector / signature-base).
+        "ReverseShell" | "C2FrameworkIndicators" => {
+            vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP07")]
+        }
+        "BackdoorPersistence" | "RansomwareBehavior" => {
+            vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")]
+        }
+        "KeyloggerIndicators" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP09")],
+        "InfoStealer" => vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")],
+
+        // webshells.yar — remote command-execution backdoors.
+        "PHPWebshellGeneric"
+        | "PHPWebshellObfuscated"
+        | "PHPWebshellKnown"
+        | "PythonWebshell"
+        | "JSPWebshell"
+        | "ASPXWebshell" => {
+            vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP07")]
+        }
+
+        // hacktools.yar — offensive tooling, recon, and exploit
+        // frameworks a legitimate skill should not invoke.
+        "OffensiveToolReferences" | "NetworkReconnaissance" | "ExploitFramework" => {
+            vec![OwaspTag::new("MCP02")]
+        }
+        "PrivilegeEscalationTools" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
+        "PhishingKit" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP06")],
+
         // Synthetic findings emitted by the skill parser (src/skills.rs)
         // for structural risks the YARA passes can't see (frontmatter
         // grants, missing triggers, network-egress tool grants).
@@ -210,6 +246,31 @@ mod tests {
             "SkillCredentialHarvesting",
             "SkillToolChainingExfiltration",
             "SkillSystemManipulation",
+            // cryptominers.yar
+            "CryptoStratumProtocol",
+            "CryptoMiningPools",
+            "CryptoMinerSoftware",
+            "CryptoCoinjacking",
+            // malware.yar
+            "ReverseShell",
+            "BackdoorPersistence",
+            "KeyloggerIndicators",
+            "RansomwareBehavior",
+            "C2FrameworkIndicators",
+            "InfoStealer",
+            // webshells.yar
+            "PHPWebshellGeneric",
+            "PHPWebshellObfuscated",
+            "PHPWebshellKnown",
+            "PythonWebshell",
+            "JSPWebshell",
+            "ASPXWebshell",
+            // hacktools.yar
+            "OffensiveToolReferences",
+            "NetworkReconnaissance",
+            "PrivilegeEscalationTools",
+            "ExploitFramework",
+            "PhishingKit",
         ] {
             assert!(
                 !tags_for_yara_rule(name).is_empty(),

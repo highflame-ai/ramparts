@@ -35,7 +35,7 @@ Ramparts provides **security scanning** of the MCP-and-skill ecosystem by:
 
 1. **MCP server discovery & analysis** — scans MCP endpoints for tools/resources/prompts; multi-transport (HTTP, SSE, stdio, subprocess) with intelligent fallback and session management
 2. **Skill scanning** — same threat model applied to agent skill files on disk (Claude Code commands, agentskills.io bundles incl. bundled `scripts/` + `references/`, Cursor / Codex / Windsurf / Gemini variants)
-3. **Static analysis (YARA)** — 25+ pre/post-scan rules across both surfaces, including 9 skill-targeted rules (prompt-injection variants, credential harvesting, tool-chaining exfil, system manipulation, authority abuse)
+3. **Static analysis (YARA)** — 35+ pre/post-scan rules across both surfaces: 9 skill-targeted rules (prompt-injection variants, credential harvesting, tool-chaining exfil, system manipulation, authority abuse) plus malware-IOC rules adapted from [NVIDIA SkillSpector](https://github.com/NVIDIA/SkillSpector) (cryptominers, reverse shells / C2 / info-stealers, webshells, offensive hack tools)
 4. **LLM-powered analysis** — sophisticated semantic issues no static rule can spot (tool descriptions that lie about behavior, sneaky permission requests, etc.)
 5. **Cross-origin analysis** — detects tools spanning multiple domains, a context-hijacking / injection vector
 6. **Supply-chain coverage** — queries OSV.dev for known CVEs in npx/uvx-launched stdio MCP servers
