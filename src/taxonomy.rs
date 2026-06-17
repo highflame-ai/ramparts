@@ -246,6 +246,31 @@ mod tests {
             "SkillCredentialHarvesting",
             "SkillToolChainingExfiltration",
             "SkillSystemManipulation",
+            // cryptominers.yar
+            "CryptoStratumProtocol",
+            "CryptoMiningPools",
+            "CryptoMinerSoftware",
+            "CryptoCoinjacking",
+            // malware.yar
+            "ReverseShell",
+            "BackdoorPersistence",
+            "KeyloggerIndicators",
+            "RansomwareBehavior",
+            "C2FrameworkIndicators",
+            "InfoStealer",
+            // webshells.yar
+            "PHPWebshellGeneric",
+            "PHPWebshellObfuscated",
+            "PHPWebshellKnown",
+            "PythonWebshell",
+            "JSPWebshell",
+            "ASPXWebshell",
+            // hacktools.yar
+            "OffensiveToolReferences",
+            "NetworkReconnaissance",
+            "PrivilegeEscalationTools",
+            "ExploitFramework",
+            "PhishingKit",
         ] {
             assert!(
                 !tags_for_yara_rule(name).is_empty(),

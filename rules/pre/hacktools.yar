@@ -27,7 +27,6 @@ rule OffensiveToolReferences
         reference = "https://github.com/NVIDIA/SkillSpector"
 
     strings:
-        $nmap_scan    = /nmap\s+-[sSUAOPpT]/ nocase
         $sqlmap       = /sqlmap.*(--url|--dbs|--dump)/ nocase
         $nikto        = /nikto\s+-h/ nocase
         $hydra        = /hydra\s+.*-[lLP]/ nocase
@@ -55,6 +54,8 @@ rule NetworkReconnaissance
         reference = "https://github.com/NVIDIA/SkillSpector"
 
     strings:
+        // nmap is a legitimate scanner, not solely offensive — recon, not hack-tool.
+        $nmap_scan  = /nmap\s+-[sSUAOPpT]/ nocase
         $port_scan  = /for\s+.*\s+in\s+range\s*\(\s*\d+\s*,\s*\d{4,}\s*\).*connect/ nocase
         $masscan    = /masscan\s+.*-p/ nocase
         $arp_scan   = /arp-scan\s+--/ nocase
