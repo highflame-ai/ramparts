@@ -269,6 +269,9 @@ pub struct ScanResult {
     /// `if (ramparts_commit)` truthiness in a downstream language.
     #[serde(default)]
     pub ramparts_commit: String,
+    /// Server name from config file (preserves user's naming, not server's self-reported name)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
     /// IDE source that provided this server configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ide_source: Option<String>,
@@ -322,6 +325,7 @@ impl ScanResult {
             errors: Vec::new(),
             ramparts_version: env!("CARGO_PKG_VERSION").to_string(),
             ramparts_commit: env!("GIT_COMMIT_SHORT").to_string(),
+            server_name: None,
             ide_source: None,
             llm_prompts: None,
         }
