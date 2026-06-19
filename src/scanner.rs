@@ -1910,8 +1910,6 @@ impl MCPScanner {
                             }
                         };
 
-                        let server_name = server.name.clone();
-
                         // Scan the MCP server - HTTP or STDIO
                         let mut result = if let Some(url) = server.scan_url() {
                             // HTTP server scanning
@@ -1957,7 +1955,7 @@ impl MCPScanner {
                             failed_result
                         };
 
-                        result.server_name = server_name;
+                        result.server_name = server.name;
                         result
                     })
                 })
