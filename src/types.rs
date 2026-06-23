@@ -49,6 +49,15 @@ pub struct YaraScanResult {
     /// exists yet for the rule — the finding is still reported.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owasp_tags: Vec<OwaspTag>,
+    // OSV dependency findings only: the installed package version that was
+    // matched and the version the advisory says the fix landed in (absent when
+    // OSV lists no fixed version). `default` + `skip_serializing_if` keep these
+    // omitted for every non-dependency finding and back-compatible with
+    // `replay` reading older JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_version: Option<String>,
     // Execution summary fields (when target_type is "summary")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
@@ -591,6 +600,8 @@ mod tests {
             context: "test context".to_string(),
             rule_metadata: None,
             owasp_tags: Vec::new(),
+            installed_version: None,
+            fixed_version: None,
             phase: Some("pre-scan".to_string()),
             rules_executed: Some(vec![
                 "secrets_leakage:SecretsLeakage".to_string(),

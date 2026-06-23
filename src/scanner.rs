@@ -689,6 +689,8 @@ impl YaraScanner {
             context: generate_context_message(T::item_type(), &match_info.rule_name),
             rule_metadata: match_info.metadata.clone(),
             owasp_tags: crate::taxonomy::tags_for_yara_rule(&match_info.rule_name),
+            installed_version: None,
+            fixed_version: None,
             phase: None,
             rules_executed: None,
             security_issues_detected: None,
@@ -777,6 +779,8 @@ impl Scanner for YaraScanner {
                     ),
                     rule_metadata: None,
                     owasp_tags: Vec::new(),
+                    installed_version: None,
+                    fixed_version: None,
                     phase: Some("pre-scan".to_string()),
                     rules_executed: if stats.pre_scan_rules.is_empty() {
                         None
@@ -881,6 +885,8 @@ impl Scanner for YaraScanner {
                     ),
                     rule_metadata: None,
                     owasp_tags: Vec::new(),
+                    installed_version: None,
+                    fixed_version: None,
                     phase: Some("post-scan".to_string()),
                     rules_executed: if stats.post_scan_rules.is_empty() {
                         None
@@ -1782,6 +1788,8 @@ impl MCPScanner {
                             context: generate_context_message("server", &m.rule_name),
                             rule_metadata: m.metadata.clone(),
                             owasp_tags: crate::taxonomy::tags_for_yara_rule(&m.rule_name),
+                            installed_version: None,
+                            fixed_version: None,
                             phase: Some("pre-config".to_string()),
                             rules_executed: None,
                             security_issues_detected: None,
@@ -1823,6 +1831,8 @@ impl MCPScanner {
                                 tags: vec!["baseline".to_string()],
                             }),
                             owasp_tags: crate::taxonomy::tags_for_yara_rule("MCPConfigChanged"),
+                            installed_version: None,
+                            fixed_version: None,
                             phase: Some("pre-config".to_string()),
                             rules_executed: None,
                             security_issues_detected: None,
