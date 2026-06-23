@@ -163,6 +163,8 @@ struct OsvVulnerability {
     severity: Vec<OsvSeverity>,
     #[serde(default)]
     aliases: Vec<String>,
+    #[serde(default)]
+    affected: Vec<OsvAffected>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +172,37 @@ struct OsvSeverity {
     #[serde(rename = "type")]
     severity_type: String,
     score: String,
+}
+
+/// Subset of OSV's `affected[]` we need to surface the fix version. OSV records
+/// the release a vulnerability was fixed in inside `ranges[].events[].fixed`;
+/// a record with no `fixed` event means no fix is available yet.
+#[derive(Debug, Deserialize)]
+struct OsvAffected {
+    #[serde(default)]
+    package: Option<OsvAffectedPackage>,
+    #[serde(default)]
+    ranges: Vec<OsvRange>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvAffectedPackage {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    ecosystem: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvRange {
+    #[serde(default)]
+    events: Vec<OsvRangeEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvRangeEvent {
+    #[serde(default)]
+    fixed: Option<String>,
 }
 
 /// Query OSV.dev for vulnerabilities affecting `spec`. Returns an empty
@@ -266,6 +299,7 @@ fn osv_finding_to_yara_result(spec: &PackageSpec, vuln: OsvVulnerability) -> Yar
         spec.version.as_deref().unwrap_or("(any version)"),
         summary
     );
+    let fixed_version = extract_fixed_version(spec, &vuln.affected);
     YaraScanResult {
         target_type: "dependency".to_string(),
         target_name: format!(
@@ -290,6 +324,8 @@ fn osv_finding_to_yara_result(spec: &PackageSpec, vuln: OsvVulnerability) -> Yar
             tags: vec!["dependency".to_string(), "osv".to_string()],
         }),
         owasp_tags: crate::taxonomy::tags_for_yara_rule("VulnerableDependency"),
+        installed_version: spec.version.clone(),
+        fixed_version,
         phase: Some("pre-scan".to_string()),
         rules_executed: None,
         security_issues_detected: None,
@@ -297,6 +333,46 @@ fn osv_finding_to_yara_result(spec: &PackageSpec, vuln: OsvVulnerability) -> Yar
         total_matches: None,
         status: Some("warning".to_string()),
     }
+}
+
+/// Best-effort "the advisory says this is fixed in version X" signal, pulled
+/// from OSV's `affected[].ranges[].events[].fixed`. OSV can list several
+/// affected packages; we only read `fixed` from the package we queried (or an
+/// entry that carries no package object, which OSV occasionally omits), never
+/// from a different package in a multi-package advisory. This is a surfacing
+/// hint for the UI, not a precise range resolution: when a package has several
+/// ranges (e.g. parallel release branches with separate fixes) we surface the
+/// first `fixed` we find rather than resolving which range covers the installed
+/// version, since that needs per-ecosystem version comparison. The result is
+/// always a valid fix, just not necessarily the lowest one for the installed
+/// branch. Returns `None` when OSV lists no fixed version for our package.
+fn extract_fixed_version(spec: &PackageSpec, affected: &[OsvAffected]) -> Option<String> {
+    fn first_fixed(a: &OsvAffected) -> Option<String> {
+        a.ranges
+            .iter()
+            .flat_map(|r| r.events.iter())
+            .find_map(|e| e.fixed.clone())
+    }
+    let names_our_pkg = |a: &OsvAffected| {
+        a.package.as_ref().is_some_and(|p| {
+            p.name.eq_ignore_ascii_case(&spec.name)
+                && p.ecosystem.eq_ignore_ascii_case(spec.ecosystem)
+        })
+    };
+    // If the advisory explicitly names our package, trust only those entries so
+    // a sibling package's fix never leaks in. Only when nothing names our
+    // package do we fall back to entries with no package object, which OSV
+    // occasionally omits.
+    if affected.iter().any(&names_our_pkg) {
+        return affected
+            .iter()
+            .filter(|a| names_our_pkg(a))
+            .find_map(first_fixed);
+    }
+    affected
+        .iter()
+        .filter(|a| a.package.is_none())
+        .find_map(first_fixed)
 }
 
 /// Map a CVSS score string (e.g. "9.8", "CVSS:3.1/AV:N/...") to a coarse
@@ -396,5 +472,141 @@ mod tests {
             "MEDIUM"
         );
         assert_eq!(severity_label_for_cvss(""), "MEDIUM");
+    }
+
+    #[test]
+    fn extracts_fixed_version_from_affected() {
+        let vuln: OsvVulnerability = serde_json::from_value(serde_json::json!({
+            "id": "GHSA-test-fixed",
+            "summary": "bad bug",
+            "affected": [{
+                "package": { "name": "lodash", "ecosystem": "npm" },
+                "ranges": [{
+                    "type": "SEMVER",
+                    "events": [ { "introduced": "0" }, { "fixed": "4.17.21" } ]
+                }]
+            }]
+        }))
+        .expect("valid osv json");
+        let spec = PackageSpec {
+            ecosystem: "npm",
+            name: "lodash".into(),
+            version: Some("4.17.20".into()),
+        };
+        assert_eq!(
+            extract_fixed_version(&spec, &vuln.affected),
+            Some("4.17.21".to_string())
+        );
+    }
+
+    #[test]
+    fn no_fixed_version_when_absent() {
+        // A record whose only event is `introduced` (no fix released yet).
+        let vuln: OsvVulnerability = serde_json::from_value(serde_json::json!({
+            "id": "GHSA-test-nofix",
+            "affected": [{
+                "package": { "name": "lodash", "ecosystem": "npm" },
+                "ranges": [{ "type": "SEMVER", "events": [ { "introduced": "0" } ] }]
+            }]
+        }))
+        .expect("valid osv json");
+        let spec = PackageSpec {
+            ecosystem: "npm",
+            name: "lodash".into(),
+            version: Some("4.17.20".into()),
+        };
+        assert_eq!(extract_fixed_version(&spec, &vuln.affected), None);
+    }
+
+    #[test]
+    fn ignores_fix_from_a_different_package() {
+        // Multi-package advisory: our package has no fix, a sibling does. We
+        // must not borrow the sibling's fixed version.
+        let vuln: OsvVulnerability = serde_json::from_value(serde_json::json!({
+            "id": "GHSA-test-multi",
+            "affected": [
+                {
+                    "package": { "name": "lodash", "ecosystem": "npm" },
+                    "ranges": [{ "type": "SEMVER", "events": [ { "introduced": "0" } ] }]
+                },
+                {
+                    "package": { "name": "other-pkg", "ecosystem": "npm" },
+                    "ranges": [{
+                        "type": "SEMVER",
+                        "events": [ { "introduced": "0" }, { "fixed": "2.0.0" } ]
+                    }]
+                }
+            ]
+        }))
+        .expect("valid osv json");
+        let spec = PackageSpec {
+            ecosystem: "npm",
+            name: "lodash".into(),
+            version: Some("4.17.20".into()),
+        };
+        assert_eq!(extract_fixed_version(&spec, &vuln.affected), None);
+    }
+
+    #[test]
+    fn package_less_fallback_only_when_no_named_match() {
+        let spec = PackageSpec {
+            ecosystem: "npm",
+            name: "lodash".into(),
+            version: Some("4.17.20".into()),
+        };
+
+        // A named entry for our package (no fix) wins over a package-less entry
+        // that does have one: a named-but-unfixed package reports no fix.
+        let with_named: OsvVulnerability = serde_json::from_value(serde_json::json!({
+            "id": "GHSA-test-mixed",
+            "affected": [
+                {
+                    "package": { "name": "lodash", "ecosystem": "npm" },
+                    "ranges": [{ "type": "SEMVER", "events": [ { "introduced": "0" } ] }]
+                },
+                { "ranges": [{ "type": "SEMVER", "events": [ { "fixed": "9.9.9" } ] }] }
+            ]
+        }))
+        .expect("valid osv json");
+        assert_eq!(extract_fixed_version(&spec, &with_named.affected), None);
+
+        // With no named entry at all, the package-less fix is used.
+        let unlabeled: OsvVulnerability = serde_json::from_value(serde_json::json!({
+            "id": "GHSA-test-unlabeled",
+            "affected": [
+                { "ranges": [{ "type": "SEMVER", "events": [ { "fixed": "9.9.9" } ] }] }
+            ]
+        }))
+        .expect("valid osv json");
+        assert_eq!(
+            extract_fixed_version(&spec, &unlabeled.affected),
+            Some("9.9.9".to_string())
+        );
+    }
+
+    #[test]
+    fn osv_finding_populates_installed_and_fixed() {
+        let vuln: OsvVulnerability = serde_json::from_value(serde_json::json!({
+            "id": "GHSA-test-full",
+            "summary": "bug",
+            "severity": [{ "type": "CVSS_V3", "score": "9.8" }],
+            "affected": [{
+                "package": { "name": "lodash", "ecosystem": "npm" },
+                "ranges": [{
+                    "type": "SEMVER",
+                    "events": [ { "introduced": "0" }, { "fixed": "4.17.21" } ]
+                }]
+            }]
+        }))
+        .expect("valid osv json");
+        let spec = PackageSpec {
+            ecosystem: "npm",
+            name: "lodash".into(),
+            version: Some("4.17.20".into()),
+        };
+        let result = osv_finding_to_yara_result(&spec, vuln);
+        assert_eq!(result.installed_version, Some("4.17.20".to_string()));
+        assert_eq!(result.fixed_version, Some("4.17.21".to_string()));
+        assert_eq!(result.target_type, "dependency");
     }
 }

@@ -1552,6 +1552,8 @@ fn make_heuristic_finding(
             tags: Vec::new(),
         }),
         owasp_tags: crate::taxonomy::tags_for_yara_rule(rule),
+        installed_version: None,
+        fixed_version: None,
         phase: None,
         rules_executed: None,
         security_issues_detected: None,
