@@ -335,6 +335,38 @@ fn osv_finding_to_yara_result(spec: &PackageSpec, vuln: OsvVulnerability) -> Yar
     }
 }
 
+/// Compare two package names within an ecosystem. PyPI treats runs of `-`,
+/// `_`, and `.` as equivalent and is case-insensitive (PEP 503), so
+/// `pip_install_test` and `pip-install-test` are the same project; OSV returns
+/// the canonical name while our spec carries the name as typed on the command
+/// line. Other ecosystems compare case-insensitively as-is.
+fn pkg_names_match(ecosystem: &str, a: &str, b: &str) -> bool {
+    if ecosystem.eq_ignore_ascii_case("PyPI") {
+        normalize_pypi_name(a) == normalize_pypi_name(b)
+    } else {
+        a.eq_ignore_ascii_case(b)
+    }
+}
+
+/// PEP 503 name normalization: lowercase and collapse any run of `-`, `_`, or
+/// `.` into a single `-`. PyPI names are ASCII, so ASCII lowercasing suffices.
+fn normalize_pypi_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_sep = false;
+    for c in name.chars() {
+        if matches!(c, '-' | '_' | '.') {
+            if !prev_sep {
+                out.push('-');
+            }
+            prev_sep = true;
+        } else {
+            out.push(c.to_ascii_lowercase());
+            prev_sep = false;
+        }
+    }
+    out
+}
+
 /// Best-effort "the advisory says this is fixed in version X" signal, pulled
 /// from OSV's `affected[].ranges[].events[].fixed`. OSV can list several
 /// affected packages; we only read `fixed` from the package we queried (or an
@@ -355,8 +387,8 @@ fn extract_fixed_version(spec: &PackageSpec, affected: &[OsvAffected]) -> Option
     }
     let names_our_pkg = |a: &OsvAffected| {
         a.package.as_ref().is_some_and(|p| {
-            p.name.eq_ignore_ascii_case(&spec.name)
-                && p.ecosystem.eq_ignore_ascii_case(spec.ecosystem)
+            p.ecosystem.eq_ignore_ascii_case(spec.ecosystem)
+                && pkg_names_match(spec.ecosystem, &p.name, &spec.name)
         })
     };
     // If the advisory explicitly names our package, trust only those entries so
@@ -581,6 +613,32 @@ mod tests {
         assert_eq!(
             extract_fixed_version(&spec, &unlabeled.affected),
             Some("9.9.9".to_string())
+        );
+    }
+
+    #[test]
+    fn matches_pypi_names_up_to_normalization() {
+        // PyPI treats pip_install_test and pip-install-test as one project; the
+        // OSV record's canonical name must still match our as-typed spec name.
+        let vuln: OsvVulnerability = serde_json::from_value(serde_json::json!({
+            "id": "GHSA-test-pypi",
+            "affected": [{
+                "package": { "name": "pip_install_test", "ecosystem": "PyPI" },
+                "ranges": [{
+                    "type": "ECOSYSTEM",
+                    "events": [ { "introduced": "0" }, { "fixed": "1.2.0" } ]
+                }]
+            }]
+        }))
+        .expect("valid osv json");
+        let spec = PackageSpec {
+            ecosystem: "PyPI",
+            name: "pip-install-test".into(),
+            version: Some("1.1.0".into()),
+        };
+        assert_eq!(
+            extract_fixed_version(&spec, &vuln.affected),
+            Some("1.2.0".to_string())
         );
     }
 
