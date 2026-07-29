@@ -188,7 +188,7 @@ pub struct SecurityIssue {
 
 impl SecurityIssue {
     pub fn new(issue_type: SecurityIssueType, description: String) -> Self {
-        let message = format!("{}: {}", issue_type.default_message(), &description);
+        let message = format!("{}: {}", issue_type.default_message(), description);
         Self {
             issue_type,
             tool_name: None,
