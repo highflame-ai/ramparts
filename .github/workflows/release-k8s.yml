@@ -60,3 +60,4 @@ jobs:
           gh workflow run ${{ env.CICD_WORKFLOW }} \
             --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \
             --ref ${{ env.DEVOPS_BRANCH }}
+            -f release_tag=${{ github.event.release.tag_name }}
