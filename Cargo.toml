@@ -8,7 +8,7 @@ name = "ramparts"
 # persists. Publishing 0.8.1 cleanly skips the orphan; crates.io
 # users go 0.7.3 -> 0.8.1, GitHub's 0.8.0 binary release stays as
 # historical archive.
-version = "0.8.2"
+version = "0.8.3"
 edition = "2021"
 authors = ["Sharath Rajasekar <sharath@highflame.com>"]
 description = "Security scanner for Model Context Protocol (MCP) servers and AI agent skills (Claude Code commands, agentskills.io bundles, Cursor / Codex / Windsurf / Gemini equivalents)."
