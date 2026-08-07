@@ -105,9 +105,9 @@ tower = "0.4"
 jsonrpc-core = "18.0"
 # yara-x is git-pinned to a post-v1.16.0 commit that bumps wasmtime
 # from 43.0.1 to 43.0.2, clearing RUSTSEC-2026-0114 (panic when
-# allocating a table exceeding the host's address space). yara-x's
-# tagged v1.16.0 release on crates.io ships the OLD wasmtime, so
-# we hold the git pin until v1.17 lands with the fix included.
+# allocating a table exceeding the host's address space). This does
+# not clear RUSTSEC-2026-0222; keep that advisory documented in
+# .cargo/audit.toml until upstream depends on a patched wasmtime.
 #
 # `version = "1.16.0"` is required for `cargo publish` of the
 # `ramparts` crate — when ramparts is published, `path` and `git`
@@ -116,8 +116,8 @@ jsonrpc-core = "18.0"
 #   "dependency `yara-x` does not specify a version".
 #
 # Note the divergence this creates:
-#   - Workspace + GitHub-released binaries: use the git pin (safe,
-#     wasmtime 43.0.2).
+#   - Workspace + GitHub-released binaries: use the git pin (clears
+#     RUSTSEC-2026-0114, still affected by RUSTSEC-2026-0222).
 #   - `cargo install ramparts` from crates.io: resolves yara-x to
 #     the crates.io version (1.16.0, has the wasmtime CVE).
 # The CVE's attack vector (oversized table allocation in a WASM
