@@ -14,6 +14,8 @@ mod integration_tests;
 mod mcp_client;
 mod mcp_server;
 mod osv;
+#[cfg(test)]
+mod rule_eval;
 mod sarif;
 mod scanner;
 mod security;

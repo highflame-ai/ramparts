@@ -112,6 +112,10 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         }
         "CoerciveInjection" => vec![OwaspTag::new("MCP01"), OwaspTag::new("MCP02")],
 
+        // Instruction to move data offsite while hiding it from the user.
+        // MCP01 is tool poisoning; MCP08 is the exfiltration half.
+        "CovertExfiltration" => vec![OwaspTag::new("MCP01"), OwaspTag::new("MCP08")],
+
         // skill_authority.yar — autonomy bypass + capability inflation.
         "AutonomyAbuse" => vec![OwaspTag::new("MCP03")],
         "CapabilityInflation" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],

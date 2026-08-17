@@ -55,6 +55,7 @@ rule SQLInjection
         $error_functions = /\b(UPDATEXML\s*\(|EXTRACTVALUE\s*\(|FLOOR\s*\(|CONVERT\s*\(|CAST\s*\(|CONCAT\s*\()\b/i
         
         // Stacked Queries
+        $stacked_destructive = /;\s*(DROP|TRUNCATE)\s+(TABLE|DATABASE|SCHEMA)\b/ nocase
         $stacked_queries = /(;\s*SELECT|;\s*INSERT|;\s*UPDATE|;\s*DELETE|;\s*DROP|;\s*CREATE|;\s*ALTER|;\s*EXEC|;\s*EXECUTE)\b/i
         $multiple_statements = /(SELECT\s+.*;\s*SELECT|INSERT\s+.*;\s*SELECT|UPDATE\s+.*;\s*SELECT|DELETE\s+.*;\s*SELECT)\b/i
         
@@ -130,6 +131,15 @@ rule SQLInjection
         // tautology nearby, multi-statement SQL is just a script,
         // not an attack.
         ($stacked_queries and ($boolean_injection or $encoding_evasion or $auth_bypass)) or
+
+        // A stacked DESTRUCTIVE statement fires standalone. The reason
+        // `$stacked_queries` needs a second signal is that `;\s*SELECT` and
+        // `;\s*UPDATE` occur in prose and in code samples. `; DROP TABLE`,
+        // `; TRUNCATE TABLE`, and `; DROP DATABASE` do not — they are only
+        // ever an injection payload, so requiring a companion signal here just
+        // loses the finding. Caught: "SELECT * FROM users WHERE id = 1;
+        // DROP TABLE users;--".
+        $stacked_destructive or
         $multiple_statements or
 
         // Database-specific injection (require sql_keywords corroboration)
