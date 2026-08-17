@@ -37,7 +37,7 @@ tokio = { version = "1.35", features = ["full"] }
 reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-features = false }
 
 # Official Rust MCP SDK
-rmcp = { version = "1.5", features = [
+rmcp = { version = "3.1", features = [
     "client",
     "server",
     "macros",
