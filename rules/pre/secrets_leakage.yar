@@ -9,9 +9,15 @@ rule SecretsLeakage
         version = "1.0"
         
     strings:
-        $api_key = /[Aa][Pp][Ii][-_]?[Kk][Ee][Yy].*[A-Za-z0-9]{20,}/
+        // Require an assignment between the name and the value. The previous
+        // form used `.*`, so the words "API keys" followed anywhere later by
+        // 20 alphanumeric characters matched — which is most prose about
+        // credentials. GitHub's own run_secret_scanning tool was flagged as a
+        // live credential leak by exactly that.
+        $api_key = /[Aa][Pp][Ii][-_]?[Kk][Ee][Yy]\s*[:=]\s*['"]?[A-Za-z0-9_\-]{20,}/
         $bearer_token = /[Bb]earer\s+[A-Za-z0-9\-_]{20,}/
-        $password = /[Pp]assword.*[A-Za-z0-9@#$%^&*]{8,}/
+        // Same `.*` problem: "passwords" plus any 8 later characters matched.
+        $password = /[Pp]assword\s*[:=]\s*['"]?[^\s'"]{8,}/
         $private_key = /-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----/
         $aws_key = /AKIA[0-9A-Z]{16}/
         $github_token = /ghp_[A-Za-z0-9]{36}/
