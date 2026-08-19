@@ -321,7 +321,7 @@ fn severity_score_value(sev: &str) -> Value {
 fn owasp_tags_value(tags: &[crate::taxonomy::OwaspTag]) -> Value {
     Value::Array(
         tags.iter()
-            .map(|t| Value::String(format!("owasp-mcp-top-10:{}:{}", t.version, t.id)))
+            .map(|t| Value::String(format!("{}:{}:{}", t.framework, t.version, t.id)))
             .collect(),
     )
 }

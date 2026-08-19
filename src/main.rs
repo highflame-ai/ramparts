@@ -5,6 +5,7 @@ use tracing_subscriber::FmtSubscriber;
 use crate::config::ScannerConfig;
 
 mod banner;
+mod baseline;
 mod cache;
 mod config;
 mod constants;
@@ -13,6 +14,7 @@ mod core;
 mod integration_tests;
 mod mcp_client;
 mod mcp_server;
+mod normalize;
 mod osv;
 #[cfg(test)]
 mod rule_eval;
@@ -703,21 +705,91 @@ async fn handle_skills_scan_command(
     // resource findings here would get silently retyped.
     let mut bundle_prompt_names: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // Content baselining (rug-pull detection, AST07): the skill body a
+    // reviewer approved is pinned on first sight; any later edit — the
+    // hot-reload-abuse / malicious-update pattern — fires
+    // SkillContentChanged until re-baselined. One store load/save for
+    // the whole scan. Bundle sibling scripts ride through the prompt
+    // body indirectly only when referenced;
+    // ponytail: SKILL.md content only — extend to bundled scripts if script-swap rug pulls show up
+    let mut baseline_store = baseline::BaselineStore::load_default();
     for p in &skill_paths {
-        if skills::is_agentskills_bundle(p) {
-            if let Some((parsed, resources)) = skills::parse_agentskills_bundle(p) {
+        let parsed_prompt = if skills::is_agentskills_bundle(p) {
+            skills::parse_agentskills_bundle(p).map(|(parsed, resources)| {
                 bundle_prompt_names.insert(parsed.prompt.name.clone());
-                prompts.push(parsed.prompt);
-                prompt_paths.push(p.clone());
-                parser_findings.extend(parsed.heuristic_findings);
                 bundle_resources.extend(resources);
+                parsed
+            })
+        } else {
+            skills::parse_skill_file(p)
+        };
+        if let Some(parsed) = parsed_prompt {
+            let path_key = std::fs::canonicalize(p)
+                .unwrap_or_else(|_| p.clone())
+                .display()
+                .to_string();
+            if let Some(finding) = baseline::check_skill_drift(
+                &mut baseline_store,
+                &path_key,
+                parsed.prompt.description.as_deref().unwrap_or(""),
+            ) {
+                parser_findings.push(finding);
             }
-        } else if let Some(parsed) = skills::parse_skill_file(p) {
             prompts.push(parsed.prompt);
             prompt_paths.push(p.clone());
             parser_findings.extend(parsed.heuristic_findings);
         }
     }
+    baseline_store.save();
+
+    // Supply-chain pass (OWASP AST02): dependency manifests bundled with a
+    // skill are the actual delivery mechanism for staged-loader attacks —
+    // the SKILL.md stays clean while requirements.txt pulls the payload.
+    // Route exactly-pinned deps through the same OSV.dev lookup the stdio
+    // launch commands already get. Fail-soft like the rest of OSV: a
+    // network failure yields no findings, never a failed scan.
+    let mut manifest_specs: Vec<osv::PackageSpec> = Vec::new();
+    for root in &bundle_roots {
+        for candidate in [
+            "requirements.txt",
+            "package.json",
+            "scripts/requirements.txt",
+            "scripts/package.json",
+        ] {
+            // Read through a symlink guard: a hostile bundle must not be
+            // able to point `requirements.txt` at the operator's private
+            // files and have their contents shipped to OSV.dev.
+            let Some(content) = skills::read_bundle_file_no_escape(root, candidate) else {
+                continue;
+            };
+            let fname = std::path::Path::new(candidate)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            manifest_specs.extend(osv::parse_manifest_specs(fname, &content));
+        }
+    }
+    manifest_specs.sort_by(|a, b| {
+        (a.ecosystem, &a.name, &a.version).cmp(&(b.ecosystem, &b.name, &b.version))
+    });
+    manifest_specs
+        .dedup_by(|a, b| a.ecosystem == b.ecosystem && a.name == b.name && a.version == b.version);
+    // ponytail: 64-dep cap bounds the network fan-out; raise if real bundles exceed it
+    manifest_specs.truncate(64);
+    // Spawn the OSV round-trips onto the runtime so they actually run
+    // concurrently with the (synchronous) YARA pass and the LLM call
+    // below — reqwest futures are lazy, so a bare `join_all` would only
+    // start at its `.await`. Drained after the YARA pass.
+    let osv_handle = if manifest_specs.is_empty() {
+        None
+    } else {
+        let client = reqwest::Client::new();
+        Some(tokio::spawn(futures::future::join_all(
+            manifest_specs
+                .into_iter()
+                .map(|spec| osv::query_osv(client.clone(), spec)),
+        )))
+    };
 
     if prompts.is_empty() {
         let msg = "All discovered skill files failed to parse";
@@ -842,6 +914,18 @@ async fn handle_skills_scan_command(
     // treat them identically to YARA matches.
     result.yara_results.append(&mut parser_findings);
 
+    // Drain the OSV manifest lookups (ran concurrently since being spawned).
+    if let Some(handle) = osv_handle {
+        match handle.await {
+            Ok(all) => {
+                for findings in all {
+                    result.yara_results.extend(findings);
+                }
+            }
+            Err(e) => warn!("OSV manifest lookup task failed: {e}"),
+        }
+    }
+
     // Run the existing security analyzer over the prompt set. We reuse the
     // batch analyzer so LLM batching, OWASP tagging, and result accounting
     // all behave the same as for live MCP scans.
@@ -884,6 +968,29 @@ async fn handle_skills_scan_command(
         }
     }
     result.security_issues = Some(security_result);
+
+    // Agentic Skills Top 10 tagging. This is the skill scan surface, so
+    // every finding here also gets its OWASP AST tag(s) appended alongside
+    // the MCP tags already present. MCP-server scans never reach this path,
+    // so AST tags stay off MCP-surface findings (see taxonomy.rs docs).
+    for finding in &mut result.yara_results {
+        finding
+            .owasp_tags
+            .extend(taxonomy::ast_tags_for_rule(&finding.rule_name));
+    }
+    if let Some(sec) = result.security_issues.as_mut() {
+        for issue in sec
+            .tool_issues
+            .iter_mut()
+            .chain(sec.prompt_issues.iter_mut())
+            .chain(sec.resource_issues.iter_mut())
+        {
+            issue
+                .owasp_tags
+                .extend(taxonomy::ast_tags_for_security_issue(issue.issue_type));
+        }
+    }
+
     result.response_time_ms = scan_timer.elapsed_ms();
 
     utils::print_result(&result, &output_format, scanner_config.scanner.detailed);
