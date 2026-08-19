@@ -17,4 +17,16 @@ pub mod messages {
 /// Common HTTP and protocol constants
 pub mod protocol {
     pub const USER_AGENT: &str = concat!("ramparts/", env!("CARGO_PKG_VERSION"));
+
+    /// The MCP protocol version ramparts speaks, taken from the SDK rather
+    /// than written out by hand.
+    ///
+    /// This string used to be pinned as `"2025-06-18"` in six places across
+    /// two files, so it silently drifted from whatever the linked rmcp
+    /// actually negotiates. Sourcing it from `ProtocolVersion::LATEST` means
+    /// an SDK bump carries the advertised version with it — the 3.1.2 upgrade
+    /// moved it to `2025-11-25` on its own.
+    pub fn mcp_version() -> String {
+        rmcp::model::ProtocolVersion::LATEST.to_string()
+    }
 }

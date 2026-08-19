@@ -804,7 +804,15 @@ If no genuine security issues found, return empty array []."
             ));
         }
 
-        let client = Client::new();
+        // Build through the shared TLS config like every other outbound
+        // client. A bare Client::new() falls back to rustls-platform-verifier,
+        // the exact component src/tls.rs exists to bypass — so on the macOS
+        // setups that motivated tls.rs, MCP connections worked while LLM
+        // analysis failed with an opaque "builder error".
+        let client = Client::builder()
+            .use_preconfigured_tls((*crate::tls::default_tls_config()).clone())
+            .build()
+            .map_err(|e| anyhow!("Failed to build LLM HTTP client: {}", e))?;
 
         // Get configuration values, with defaults if not configured
         let temperature = self.config.as_ref().map_or(0.1, |c| c.llm.temperature);
@@ -820,15 +828,11 @@ If no genuine security issues found, return empty array []."
         debug!("   Temperature: {}", temperature);
         debug!("   Max tokens: {}", max_tokens);
         debug!("   Timeout: {}s", timeout);
-        debug!(
-            "   API key: {}...{}",
-            &api_key[..8.min(api_key.len())],
-            if api_key.len() > 16 {
-                &api_key[api_key.len() - 8..]
-            } else {
-                "***"
-            }
-        );
+        // Never log key material, not even a prefix. Report presence and
+        // length only. The previous version also sliced the String by BYTE
+        // index, which panics with "byte index is not a char boundary" when a
+        // key contains a multi-byte character.
+        debug!("   API key: present ({} chars)", api_key.chars().count());
 
         let request_body = json!({
             "model": self.model_name,
@@ -939,9 +943,12 @@ Example valid response: [{\"tool_name\": \"example\", \"found_issue\": true, \"i
                     error!(
                         "   💡 Hint: Check your API key is correct and has sufficient permissions"
                     );
+                    // Do not echo any part of the key. This branch runs at
+                    // error! level, which the default filter shows, so the
+                    // most common failure was also the loudest leak.
                     error!(
-                        "   💡 Current key starts with: {}...",
-                        &api_key[..8.min(api_key.len())]
+                        "   💡 The configured key is {} characters long",
+                        api_key.chars().count()
                     );
                 }
                 403 => {

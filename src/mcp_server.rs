@@ -7,7 +7,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::JsonSchema;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
     transport::{
         io::stdio,
@@ -96,7 +96,7 @@ impl RampartsMcpServer {
         if let Some(result) = resp.result {
             let json = serde_json::to_string(&result)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            Ok(CallToolResult::success(vec![Content::text(json)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
         } else {
             Err(ErrorData::invalid_request(
                 resp.error.unwrap_or_else(|| "scan failed".to_string()),
@@ -142,7 +142,7 @@ impl RampartsMcpServer {
             .map_err(|e| ErrorData::invalid_request(e.to_string(), None))?;
         let json = serde_json::to_string(&results)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }
 

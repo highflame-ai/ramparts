@@ -63,13 +63,23 @@ rule CrossOriginEscalation
         $json_multi_origin = /"origin".*:.*"https?:\/\/.*"origin".*:.*"https?:\/\//i
         
         // Legitimate patterns to reduce false positives
+        // Specification and schema URLs are identifiers, not endpoints. Every
+        // JSON Schema carries a `$schema` declaration pointing at
+        // json-schema.org, so a schema plus a single example URL satisfied
+        // `$multi_domain_1` and `$mixed_schemes_*`. That flagged
+        // `gzip-file-as-resource` on the reference server-everything
+        // implementation, whose schema is entirely ordinary.
+        $excl_schema_url = /https?:\/\/(json-schema\.org|www\.w3\.org|schema\.org|spec\.openapis\.org|docs\.oasis-open\.org|modelcontextprotocol\.io)\//i
+
         $legitimate_cdn = /(cdn\.|static\.|assets\.|media\.)/i
         $legitimate_backup = /(backup|fallback|mirror)/i
         $legitimate_loadbalancer = /(lb\.|loadbalancer|ha\.)/i
         
     condition:
-        // Primary detection: Multiple different domains
-        ($multi_domain_1 and not ($legitimate_cdn or $legitimate_backup or $legitimate_loadbalancer)) or
+        // Primary detection: Multiple different domains.
+        // Excludes specification/schema URLs — see $excl_schema_url.
+        ($multi_domain_1 and not $excl_schema_url
+            and not ($legitimate_cdn or $legitimate_backup or $legitimate_loadbalancer)) or
         
         // Mixed local/remote origins (high risk)
         ($mixed_local_remote_1 or $mixed_local_remote_2) or
@@ -77,8 +87,10 @@ rule CrossOriginEscalation
         // Port-based escalation
         $port_escalation or
         
-        // Mixed security schemes (HTTP/HTTPS mixing)
-        ($mixed_schemes_1 or $mixed_schemes_2 or $mixed_ws_schemes) or
+        // Mixed security schemes (HTTP/HTTPS mixing). A plaintext
+        // json-schema.org identifier alongside an https example URL is not a
+        // downgrade, so the schema exclusion applies here too.
+        (($mixed_schemes_1 or $mixed_schemes_2 or $mixed_ws_schemes) and not $excl_schema_url) or
         
         // Subdomain variations (potential takeover)
         $subdomain_variations or

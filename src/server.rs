@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 pub struct ServerState {
     core: Arc<MCPScannerCore>,
     rate_limiter: Arc<RwLock<HashMap<String, Vec<Instant>>>>,
+    api_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,9 +37,150 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             port: 3000,
-            host: "0.0.0.0".to_string(),
+            // Loopback, not 0.0.0.0. This service takes an arbitrary URL and
+            // arbitrary headers and makes the host issue that request, so a
+            // default that listens on every interface hands a request-forgery
+            // primitive to the whole network. Operators who want it exposed
+            // pass --host explicitly and set RAMPARTS_API_TOKEN.
+            host: "127.0.0.1".to_string(),
         }
     }
+}
+
+/// Shared-secret token required on every scanning endpoint, read once at
+/// startup from `RAMPARTS_API_TOKEN`.
+///
+/// `None` means no token was configured. In that case the server refuses to
+/// bind anything other than loopback, so the unauthenticated mode stays
+/// available for local use without being reachable from the network.
+fn configured_api_token() -> Option<String> {
+    std::env::var("RAMPARTS_API_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Reject a request that does not carry the configured token.
+///
+/// Deliberately NOT applied to `/health`, `/healthz`, or `/livez`: Kubernetes
+/// probes cannot present a secret, and those handlers touch nothing.
+fn check_api_token(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let Some(expected) = state.api_token.as_deref() else {
+        return Ok(());
+    };
+
+    let presented = headers
+        .get("x-ramparts-token")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        })
+        .unwrap_or_default();
+
+    // Constant-time compare so a caller cannot recover the token byte by byte
+    // from response timing.
+    let matches = presented.len() == expected.len()
+        && presented
+            .as_bytes()
+            .iter()
+            .zip(expected.as_bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+
+    if matches {
+        Ok(())
+    } else {
+        warn!("Rejected a request with a missing or invalid API token");
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "success": false,
+                "error": "Missing or invalid API token. Send it as X-Ramparts-Token or Authorization: Bearer <token>.",
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            })),
+        ))
+    }
+}
+
+/// Reject scan targets that resolve to the host itself or to private networks.
+///
+/// The scan endpoints make the server fetch a caller-supplied URL, which is a
+/// textbook request-forgery primitive: without this, a caller reaches
+/// `169.254.169.254` for cloud credentials, or any service bound to the host's
+/// private interfaces. Set `RAMPARTS_ALLOW_PRIVATE_TARGETS=1` to scan internal
+/// servers deliberately.
+fn reject_forbidden_target(raw_url: &str) -> Result<(), String> {
+    let allow_private = std::env::var("RAMPARTS_ALLOW_PRIVATE_TARGETS").is_ok_and(|v| v == "1");
+    reject_forbidden_target_with(raw_url, allow_private)
+}
+
+/// The policy itself, with the environment read out of it, so tests exercise
+/// the rules without mutating process-global state.
+fn reject_forbidden_target_with(raw_url: &str, allow_private: bool) -> Result<(), String> {
+    if allow_private {
+        return Ok(());
+    }
+
+    // Normalize the same way the scanner does before inspecting the host.
+    let candidate = if raw_url.contains("://") {
+        raw_url.to_string()
+    } else {
+        format!("http://{raw_url}")
+    };
+
+    let parsed = url::Url::parse(&candidate).map_err(|e| format!("Invalid URL: {e}"))?;
+
+    // Match on the typed host. `host_str` returns an IPv6 literal wrapped in
+    // brackets ("[::1]"), which does not parse as an IpAddr — so a string-based
+    // check silently lets IPv6 loopback through.
+    let ip = match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => Some(std::net::IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => Some(std::net::IpAddr::V6(v6)),
+        Some(url::Host::Domain(domain)) => {
+            let lowered = domain.to_ascii_lowercase();
+            if lowered == "localhost" || lowered.ends_with(".localhost") {
+                return Err(
+                    "Refusing to scan a loopback address. Set RAMPARTS_ALLOW_PRIVATE_TARGETS=1 \
+                     to allow it."
+                        .to_string(),
+                );
+            }
+            // A bare domain may still resolve into private space. Resolution
+            // happens later in the HTTP stack, so this check is best-effort by
+            // design; the literal forms below are what an attacker reaches for.
+            None
+        }
+        None => return Err("URL has no host".to_string()),
+    };
+
+    if let Some(ip) = ip {
+        let forbidden = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+        if forbidden {
+            return Err(format!(
+                "Refusing to scan {ip}: loopback, private, or link-local address. \
+                 Set RAMPARTS_ALLOW_PRIVATE_TARGETS=1 to allow it."
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub struct MCPScannerServer {
@@ -66,16 +208,52 @@ impl MCPScannerServer {
 
     pub async fn start(self) -> anyhow::Result<()> {
         let core = Arc::new(self.core);
+        let api_token = configured_api_token();
+
+        // Refuse the dangerous combination outright rather than warning about
+        // it. An unauthenticated request-forgery endpoint reachable from the
+        // network is not a configuration to start and log about.
+        let is_loopback = matches!(self.config.host.as_str(), "127.0.0.1" | "::1" | "localhost");
+        if api_token.is_none() && !is_loopback {
+            return Err(anyhow::anyhow!(
+                "Refusing to bind {} without an API token. This service fetches caller-supplied \
+                 URLs, so exposing it unauthenticated is a request-forgery risk. Set \
+                 RAMPARTS_API_TOKEN, or bind 127.0.0.1 for local use.",
+                self.config.host
+            ));
+        }
+        if api_token.is_some() {
+            info!("API token authentication is enabled");
+        } else {
+            info!("No API token set; listening on loopback only");
+        }
+
         let state = ServerState {
             core: core.clone(),
             rate_limiter: Arc::new(RwLock::new(HashMap::new())),
+            api_token,
         };
 
-        // Configure CORS
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-            .allow_headers(Any);
+        // Configure CORS. `allow_origin(Any)` combined with no authentication
+        // let any page in an operator's browser drive the scanner, so the
+        // default is now same-origin only. Operators who need a browser client
+        // list their origins in RAMPARTS_ALLOWED_ORIGINS.
+        let cors = match std::env::var("RAMPARTS_ALLOWED_ORIGINS") {
+            Ok(origins) if !origins.trim().is_empty() => {
+                let parsed: Vec<_> = origins
+                    .split(',')
+                    .filter_map(|o| o.trim().parse::<axum::http::HeaderValue>().ok())
+                    .collect();
+                info!("CORS: allowing {} configured origin(s)", parsed.len());
+                CorsLayer::new()
+                    .allow_origin(parsed)
+                    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                    .allow_headers(Any)
+            }
+            _ => CorsLayer::new()
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers(Any),
+        };
 
         // Create router with routes
         let app = Router::new()
@@ -329,6 +507,24 @@ async fn scan_endpoint(
     headers: HeaderMap,
     Json(mut request): Json<ScanRequest>,
 ) -> Result<Json<ScanResponse>, (StatusCode, Json<Value>)> {
+    check_api_token(&state, &headers)?;
+
+    // Rate limit the endpoint that actually performs work. This previously
+    // guarded only the deprecated refresh-tools stub.
+    if check_rate_limit(&state, std::slice::from_ref(&request.url))
+        .await
+        .is_err()
+    {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "success": false,
+                "error": "Rate limit exceeded. Please try again later.",
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            })),
+        ));
+    }
+
     // Extract Javelin API key from headers using helper function
     extract_and_add_api_key(&headers, &mut request.auth_headers);
 
@@ -353,6 +549,18 @@ async fn scan_endpoint(
             Json(json!({
                 "success": false,
                 "error": "Only HTTP and HTTPS URLs are supported",
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            })),
+        ));
+    }
+
+    // Block request-forgery targets before the scanner fetches anything.
+    if let Err(reason) = reject_forbidden_target(&request.url) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "error": reason,
                 "timestamp": chrono::Utc::now().to_rfc3339()
             })),
         ));
@@ -407,8 +615,14 @@ async fn scan_endpoint(
 /// between the two paths without learning two error formats.
 async fn analyze_endpoint(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(request): Json<AnalyzeRequest>,
 ) -> Result<Json<ScanResponse>, (StatusCode, Json<Value>)> {
+    // This endpoint drives LLM analysis, so it spends money per call even
+    // though it fetches no URL of its own. Require the token; skip the
+    // forgery guard, which has nothing to check here.
+    check_api_token(&state, &headers)?;
+
     // Validate timeout (same range as /scan — 1..=3600 seconds).
     if let Some(timeout) = request.timeout {
         if timeout == 0 || timeout > 3600 {
@@ -493,6 +707,8 @@ async fn batch_scan_endpoint(
     headers: HeaderMap,
     Json(mut request): Json<BatchScanRequest>,
 ) -> Result<Json<BatchScanResponse>, (StatusCode, Json<Value>)> {
+    check_api_token(&state, &headers)?;
+
     // Fix critical bug: Handle API key even when options is None
     if request.options.is_none() {
         // Create default options if they don't exist
@@ -510,6 +726,45 @@ async fn batch_scan_endpoint(
             Json(json!({
                 "success": false,
                 "error": "At least one URL is required",
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            })),
+        ));
+    }
+
+    // Cap the batch. Scans run sequentially, so an uncapped list is an
+    // unbounded amount of work bought with a single request.
+    const MAX_BATCH_URLS: usize = 50;
+    if request.urls.len() > MAX_BATCH_URLS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": format!("At most {MAX_BATCH_URLS} URLs per batch request"),
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            })),
+        ));
+    }
+
+    // Apply the forgery guard to every target, not just the first.
+    for url in &request.urls {
+        if let Err(reason) = reject_forbidden_target(url) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "success": false,
+                    "error": reason,
+                    "timestamp": chrono::Utc::now().to_rfc3339()
+                })),
+            ));
+        }
+    }
+
+    if check_rate_limit(&state, &request.urls).await.is_err() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "success": false,
+                "error": "Rate limit exceeded. Please try again later.",
                 "timestamp": chrono::Utc::now().to_rfc3339()
             })),
         ));
@@ -690,30 +945,44 @@ async fn list_servers_endpoint(
     Json(response)
 }
 
-/// Check rate limit for refresh requests
+/// Check the per-URL rate limit for a scanning request.
+///
+/// Two fixes over the original. The map is swept of empty and stale entries on
+/// every call, because it is keyed on a caller-supplied URL and previously grew
+/// without bound. And the limit is checked for every URL *before* any timestamp
+/// is recorded, so a batch that trips the limit part-way no longer leaves the
+/// earlier URLs charged for a request that was refused.
 async fn check_rate_limit(state: &ServerState, urls: &[String]) -> Result<(), StatusCode> {
+    const MAX_REQUESTS_PER_MINUTE: usize = 10;
+    const MAX_TRACKED_URLS: usize = 10_000;
+
     let now = Instant::now();
+    let window_duration = Duration::from_secs(60);
     let mut rate_limiter = state.rate_limiter.write().await;
 
-    // Load rate limit config (default values if config loading fails)
-    let max_requests_per_minute = 10u64; // Default from config
-    let window_duration = Duration::from_secs(60); // 1 minute window
-
-    for url in urls {
-        // Get or create request history for this URL
-        let requests = rate_limiter.entry(url.clone()).or_insert_with(Vec::new);
-
-        // Remove old requests outside the time window
+    // Sweep expired timestamps and drop entries that hold none. Without this
+    // the map retains a key for every distinct URL ever submitted.
+    rate_limiter.retain(|_, requests| {
         requests.retain(|&timestamp| now.duration_since(timestamp) < window_duration);
+        !requests.is_empty()
+    });
 
-        // Check if we're at the rate limit
-        if requests.len() >= max_requests_per_minute as usize {
+    // Backstop against a flood of distinct URLs inside a single window.
+    if rate_limiter.len() >= MAX_TRACKED_URLS {
+        warn!("Rate limiter is tracking {MAX_TRACKED_URLS} URLs; shedding load");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // Check every URL first, so nothing is recorded for a refused request.
+    for url in urls {
+        if rate_limiter.get(url).map_or(0, Vec::len) >= MAX_REQUESTS_PER_MINUTE {
             warn!("Rate limit exceeded for URL: {}", url);
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
+    }
 
-        // Add current request to history
-        requests.push(now);
+    for url in urls {
+        rate_limiter.entry(url.clone()).or_default().push(now);
     }
 
     Ok(())
@@ -726,11 +995,49 @@ mod tests {
     use super::*;
     // Note: StatusCode is used in the validation logic but not in tests
 
+    /// The default bind address must stay on loopback. This service fetches
+    /// caller-supplied URLs with caller-supplied headers, so a default of
+    /// 0.0.0.0 exposed a request-forgery primitive to the whole network.
     #[test]
-    fn test_server_config_default() {
+    fn test_server_defaults_to_loopback() {
         let config = ServerConfig::default();
         assert_eq!(config.port, 3000);
-        assert_eq!(config.host, "0.0.0.0");
+        assert_eq!(
+            config.host, "127.0.0.1",
+            "the default bind address must not be reachable from the network"
+        );
+    }
+
+    #[test]
+    fn test_forbidden_targets_are_rejected() {
+        let denied = |url: &str| reject_forbidden_target_with(url, false).is_err();
+
+        // Cloud metadata, the canonical request-forgery target.
+        assert!(denied("http://169.254.169.254/latest/meta-data"));
+        // Loopback by name and by address, v4 and v6.
+        assert!(denied("http://localhost:8080"));
+        assert!(denied("http://127.0.0.1:3000"));
+        assert!(denied("http://[::1]:3000"));
+        // RFC 1918 space.
+        assert!(denied("http://10.0.0.5/mcp"));
+        assert!(denied("http://192.168.1.10/mcp"));
+        assert!(denied("http://172.16.4.2/mcp"));
+        // A scheme-less host must be normalized before the check, not skipped.
+        assert!(denied("127.0.0.1:3000"));
+
+        // Ordinary public targets still scan.
+        assert!(reject_forbidden_target_with("https://mcp.example.com/v1", false).is_ok());
+        assert!(reject_forbidden_target_with("mcp.example.com", false).is_ok());
+    }
+
+    #[test]
+    fn test_private_targets_allowed_when_explicitly_opted_in() {
+        // Operators who mean to scan internal servers can opt in. Exercised
+        // through the pure form so the test mutates no process-global state.
+        assert!(reject_forbidden_target_with("http://10.0.0.5/mcp", true).is_ok());
+        assert!(reject_forbidden_target_with("http://169.254.169.254/", true).is_ok());
+        // ...and the same targets are still refused by default.
+        assert!(reject_forbidden_target_with("http://10.0.0.5/mcp", false).is_err());
     }
 
     #[test]
