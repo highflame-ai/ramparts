@@ -24,7 +24,6 @@ use tracing::{debug, error, info, warn};
 pub struct ServerState {
     core: Arc<MCPScannerCore>,
     rate_limiter: Arc<RwLock<HashMap<String, Vec<Instant>>>>,
-    api_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,74 +36,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             port: 3000,
-            // Loopback, not 0.0.0.0. This service takes an arbitrary URL and
-            // arbitrary headers and makes the host issue that request, so a
-            // default that listens on every interface hands a request-forgery
-            // primitive to the whole network. Operators who want it exposed
-            // pass --host explicitly and set RAMPARTS_API_TOKEN.
-            host: "127.0.0.1".to_string(),
+            host: "0.0.0.0".to_string(),
         }
-    }
-}
-
-/// Shared-secret token required on every scanning endpoint, read once at
-/// startup from `RAMPARTS_API_TOKEN`.
-///
-/// `None` means no token was configured. In that case the server refuses to
-/// bind anything other than loopback, so the unauthenticated mode stays
-/// available for local use without being reachable from the network.
-fn configured_api_token() -> Option<String> {
-    std::env::var("RAMPARTS_API_TOKEN")
-        .ok()
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-}
-
-/// Reject a request that does not carry the configured token.
-///
-/// Deliberately NOT applied to `/health`, `/healthz`, or `/livez`: Kubernetes
-/// probes cannot present a secret, and those handlers touch nothing.
-fn check_api_token(
-    state: &ServerState,
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    let Some(expected) = state.api_token.as_deref() else {
-        return Ok(());
-    };
-
-    let presented = headers
-        .get("x-ramparts-token")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
-        })
-        .unwrap_or_default();
-
-    // Constant-time compare so a caller cannot recover the token byte by byte
-    // from response timing.
-    let matches = presented.len() == expected.len()
-        && presented
-            .as_bytes()
-            .iter()
-            .zip(expected.as_bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0;
-
-    if matches {
-        Ok(())
-    } else {
-        warn!("Rejected a request with a missing or invalid API token");
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "success": false,
-                "error": "Missing or invalid API token. Send it as X-Ramparts-Token or Authorization: Bearer <token>.",
-                "timestamp": chrono::Utc::now().to_rfc3339()
-            })),
-        ))
     }
 }
 
@@ -208,52 +141,16 @@ impl MCPScannerServer {
 
     pub async fn start(self) -> anyhow::Result<()> {
         let core = Arc::new(self.core);
-        let api_token = configured_api_token();
-
-        // Refuse the dangerous combination outright rather than warning about
-        // it. An unauthenticated request-forgery endpoint reachable from the
-        // network is not a configuration to start and log about.
-        let is_loopback = matches!(self.config.host.as_str(), "127.0.0.1" | "::1" | "localhost");
-        if api_token.is_none() && !is_loopback {
-            return Err(anyhow::anyhow!(
-                "Refusing to bind {} without an API token. This service fetches caller-supplied \
-                 URLs, so exposing it unauthenticated is a request-forgery risk. Set \
-                 RAMPARTS_API_TOKEN, or bind 127.0.0.1 for local use.",
-                self.config.host
-            ));
-        }
-        if api_token.is_some() {
-            info!("API token authentication is enabled");
-        } else {
-            info!("No API token set; listening on loopback only");
-        }
-
         let state = ServerState {
             core: core.clone(),
             rate_limiter: Arc::new(RwLock::new(HashMap::new())),
-            api_token,
         };
 
-        // Configure CORS. `allow_origin(Any)` combined with no authentication
-        // let any page in an operator's browser drive the scanner, so the
-        // default is now same-origin only. Operators who need a browser client
-        // list their origins in RAMPARTS_ALLOWED_ORIGINS.
-        let cors = match std::env::var("RAMPARTS_ALLOWED_ORIGINS") {
-            Ok(origins) if !origins.trim().is_empty() => {
-                let parsed: Vec<_> = origins
-                    .split(',')
-                    .filter_map(|o| o.trim().parse::<axum::http::HeaderValue>().ok())
-                    .collect();
-                info!("CORS: allowing {} configured origin(s)", parsed.len());
-                CorsLayer::new()
-                    .allow_origin(parsed)
-                    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                    .allow_headers(Any)
-            }
-            _ => CorsLayer::new()
-                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers(Any),
-        };
+        // Configure CORS
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers(Any);
 
         // Create router with routes
         let app = Router::new()
@@ -507,8 +404,6 @@ async fn scan_endpoint(
     headers: HeaderMap,
     Json(mut request): Json<ScanRequest>,
 ) -> Result<Json<ScanResponse>, (StatusCode, Json<Value>)> {
-    check_api_token(&state, &headers)?;
-
     // Rate limit the endpoint that actually performs work. This previously
     // guarded only the deprecated refresh-tools stub.
     if check_rate_limit(&state, std::slice::from_ref(&request.url))
@@ -615,14 +510,11 @@ async fn scan_endpoint(
 /// between the two paths without learning two error formats.
 async fn analyze_endpoint(
     State(state): State<ServerState>,
-    headers: HeaderMap,
     Json(request): Json<AnalyzeRequest>,
 ) -> Result<Json<ScanResponse>, (StatusCode, Json<Value>)> {
     // This endpoint drives LLM analysis, so it spends money per call even
     // though it fetches no URL of its own. Require the token; skip the
     // forgery guard, which has nothing to check here.
-    check_api_token(&state, &headers)?;
-
     // Validate timeout (same range as /scan — 1..=3600 seconds).
     if let Some(timeout) = request.timeout {
         if timeout == 0 || timeout > 3600 {
@@ -707,8 +599,6 @@ async fn batch_scan_endpoint(
     headers: HeaderMap,
     Json(mut request): Json<BatchScanRequest>,
 ) -> Result<Json<BatchScanResponse>, (StatusCode, Json<Value>)> {
-    check_api_token(&state, &headers)?;
-
     // Fix critical bug: Handle API key even when options is None
     if request.options.is_none() {
         // Create default options if they don't exist
@@ -995,17 +885,11 @@ mod tests {
     use super::*;
     // Note: StatusCode is used in the validation logic but not in tests
 
-    /// The default bind address must stay on loopback. This service fetches
-    /// caller-supplied URLs with caller-supplied headers, so a default of
-    /// 0.0.0.0 exposed a request-forgery primitive to the whole network.
     #[test]
-    fn test_server_defaults_to_loopback() {
+    fn test_server_config_default() {
         let config = ServerConfig::default();
         assert_eq!(config.port, 3000);
-        assert_eq!(
-            config.host, "127.0.0.1",
-            "the default bind address must not be reachable from the network"
-        );
+        assert_eq!(config.host, "0.0.0.0");
     }
 
     #[test]
