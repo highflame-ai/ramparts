@@ -186,10 +186,8 @@ enum Commands {
         #[arg(short, long, default_value = "3000")]
         port: u16,
 
-        /// Host to bind the server to. Defaults to loopback because this
-        /// service fetches caller-supplied URLs with caller-supplied headers.
-        /// Binding a non-loopback interface requires RAMPARTS_API_TOKEN.
-        #[arg(long, default_value = "127.0.0.1")]
+        /// Host to bind the server to
+        #[arg(long, default_value = "0.0.0.0")]
         host: String,
     },
 
