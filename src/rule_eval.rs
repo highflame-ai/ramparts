@@ -58,6 +58,28 @@ fn render(entry: &Value) -> String {
     text
 }
 
+/// Scan the same way the live pipeline does: raw text first, then every
+/// normalized/decoded view, deduped by rule name. Without this the corpus
+/// would test `pre_scan` in isolation and never exercise the
+/// evasion-resistant rescan that `scan_items_with_yara` applies in
+/// production — so a Unicode/base64 evasion case would look "missed" here
+/// even though the real scanner catches it.
+fn scan_all_views(engine: &ThreatRules, text: &str) -> Vec<String> {
+    let mut rules: Vec<String> = engine
+        .pre_scan(text, "corpus")
+        .into_iter()
+        .map(|h| h.rule_name)
+        .collect();
+    for view in crate::normalize::additional_scan_views(text) {
+        for h in engine.pre_scan(&view, "corpus") {
+            rules.push(h.rule_name);
+        }
+    }
+    rules.sort();
+    rules.dedup();
+    rules
+}
+
 fn load(path: &str) -> Vec<Value> {
     let raw = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("corpus {path} must be readable: {e}"));
@@ -84,11 +106,8 @@ fn evaluate() -> Outcome {
 
     let mut benign_flagged = Vec::new();
     for entry in &benign {
-        let hits = engine.pre_scan(&render(entry), "corpus");
-        if !hits.is_empty() {
-            let mut rules: Vec<String> = hits.into_iter().map(|h| h.rule_name).collect();
-            rules.sort();
-            rules.dedup();
+        let rules = scan_all_views(&engine, &render(entry));
+        if !rules.is_empty() {
             benign_flagged.push((
                 entry["origin"].as_str().unwrap_or("?").to_string(),
                 entry["name"].as_str().unwrap_or("?").to_string(),
@@ -99,8 +118,8 @@ fn evaluate() -> Outcome {
 
     let mut malicious_missed = Vec::new();
     for entry in &malicious {
-        let hits = engine.pre_scan(&render(entry), "corpus");
-        if hits.is_empty() {
+        let rules = scan_all_views(&engine, &render(entry));
+        if rules.is_empty() {
             malicious_missed.push((
                 entry["id"].as_str().unwrap_or("?").to_string(),
                 entry["attack"].as_str().unwrap_or("?").to_string(),

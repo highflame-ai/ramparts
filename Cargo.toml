@@ -77,6 +77,11 @@ url = "2.4"
 # Regular expressions for environment variable expansion
 regex = "1.10"
 
+# NFKC folding for the evasion-resistant rescan pass (normalize.rs):
+# collapses fullwidth/mathematical-alphanumeric homoglyphs so YARA
+# rules match text an attacker spelled with Unicode variants.
+unicode-normalization = "0.1"
+
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
 

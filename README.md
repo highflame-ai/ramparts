@@ -35,14 +35,16 @@ Ramparts provides **security scanning** of the MCP-and-skill ecosystem by:
 
 1. **MCP server discovery & analysis** — scans MCP endpoints for tools/resources/prompts; multi-transport (HTTP, SSE, stdio, subprocess) with intelligent fallback and session management
 2. **Skill scanning** — same threat model applied to agent skill files on disk (Claude Code commands, agentskills.io bundles incl. bundled `scripts/` + `references/`, Cursor / Codex / Windsurf / Gemini variants)
-3. **Static analysis (YARA)** — 35+ pre/post-scan rules across both surfaces: 9 skill-targeted rules (prompt-injection variants, credential harvesting, tool-chaining exfil, system manipulation, authority abuse) plus malware-IOC rules adapted from [NVIDIA SkillSpector](https://github.com/NVIDIA/SkillSpector) (cryptominers, reverse shells / C2 / info-stealers, webshells, offensive hack tools)
-4. **LLM-powered analysis** — sophisticated semantic issues no static rule can spot (tool descriptions that lie about behavior, sneaky permission requests, etc.)
-5. **Cross-origin analysis** — detects tools spanning multiple domains, a context-hijacking / injection vector
-6. **Supply-chain coverage** — queries OSV.dev for known CVEs in npx/uvx-launched stdio MCP servers
-7. **Structural skill heuristics** — overbroad `allowed-tools` grants, vague/generic triggers, sensitive `@<path>` references, embedded base64/hex payloads, skill-name collisions
-8. **agentskills.io spec validation** — directory-vs-`name:` mismatch (deception), spec name-rule violations, unknown frontmatter fields
-9. **OWASP MCP Top 10 tagging** — every finding mapped to a versioned OWASP MCP Top 10 entry; visible in terminal, JSON, SARIF, and markdown report output
-10. **Multiple output formats** — terminal, JSON, **SARIF 2.1.0** (for GitHub Advanced Security / GitLab / Azure DevOps), and a detailed markdown report
+3. **Static analysis (YARA)** — 40 pre-scan rules across both surfaces: 10 skill-targeted rules (prompt-injection variants, credential harvesting, tool-chaining exfil, system manipulation, authority abuse, covert exfiltration) plus malware-IOC rules adapted from [NVIDIA SkillSpector](https://github.com/NVIDIA/SkillSpector) (cryptominers, reverse shells / C2 / info-stealers, webshells, offensive hack tools)
+4. **Evasion-resistant rescan** — every YARA rule is also run over a normalized view (invisible/zero-width chars stripped, NFKC homoglyph folding) and iteratively base64/hex-decoded views, so a keyword split by zero-width characters, spelled in fullwidth homoglyphs, or hidden in an encoded blob still matches
+5. **LLM-powered analysis** — sophisticated semantic issues no static rule can spot (tool descriptions that lie about behavior, sneaky permission requests, etc.)
+6. **Cross-origin analysis** — detects tools spanning multiple domains, a context-hijacking / injection vector
+7. **Supply-chain coverage** — queries OSV.dev for known CVEs in npx/uvx-launched stdio MCP servers and in exactly-pinned dependencies declared by skill bundles (`requirements.txt`, `package.json`)
+8. **Rug-pull / drift detection** — content-fingerprints MCP server configs, individual tool definitions, and skill files against a stored baseline; flags any post-approval swap (`MCPConfigChanged` / `MCPToolChanged` / `SkillContentChanged`)
+9. **Structural skill heuristics** — overbroad `allowed-tools` grants, vague/generic triggers, sensitive `@<path>` references, embedded base64/hex payloads, skill-name collisions, agent identity/memory-file writes, undeclared network egress (manifest-vs-script mismatch), external-reference inventory, unsafe-YAML-deserialization tags, brand impersonation, JSON prototype pollution, and an explicit incomplete-coverage finding when files are skipped
+10. **agentskills.io spec validation** — directory-vs-`name:` mismatch (deception), spec name-rule violations, unknown frontmatter fields
+11. **OWASP taxonomy tagging** — every finding mapped to the versioned **OWASP MCP Top 10**; skill-surface findings additionally carry **OWASP Agentic Skills Top 10** (`AST01`–`AST10`) tags. Visible in terminal, JSON, SARIF, and markdown report output
+12. **Multiple output formats** — terminal, JSON, **SARIF 2.1.0** (for GitHub Advanced Security / GitLab / Azure DevOps), and a detailed markdown report
 >
 > **💡 Jump directly to detailed Rampart features?**
 > [**📚 Detailed Features**](docs/features.md)

@@ -134,6 +134,71 @@ fn split_pypi_spec(raw: &str) -> Option<(String, Option<String>)> {
     Some((raw.to_string(), None))
 }
 
+/// Parse a dependency manifest bundled with a skill into OSV-queryable
+/// specs (OWASP AST02: skill-bundle dependencies are the delivery
+/// mechanism for staged-loader / dependency-confusion attacks; scanning
+/// only the launch command misses them entirely).
+///
+/// Conservative on purpose: only exactly-pinned versions are returned.
+/// - `requirements.txt`: `name==version` lines (extras and environment
+///   markers stripped); ranges (`>=`) are skipped.
+/// - `package.json`: `dependencies` + `devDependencies` entries whose
+///   version is exact (no `^ ~ > < * x ||` range syntax).
+pub fn parse_manifest_specs(filename: &str, content: &str) -> Vec<PackageSpec> {
+    match filename {
+        "requirements.txt" => content
+            .lines()
+            .filter_map(|line| {
+                let line = line.split('#').next().unwrap_or("").trim();
+                let (name, rest) = line.split_once("==")?;
+                // strip extras: `pkg[extra]==1.0` -> `pkg`
+                let name = name.split('[').next().unwrap_or(name).trim();
+                // strip env markers / trailing tokens: `1.0 ; python<3` -> `1.0`
+                let version = rest
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if name.is_empty() || version.is_empty() {
+                    return None;
+                }
+                Some(PackageSpec {
+                    ecosystem: "PyPI",
+                    name: name.to_string(),
+                    version: Some(version.to_string()),
+                })
+            })
+            .collect(),
+        "package.json" => {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
+                return Vec::new();
+            };
+            let mut specs = Vec::new();
+            for section in ["dependencies", "devDependencies"] {
+                let Some(deps) = json.get(section).and_then(|d| d.as_object()) else {
+                    continue;
+                };
+                for (name, ver) in deps {
+                    let Some(ver) = ver.as_str() else { continue };
+                    let exact = ver.starts_with(|c: char| c.is_ascii_digit())
+                        && !ver.contains(['^', '~', '>', '<', '*', 'x', '|', ' ']);
+                    if exact {
+                        specs.push(PackageSpec {
+                            ecosystem: "npm",
+                            name: name.clone(),
+                            version: Some(ver.to_string()),
+                        });
+                    }
+                }
+            }
+            specs
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn version_or_none(s: &str) -> Option<String> {
     let s = s.trim();
     // npm/PyPI both treat "latest" as a tag rather than a real version. OSV
@@ -666,5 +731,35 @@ mod tests {
         assert_eq!(result.installed_version, Some("4.17.20".to_string()));
         assert_eq!(result.fixed_version, Some("4.17.21".to_string()));
         assert_eq!(result.target_type, "dependency");
+    }
+
+    #[test]
+    fn parses_requirements_txt_pins_only() {
+        let content = "requests==2.31.0\nflask>=2.0  # range, skipped\n\
+                       pyyaml[safe]==6.0.1 ; python_version<'3.12'\n# comment\n";
+        let specs = parse_manifest_specs("requirements.txt", content);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "requests");
+        assert_eq!(specs[0].version.as_deref(), Some("2.31.0"));
+        assert_eq!(specs[1].name, "pyyaml");
+        assert_eq!(specs[1].version.as_deref(), Some("6.0.1"));
+    }
+
+    #[test]
+    fn parses_package_json_exact_versions_only() {
+        let content = r#"{
+            "dependencies": { "lodash": "4.17.20", "axios": "^1.0.0" },
+            "devDependencies": { "left-pad": "1.3.0" }
+        }"#;
+        let specs = parse_manifest_specs("package.json", content);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"lodash"));
+        assert!(names.contains(&"left-pad"));
+        assert!(!names.contains(&"axios"));
+    }
+
+    #[test]
+    fn unknown_manifest_yields_nothing() {
+        assert!(parse_manifest_specs("Gemfile", "gem 'rails'").is_empty());
     }
 }
