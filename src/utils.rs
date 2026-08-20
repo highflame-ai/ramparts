@@ -1291,12 +1291,24 @@ fn print_table_result(result: &ScanResult, detailed: bool) {
                 }
 
                 if !yara_result.owasp_tags.is_empty() {
-                    let ids: Vec<&str> = yara_result
+                    let mcp: Vec<&str> = yara_result
                         .owasp_tags
                         .iter()
+                        .filter(|t| t.framework == crate::taxonomy::FRAMEWORK_MCP)
                         .map(|t| t.id.as_str())
                         .collect();
-                    println!("  OWASP MCP Top 10: {}", ids.join(", "));
+                    let ast: Vec<&str> = yara_result
+                        .owasp_tags
+                        .iter()
+                        .filter(|t| t.framework == crate::taxonomy::FRAMEWORK_AST)
+                        .map(|t| t.id.as_str())
+                        .collect();
+                    if !mcp.is_empty() {
+                        println!("  OWASP MCP Top 10: {}", mcp.join(", "));
+                    }
+                    if !ast.is_empty() {
+                        println!("  OWASP Agentic Skills Top 10: {}", ast.join(", "));
+                    }
                 }
 
                 if let Some(matched_text) = &yara_result.matched_text {

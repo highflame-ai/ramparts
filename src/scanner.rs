@@ -722,11 +722,28 @@ impl YaraScanner {
             let item_text = Self::format_item_for_yara_scan(item);
             let context = format!("{} '{}'", T::item_type(), item.name());
 
-            // Use enhanced scanning methods that return metadata
+            // Scan the raw text first (rules like UnicodeSteganography need
+            // the raw bytes), then every normalized/decoded view of it, so a
+            // keyword split by zero-width chars, folded into homoglyphs, or
+            // hidden in a base64/hex blob still hits the same rules (AST08).
+            // Matches are deduped by rule name across views.
             #[cfg(feature = "yara-x-scanning")]
-            let enhanced_matches = match phase {
-                ScanPhase::PreScan => self.scanner.pre_scan(&item_text, &context),
-                ScanPhase::PostScan => self.scanner.post_scan(&item_text, &context),
+            let enhanced_matches = {
+                let scan_one = |text: &str| match phase {
+                    ScanPhase::PreScan => self.scanner.pre_scan(text, &context),
+                    ScanPhase::PostScan => self.scanner.post_scan(text, &context),
+                };
+                let mut matches = scan_one(&item_text);
+                let mut seen: std::collections::HashSet<String> =
+                    matches.iter().map(|m| m.rule_name.clone()).collect();
+                for view in crate::normalize::additional_scan_views(&item_text) {
+                    for m in scan_one(&view) {
+                        if seen.insert(m.rule_name.clone()) {
+                            matches.push(m);
+                        }
+                    }
+                }
+                matches
             };
 
             #[cfg(not(feature = "yara-x-scanning"))]
@@ -1153,6 +1170,9 @@ impl MCPScanner {
 
         // === PRE-SCAN HOOKS ===
         self.middleware_chain.run_pre_scan(&mut scan_data);
+        scan_data
+            .yara_results
+            .extend(crate::baseline::check_tool_drift(url, &scan_data.tools));
 
         result.status = ScanStatus::Success;
         result.server_info.clone_from(&scan_data.server_info);
@@ -1347,6 +1367,12 @@ impl MCPScanner {
             Ok(mut scan_data) => {
                 // === PRE-SCAN HOOKS ===
                 self.middleware_chain.run_pre_scan(&mut scan_data);
+                scan_data
+                    .yara_results
+                    .extend(crate::baseline::check_tool_drift(
+                        &normalized_url,
+                        &scan_data.tools,
+                    ));
 
                 result.status = ScanStatus::Success;
                 result.server_info.clone_from(&scan_data.server_info);
@@ -1653,6 +1679,12 @@ impl MCPScanner {
             Ok((session, mut scan_data)) => {
                 // Apply the same middleware chain as HTTP scanning
                 self.middleware_chain.run_pre_scan(&mut scan_data);
+                scan_data
+                    .yara_results
+                    .extend(crate::baseline::check_tool_drift(
+                        &display_url,
+                        &scan_data.tools,
+                    ));
 
                 // === SECURITY ANALYSIS ===
                 // Load scanner configuration for security analysis
