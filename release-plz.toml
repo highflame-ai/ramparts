@@ -32,7 +32,28 @@ git_tag_name = "{{ version }}"
 # read "chore: release v0.9.0" which doesn't pass Highflame's
 # commit-prefix check (only feat:/fix:/devops:/Merge/Revert are
 # allowed). Use `feat:` so the PR's merge commit passes CI.
-pr_name = "feat: release {{ version }}"
+#
+# DO NOT add `{{ version }}` back here. release-plz populates that
+# variable ONLY when releasing a single package, or several packages
+# that land on the same version. This is a two-crate workspace with
+# independent versions (`ramparts` 0.8.2 / `ramparts-common` 0.8.1 on
+# crates.io), so the moment both crates need a release at different
+# versions the render fails with "Variable `version` is not defined"
+# and the job exits 1 — no release PR, no draft release.
+#
+# That is not hypothetical: it broke every push to `main` from
+# 2026-08-17 onward, once a change to `common/Cargo.toml` made
+# `ramparts-common` eligible for its own bump for the first time in
+# months. Before that, only `ramparts` ever released, so the single-
+# package case always held and the template worked by luck.
+#
+# There is no `packages` list available to `pr_name` (only `package`
+# and `version`, both single-package-only), so a per-crate title is
+# not expressible. The versions are not lost: they appear in
+# `git_tag_name`, in the draft GitHub release, and in the default
+# `pr_body`, whose `releases` array carries `release.package`,
+# `release.previous_version`, and `release.next_version` per crate.
+pr_name = "feat: release"
 
 # Workspace-level changelog template. Even though we set
 # `changelog_update = false` per package (no `CHANGELOG.md` written
