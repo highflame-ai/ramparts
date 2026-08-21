@@ -10,6 +10,8 @@ env:
   DEVOPS_BRANCH: "main"
   CICD_TRIGGER: "enable"
   CICD_WORKFLOW: "trigger-release-deploy-ramparts-server.yml"
+  REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+  RELEASE_NAME: ${{ github.event.release.name }}
 
 jobs:
   reusable-vars:
@@ -22,15 +24,33 @@ jobs:
     outputs:
       CICD_TRIGGER: ${{ env.CICD_TRIGGER }}
 
-  reusable-workflow-validate:
+  highflame-validate:
     permissions:
       contents: 'read'
-      id-token: 'write'
-    uses: highflame-ai/highflame-workflow/.github/workflows/workflow-release-validate.yml@v2.0
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Validate Release Tag
+        id: validate_tag
+        shell: bash
+        run: |-
+          if [[ "${{ env.RELEASE_NAME }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
+            echo "Valid version format: ${{ env.RELEASE_NAME }}"
+          else
+            echo "Invalid version format: ${{ env.RELEASE_NAME }}"
+            echo "Expected bare semver (X.Y.Z); got: ${{ env.RELEASE_NAME }}"
+            exit 1
+          fi
 
   highflame-trigger:
     needs:
       - reusable-vars
+      - highflame-validate
     permissions:
       contents: 'read'
       id-token: 'write'

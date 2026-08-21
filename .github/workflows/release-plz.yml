@@ -28,7 +28,7 @@ name: Release-plz (auto-bump + draft release)
 
 on:
   push:
-    branches: [main]
+    branches: [don't-trigger]
 
 concurrency:
   group: release-plz-${{ github.ref }}
