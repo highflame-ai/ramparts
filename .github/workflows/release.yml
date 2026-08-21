@@ -46,7 +46,7 @@ jobs:
               echo "::error::Expected $f to exist; aborting release."
               exit 1
             fi
-            sed -i 's/^version = ".*"/version = "$VERSION"/' "$f"
+            sed -i "s|^version = \".*\"|version = \"$VERSION\"|" "$f"
             actual="$(grep -m1 '^version = ' "$f" | cut -d'"' -f2)"
             if [[ "$actual" != "$VERSION" ]]; then
               echo "::error::$f version did not update to $VERSION (got: $actual)"
