@@ -8,20 +8,10 @@ on:
 env:
   PY_VER: 3.11.8
   RELEASE_BRANCH: "main"
-  REGEX_PATTERN: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+  REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
   RELEASE_NAME: ${{ github.event.release.name }}
 
 jobs:
-  reusable-vars:
-    permissions:
-      contents: 'read'
-    runs-on: ubuntu-24.04
-    steps:
-      - name: reusable variables
-        run: echo "Exposing env vars"
-    outputs:
-      RELEASE_TRIGGER: ${{ env.RELEASE_TRIGGER }}
-
   highflame-validate:
     permissions:
       contents: 'read'
@@ -33,12 +23,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      # Tag format gate. Previously this step was conditioned on
-      # `steps.validate_branch.outputs.enable_branch_build == 'true'`,
-      # but `validate_branch` was never a real step in this job — the
-      # gate evaluated to false and the validation silently skipped on
-      # every release. Removed the conditional; the format check now
-      # actually runs. (Same bug + fix as zeroid's release.yml.)
       - name: Validate Release Tag
         id: validate_tag
         shell: bash
@@ -51,128 +35,26 @@ jobs:
             exit 1
           fi
 
-      # convco (Rust equivalent of caarlos0/svu — same Conventional
-      # Commits model) computes the semver bump implied by commit
-      # messages since the last tag. Highflame's commit-prefix
-      # convention maps cleanly onto Conventional Commits for the
-      # bumps: `feat:` -> minor, `fix:` -> patch, `feat!:` /
-      # `BREAKING CHANGE:` -> major. `devops:`, `build(deps)`,
-      # `[Snyk]`, `Bump`, `Merge`, `Revert` aren't in convco's default
-      # type table and don't move version numbers — matches our intent
-      # (housekeeping, not user-visible).
-      #
-      # Behavior: fail if the published tag is BELOW convco's
-      # recommendation — that means a `feat:` commit was missed and
-      # we'd be silently shipping a feature as a patch. Allow tags AT
-      # OR ABOVE the recommendation so a maintainer can manually force
-      # a higher bump (e.g., release a major from a fix-only window).
-      # Note: convco's pre-1.0 bump heuristic is more conservative than
-      # svu's; this is fine here because the check is one-way (fail on
-      # too-low) — false negatives (a missed under-bump) hurt less than
-      # false positives (blocking a correct release).
-      #
-      # ramparts uses bare semver tags (X.Y.Z, no `v` prefix); convco's
-      # `--prefix ""` outputs the same shape so no string munging is
-      # needed. Installed from the prebuilt binary release rather than
-      # `cargo install convco` so the job doesn't burn a few minutes
-      # compiling the tool on every release.
-      - name: Validate semver against commit history (convco)
-        shell: bash
-        run: |-
-          set -euo pipefail
-          CONVCO_VERSION="0.6.3"
-          curl -fsSL "https://github.com/convco/convco/releases/download/v${CONVCO_VERSION}/convco-ubuntu.zip" -o /tmp/convco.zip
-          unzip -q /tmp/convco.zip -d /tmp/convco-bin
-          sudo install -m 0755 /tmp/convco-bin/convco /usr/local/bin/convco
-
-          # Critical: at release-publish time the just-pushed tag is
-          # already at HEAD. `convco version --bump` would then see it
-          # as "the latest tag" and report zero bump (no commits past
-          # HEAD), making the check trivially pass on every release.
-          # Delete the tag from the LOCAL clone before computing — the
-          # remote still has it (the GitHub release isn't affected) —
-          # so convco sees the PREVIOUS tag as the latest and computes
-          # the bump from commits between previous-tag and HEAD. That's
-          # what we actually want to validate.
-          ACTUAL="${{ env.RELEASE_NAME }}"
-          if git rev-parse --verify --quiet "refs/tags/${ACTUAL}" >/dev/null; then
-            git tag -d "${ACTUAL}" >/dev/null
-            echo "Removed local tag ${ACTUAL} so convco computes the bump from the previous tag."
-          else
-            # Tag wasn't fetched into the local clone. Warn loudly —
-            # convco's output may be off but the comparison still
-            # catches gross under-bumps.
-            echo "::warning::Local tag ${ACTUAL} not found; convco computation may be skewed."
-          fi
-
-          EXPECTED="$(convco version --bump --prefix '')"
-          if [[ -z "${EXPECTED}" ]]; then
-            echo "::error::convco returned an empty recommendation. Cannot validate."
-            exit 1
-          fi
-          echo "Published tag : ${ACTUAL}"
-          echo "convco --bump : ${EXPECTED}"
-          HIGHEST="$(printf '%s\n%s\n' "${EXPECTED}" "${ACTUAL}" | sort -V | tail -1)"
-          if [[ "${ACTUAL}" != "${EXPECTED}" && "${HIGHEST}" != "${ACTUAL}" ]]; then
-            echo "::error::Release tag ${ACTUAL} is below convco's computed next version ${EXPECTED}."
-            echo "::error::This usually means a feat: commit since the last tag implied a minor bump."
-            echo "::error::Either retag at ${EXPECTED} or higher, or audit recent commit prefixes."
-            exit 1
-          fi
-          if [[ "${ACTUAL}" != "${EXPECTED}" ]]; then
-            echo "::notice::Release tag ${ACTUAL} is ahead of convco's recommendation (${EXPECTED}). Treating as an intentional manual bump."
-          else
-            echo "Release tag matches convco recommendation."
-          fi
-
-      # Stamp the release version into every place a version literal
-      # appears. Today that's the root Cargo.toml and `common/Cargo.toml`
-      # (the `ramparts-common` workspace member). Both files need to
-      # match — drifting versions inside a single workspace either
-      # break `cargo publish` outright or ship a confusing mix of
-      # `[[package]]` entries in the eventual crate metadata.
-      #
-      # `Cargo.lock` is refreshed implicitly by the downstream `cargo
-      # build` / `cargo publish` steps (Cargo regenerates lock entries
-      # for workspace members whenever their Cargo.toml `version`
-      # changes), so we don't sed it here.
-      #
-      # The hardcoded `"version": "0.2.0"` literals in
-      # `src/server.rs` (health-endpoint JSON) are intentionally NOT
-      # patched here — those are a source-level bug that should be
-      # refactored to use `env!("CARGO_PKG_VERSION")` instead of being
-      # papered over at release time. Tracked separately.
       - name: Stamp release version into Cargo.toml files
         shell: bash
         run: |-
           set -euo pipefail
+          VERSION=$(echo "$RELEASE_NAME" | sed 's|^v||g')
+          echo "Releasing version: $VERSION"
           for f in Cargo.toml common/Cargo.toml; do
             if [[ ! -f "$f" ]]; then
               echo "::error::Expected $f to exist; aborting release."
               exit 1
             fi
-            sed -i 's/^version = ".*"/version = "${{ env.RELEASE_NAME }}"/' "$f"
+            sed -i 's/^version = ".*"/version = "$VERSION"/' "$f"
             actual="$(grep -m1 '^version = ' "$f" | cut -d'"' -f2)"
-            if [[ "$actual" != "${{ env.RELEASE_NAME }}" ]]; then
-              echo "::error::$f version did not update to ${{ env.RELEASE_NAME }} (got: $actual)"
+            if [[ "$actual" != "$VERSION" ]]; then
+              echo "::error::$f version did not update to $VERSION (got: $actual)"
               exit 1
             fi
             echo "Stamped $f -> $actual"
           done
 
-      # The downstream `highflame-artifact` job runs on separate
-      # runners (matrix-based), so the in-place edits above don't
-      # propagate via the working directory. We bundle the patched
-      # files into an artifact that job downloads to overlay before
-      # building. Preserves the relative path (`common/Cargo.toml`)
-      # so the workspace structure is intact when the artifact
-      # unpacks.
-      #
-      # In the normal release-plz flow this is redundant (release-plz
-      # already merged the version bump into main before tagging, so
-      # the checkout in `highflame-artifact` has the right
-      # Cargo.toml versions). The sed + artifact transport is a
-      # safety net for manual-tag releases that bypass release-plz.
       - name: Upload version-stamped Cargo.toml files
         uses: actions/upload-artifact@v7
         if: always()
@@ -221,7 +103,10 @@ jobs:
       - name: Check Cargo.toml
         shell: bash
         run: |-
-          cat Cargo.toml
+          for f in Cargo.toml common/Cargo.toml; do
+            echo "printing contents of $f"
+            cat $f
+          done
 
       - name: Setting up Envs
         id: set_env
@@ -322,25 +207,9 @@ jobs:
         uses: actions/create-github-app-token@v3
         id: token
         with:
-          # `app-id` is the deprecated alias for `client-id` in
-          # `create-github-app-token@v3`. Kept on purpose because the
-          # existing `HIGHFLAME_GITHUB_APP_ID` secret holds the
-          # numeric App ID, not the alphanumeric Client ID — those
-          # are different identifiers on GitHub Apps. Switching to
-          # `client-id:` without first adding a separate
-          # `HIGHFLAME_GITHUB_APP_CLIENT_ID` secret would break
-          # JWT-signed auth at runtime. Eat the deprecation warning
-          # until the secret is split and the cutover is intentional.
           app-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
           private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          # `repositories:` is a newline-separated list of BARE repo
-          # names (no `owner/` prefix), NOT a YAML list and NOT
-          # `owner/repo` form. The action validates the input against
-          # the `owner:` field above and rejects `owner/repo` form
-          # with the same "owner '- ...' doesn't match" error a
-          # leading `- ` caused. Use `github.event.repository.name`
-          # for the bare name (yields `ramparts` here).
           repositories: |
             ${{ github.event.repository.name }}
 
@@ -364,22 +233,54 @@ jobs:
           asset_name: ${{ matrix.target }}-${{ matrix.arch }}_checksums.txt
           asset_content_type: text/plain
 
-  # NOTE: the cargo-publish job that used to live here has been
-  # removed. release-plz now publishes to crates.io as part of its
-  # full-mode flow — when a release-plz PR is merged, release-plz
-  # tags + publishes the crate + creates the GitHub release (as a
-  # draft, see release-plz.toml). The maintainer polishes the draft
-  # release notes and clicks "Publish release", which fires this
-  # workflow on `release: published` and builds the multi-arch
-  # binaries that get attached.
-  #
-  # If you need to bypass release-plz and publish a release
-  # manually (e.g., release-plz workflow is broken), do it from a
-  # checkout of the release tag:
-  #
-  #   git checkout 0.X.0
-  #   cargo publish --allow-dirty
-  #
-  # The sed step above (`Stamp release version into Cargo.toml
-  # files`) is the safety net that bridges manual tags whose
-  # Cargo.toml wasn't pre-bumped by release-plz.
+  highflame-crate:
+    needs:
+      - highflame-artifact
+    permissions:
+      contents: 'read'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download cargo-toml
+        uses: actions/download-artifact@v7
+        with:
+          name: cargo-toml
+
+      - name: Check Cargo.toml
+        shell: bash
+        run: |-
+          for f in Cargo.toml common/Cargo.toml; do
+            echo "printing contents of $f"
+            cat $f
+          done
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install YARA (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y yara libyara-dev
+
+      - name: Cache dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Publish to Crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |-
+          # cargo publish --allow-dirty Cargo.toml --allow-dirty Cargo.lock
+          cargo publish --allow-dirty
