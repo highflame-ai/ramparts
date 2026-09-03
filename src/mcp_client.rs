@@ -28,6 +28,156 @@ use tracing::{debug, warn};
 /// callers that haven't started forwarding the configured `http_timeout`.
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
 
+/// An OAuth-gated server's rejection, parsed from its `WWW-Authenticate`
+/// header.
+///
+/// A server behind OAuth answers `initialize` with 401 and a challenge that
+/// names where to get a token. Treating that as a generic transport failure
+/// is wrong: "this server requires credentials the scanner was not given" is
+/// a different fact from "this server is broken", and only the second is a
+/// defect. `ScanStatus::AuthenticationError` already renders in the terminal,
+/// markdown, JSON, and SARIF outputs — it was simply never constructed.
+///
+/// Carrying the challenge rather than discarding it means the report can tell
+/// the operator exactly which authorization server to get a token from, and
+/// gives a later client-credentials implementation everything it needs.
+#[derive(Debug, Clone)]
+pub struct AuthChallenge {
+    pub status: u16,
+    pub scheme: String,
+    /// RFC 9728 protected-resource-metadata URL, when the server sent one.
+    pub resource_metadata: Option<String>,
+    pub realm: Option<String>,
+    pub scopes: Vec<String>,
+    pub error: Option<String>,
+}
+
+impl AuthChallenge {
+    /// Parse a `WWW-Authenticate` value such as
+    /// `Bearer realm="x", resource_metadata="https://…", scope="a b"`.
+    fn parse(status: u16, header: Option<&str>) -> Self {
+        let mut challenge = Self {
+            status,
+            scheme: "Bearer".to_string(),
+            resource_metadata: None,
+            realm: None,
+            scopes: Vec::new(),
+            error: None,
+        };
+
+        let Some(raw) = header else {
+            return challenge;
+        };
+
+        let raw = raw.trim();
+        if let Some((scheme, rest)) = raw.split_once(char::is_whitespace) {
+            challenge.scheme = scheme.to_string();
+            for part in rest.split(',') {
+                let Some((key, value)) = part.split_once('=') else {
+                    continue;
+                };
+                let key = key.trim().to_ascii_lowercase();
+                let value = value.trim().trim_matches('"').to_string();
+                match key.as_str() {
+                    "resource_metadata" => challenge.resource_metadata = Some(value),
+                    "realm" => challenge.realm = Some(value),
+                    "scope" => {
+                        challenge.scopes = value.split_whitespace().map(str::to_string).collect();
+                    }
+                    "error" => challenge.error = Some(value),
+                    _ => {}
+                }
+            }
+        } else if !raw.is_empty() {
+            challenge.scheme = raw.to_string();
+        }
+
+        challenge
+    }
+
+    /// One-line operator-facing summary, used as the scan status message.
+    pub fn summary(&self) -> String {
+        let mut parts = vec![format!(
+            "server requires {} authentication (HTTP {})",
+            self.scheme, self.status
+        )];
+        if let Some(metadata) = &self.resource_metadata {
+            parts.push(format!("authorization metadata: {metadata}"));
+        } else if let Some(realm) = &self.realm {
+            parts.push(format!("realm: {realm}"));
+        }
+        if !self.scopes.is_empty() {
+            parts.push(format!("required scopes: {}", self.scopes.join(" ")));
+        }
+        parts.push(
+            "supply a token with --auth-headers \"Authorization: Bearer <token>\"".to_string(),
+        );
+        parts.join("; ")
+    }
+}
+
+impl std::fmt::Display for AuthChallenge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.summary())
+    }
+}
+
+impl std::error::Error for AuthChallenge {}
+
+/// Server name and version, for a peer that may not have identified itself.
+///
+/// rmcp 3.x made the implementation identity optional on `ServerPeerInfo`,
+/// because a discovery response need not include one. Report the absence
+/// rather than substituting a plausible-looking name, so a report never
+/// attributes tools to a server identity the server never claimed.
+fn identity_of(implementation: Option<&rmcp::model::Implementation>) -> (String, String) {
+    implementation.map_or_else(
+        || ("Unidentified MCP Server".to_string(), "Unknown".to_string()),
+        |info| (info.name.clone(), info.version.clone()),
+    )
+}
+
+/// Build the capability list from what the server actually declared during
+/// initialize.
+///
+/// Every construction site used to hardcode `["tools", "resources",
+/// "prompts"]`, so the reported capabilities were fixed text regardless of
+/// the handshake. That is wrong on its own, and it also removed the only
+/// signal telling us which `*/list` calls are worth making — which matters
+/// now that a failed list is a real error instead of an empty success.
+fn capabilities_from(caps: &rmcp::model::ServerCapabilities) -> Vec<String> {
+    let mut declared = Vec::new();
+    if caps.tools.is_some() {
+        declared.push("tools".to_string());
+    }
+    if caps.resources.is_some() {
+        declared.push("resources".to_string());
+    }
+    if caps.prompts.is_some() {
+        declared.push("prompts".to_string());
+    }
+    if caps.logging.is_some() {
+        declared.push("logging".to_string());
+    }
+    if caps.completions.is_some() {
+        declared.push("completions".to_string());
+    }
+    declared
+}
+
+/// Parse the `capabilities` object from a raw `initialize` result, for the
+/// simple-HTTP path which has no typed `peer_info`.
+fn capabilities_from_json(result: Option<&Value>) -> Vec<String> {
+    let Some(caps) = result.and_then(|r| r.get("capabilities")) else {
+        return Vec::new();
+    };
+    ["tools", "resources", "prompts", "logging", "completions"]
+        .iter()
+        .filter(|key| caps.get(*key).is_some())
+        .map(|key| (*key).to_string())
+        .collect()
+}
+
 /// MCP client using the official Rust MCP SDK with full transport support
 #[derive(Clone)]
 pub struct McpClient {
@@ -85,7 +235,11 @@ impl McpClient {
             );
 
             for (key, value) in auth_headers {
-                debug!("Processing header: {} = {}", key, value);
+                // Log the header NAME only. This map holds bearer tokens and
+                // API keys, and printing values wrote live credentials into
+                // any terminal or captured log the moment a user enabled
+                // --debug to troubleshoot a connection.
+                debug!("Processing header: {}", key);
                 match (
                     HeaderName::from_bytes(key.as_bytes()),
                     HeaderValue::from_str(value),
@@ -145,16 +299,17 @@ impl McpClient {
 
         // Get server information
         let peer_info = service.peer().peer_info();
-        let server_info = if let Some(init_result) = peer_info {
+        let server_info = if let Some(peer) = peer_info {
+            // rmcp 3.x models the peer as `ServerPeerInfo`, whose
+            // `server_info` is optional: a discovery response is not required
+            // to carry an implementation identity. Report what the server
+            // actually told us instead of inventing a name.
+            let (name, version) = identity_of(peer.server_info.as_ref());
             MCPServerInfo {
-                name: init_result.server_info.name.to_string(),
-                version: init_result.server_info.version.to_string(),
+                name,
+                version,
                 description: None,
-                capabilities: vec![
-                    "tools".to_string(),
-                    "resources".to_string(),
-                    "prompts".to_string(),
-                ],
+                capabilities: capabilities_from(&peer.capabilities),
                 metadata: {
                     let mut map = HashMap::new();
                     map.insert(
@@ -169,11 +324,7 @@ impl McpClient {
                 name: "Streamable HTTP MCP Server".to_string(),
                 version: "Unknown".to_string(),
                 description: Some("Connected via streamable HTTP".to_string()),
-                capabilities: vec![
-                    "tools".to_string(),
-                    "resources".to_string(),
-                    "prompts".to_string(),
-                ],
+                capabilities: Vec::new(),
                 metadata: {
                     let mut map = HashMap::new();
                     map.insert(
@@ -257,16 +408,13 @@ impl McpClient {
 
         // Get server information
         let peer_info = service.peer().peer_info();
-        let server_info = if let Some(init_result) = peer_info {
+        let server_info = if let Some(peer) = peer_info {
+            let (name, version) = identity_of(peer.server_info.as_ref());
             MCPServerInfo {
-                name: init_result.server_info.name.to_string(),
-                version: init_result.server_info.version.to_string(),
+                name,
+                version,
                 description: None,
-                capabilities: vec![
-                    "tools".to_string(),
-                    "resources".to_string(),
-                    "prompts".to_string(),
-                ],
+                capabilities: capabilities_from(&peer.capabilities),
                 metadata: {
                     let mut map = HashMap::new();
                     map.insert(
@@ -281,11 +429,7 @@ impl McpClient {
                 name: "Subprocess MCP Server".to_string(),
                 version: "Unknown".to_string(),
                 description: Some("Connected via subprocess".to_string()),
-                capabilities: vec![
-                    "tools".to_string(),
-                    "resources".to_string(),
-                    "prompts".to_string(),
-                ],
+                capabilities: Vec::new(),
                 metadata: {
                     let mut map = HashMap::new();
                     map.insert(
@@ -361,13 +505,20 @@ impl McpClient {
                     Ok(mcp_tools)
                 }
                 Err(e) => {
+                    // Do NOT collapse this into Ok(vec![]). A failed
+                    // tools/list and a server with zero tools are different
+                    // facts, and reporting them identically turned every
+                    // transport failure into a clean, empty scan.
                     debug!("Failed to fetch tools from MCP server: {}", e);
-                    Ok(vec![])
+                    Err(anyhow!("tools/list failed: {}", e))
                 }
             }
         } else {
             warn!("No active MCP service found for: {}", session.endpoint_url);
-            Ok(vec![])
+            Err(anyhow!(
+                "no active MCP service for {}",
+                session.endpoint_url
+            ))
         }
     }
 
@@ -421,12 +572,15 @@ impl McpClient {
                 }
                 Err(e) => {
                     debug!("Failed to fetch resources from MCP server: {}", e);
-                    Ok(vec![])
+                    Err(anyhow!("resources/list failed: {}", e))
                 }
             }
         } else {
             warn!("No active MCP service found for: {}", session.endpoint_url);
-            Ok(vec![])
+            Err(anyhow!(
+                "no active MCP service for {}",
+                session.endpoint_url
+            ))
         }
     }
 
@@ -484,12 +638,15 @@ impl McpClient {
                 }
                 Err(e) => {
                     debug!("Failed to fetch prompts from MCP server: {}", e);
-                    Ok(vec![])
+                    Err(anyhow!("prompts/list failed: {}", e))
                 }
             }
         } else {
             warn!("No active MCP service found for: {}", session.endpoint_url);
-            Ok(vec![])
+            Err(anyhow!(
+                "no active MCP service for {}",
+                session.endpoint_url
+            ))
         }
     }
 
@@ -545,6 +702,14 @@ impl McpClient {
                 }
             }
             Err(e) => {
+                // An auth challenge is a definitive answer, not a transport
+                // mismatch. Every other transport will get the same 401, so
+                // returning immediately preserves the useful error instead of
+                // burying it behind a second, vaguer failure.
+                if e.downcast_ref::<AuthChallenge>().is_some() {
+                    debug!("Server is auth-gated; not attempting other transports");
+                    return Err(e);
+                }
                 debug!("Simple HTTP connection failed: {}", e);
                 last_error = Some(e);
             }
@@ -607,7 +772,7 @@ impl McpClient {
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": crate::constants::protocol::mcp_version(),
                 "capabilities": {},
                 "clientInfo": {
                     "name": "ramparts",
@@ -619,8 +784,26 @@ impl McpClient {
         debug!("Sending initialize request to: {}", url);
         let response = client.post(url).json(&init_request).send().await?;
 
-        if !response.status().is_success() {
-            return Err(anyhow!("Initialize failed: HTTP {}", response.status()));
+        let status = response.status();
+
+        // An OAuth-gated server answers initialize with 401 (or 403 once a
+        // token is present but insufficient). Surface the challenge as a
+        // typed error so the scan is reported as "needs credentials" rather
+        // than "broken".
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            let challenge = AuthChallenge::parse(
+                status.as_u16(),
+                response
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok()),
+            );
+            debug!("Auth challenge from {}: {}", url, challenge.summary());
+            return Err(anyhow::Error::new(challenge));
+        }
+
+        if !status.is_success() {
+            return Err(anyhow!("Initialize failed: HTTP {}", status));
         }
 
         // Extract session ID from response headers (for stateful servers like GitHub Copilot)
@@ -651,6 +834,7 @@ impl McpClient {
         let _ = client.post(url).json(&notify_request).send().await;
 
         // Extract server info from initialize response
+        let declared_capabilities = capabilities_from_json(init_response.get("result"));
         let server_info = init_response
             .get("result")
             .and_then(|r| r.get("serverInfo"))
@@ -666,11 +850,7 @@ impl McpClient {
                     .unwrap_or("Unknown")
                     .to_string(),
                 description: None,
-                capabilities: vec![
-                    "tools".to_string(),
-                    "resources".to_string(),
-                    "prompts".to_string(),
-                ],
+                capabilities: declared_capabilities,
                 metadata: {
                     let mut map = HashMap::new();
                     map.insert(
@@ -849,36 +1029,48 @@ impl McpClient {
     pub async fn cleanup_session(&self, session: &MCPSession) -> Result<()> {
         debug!("Cleaning up MCP session for: {}", session.endpoint_url);
 
-        let mut services = self.services.lock().await;
-        if let Some(service) = services.remove(&session.endpoint_url) {
+        let service = {
+            let mut services = self.services.lock().await;
+            services.remove(&session.endpoint_url)
+        };
+
+        if let Some(service) = service {
             debug!("Shutting down MCP service for: {}", session.endpoint_url);
-            // The service will be dropped and cleaned up automatically
-            drop(service);
+            // Cancel through the protocol rather than relying on Drop. For
+            // TokioChildProcess transports a bare drop does not shut the child
+            // down cleanly, which risks orphaned server processes after a
+            // config scan.
+            Self::shutdown_service(service, &session.endpoint_url).await;
         }
 
         Ok(())
+    }
+
+    /// Cancel one service, bounded so a wedged server cannot stall cleanup.
+    async fn shutdown_service(service: RunningService<RoleClient, ()>, endpoint: &str) {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), service.cancel()).await {
+            Ok(Ok(reason)) => debug!("MCP service for {} stopped: {:?}", endpoint, reason),
+            Ok(Err(e)) => warn!("MCP service for {} failed to stop cleanly: {}", endpoint, e),
+            Err(_) => warn!("Timed out cancelling the MCP service for {}", endpoint),
+        }
     }
 
     /// Clean up all active MCP sessions
     pub async fn cleanup_all_sessions(&self) -> Result<()> {
         debug!("Cleaning up all MCP sessions");
 
-        let mut services = self.services.lock().await;
-        let endpoints: Vec<String> = services.keys().cloned().collect();
+        // Drain the map first so the lock is not held across the awaits below.
+        let drained: Vec<(String, RunningService<RoleClient, ()>)> = {
+            let mut services = self.services.lock().await;
+            services.drain().collect()
+        };
 
-        for endpoint in endpoints {
-            if let Some(service) = services.remove(&endpoint) {
-                debug!("Shutting down MCP service for: {}", endpoint);
-                // Add timeout for cleanup to prevent hanging
-                let cleanup_timeout =
-                    tokio::time::timeout(std::time::Duration::from_millis(500), async move {
-                        drop(service);
-                    });
-
-                if cleanup_timeout.await.is_err() {
-                    warn!("Cleanup timeout for MCP service: {}", endpoint);
-                }
-            }
+        // The previous version wrapped `drop(service)` in a timeout. A plain
+        // drop has no await point, so that timeout could never fire and the
+        // service was never cancelled through the protocol.
+        for (endpoint, service) in drained {
+            debug!("Shutting down MCP service for: {}", endpoint);
+            Self::shutdown_service(service, &endpoint).await;
         }
 
         debug!("All MCP sessions cleaned up");
@@ -921,12 +1113,12 @@ impl McpClient {
             "params": params
         });
 
-        // Add mask=false query parameter to get unmasked tokens
-        let request_url = {
-            let mut url = url::Url::parse(url)?;
-            url.query_pairs_mut().append_pair("mask", "false");
-            url
-        };
+        // Post to the URL exactly as configured. A `mask=false` parameter was
+        // previously appended to EVERY request, which leaked a vendor-private
+        // parameter to third-party servers and, worse, meant `initialize`
+        // (which did not append it) and every later call used different URLs
+        // — breaking session affinity on stateful servers.
+        let request_url = url::Url::parse(url)?;
 
         debug!("Sending JSON-RPC request to {}: {}", request_url, method);
         let response = client.post(request_url).json(&request).send().await?;
@@ -1043,6 +1235,52 @@ impl McpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parses_a_full_oauth_challenge() {
+        let challenge = AuthChallenge::parse(
+            401,
+            Some(
+                r#"Bearer realm="mcp", resource_metadata="https://as.example/.well-known/oauth-protected-resource", scope="mcp:read mcp:tools", error="invalid_token""#,
+            ),
+        );
+
+        assert_eq!(challenge.status, 401);
+        assert_eq!(challenge.scheme, "Bearer");
+        assert_eq!(
+            challenge.resource_metadata.as_deref(),
+            Some("https://as.example/.well-known/oauth-protected-resource")
+        );
+        assert_eq!(challenge.realm.as_deref(), Some("mcp"));
+        assert_eq!(challenge.scopes, vec!["mcp:read", "mcp:tools"]);
+        assert_eq!(challenge.error.as_deref(), Some("invalid_token"));
+
+        let summary = challenge.summary();
+        assert!(summary.contains("requires Bearer authentication"));
+        assert!(summary.contains("mcp:read mcp:tools"));
+        assert!(summary.contains("--auth-headers"));
+    }
+
+    /// A bare 401 with no header at all must still classify as auth-gated,
+    /// because that is the case that otherwise reads as a broken server.
+    #[test]
+    fn test_parses_a_bare_401_without_a_header() {
+        let challenge = AuthChallenge::parse(401, None);
+        assert_eq!(challenge.status, 401);
+        assert_eq!(challenge.scheme, "Bearer");
+        assert!(challenge.resource_metadata.is_none());
+        assert!(challenge.scopes.is_empty());
+        assert!(challenge
+            .summary()
+            .contains("requires Bearer authentication"));
+    }
+
+    #[test]
+    fn test_parses_a_scheme_only_challenge() {
+        let challenge = AuthChallenge::parse(403, Some("Basic"));
+        assert_eq!(challenge.scheme, "Basic");
+        assert_eq!(challenge.status, 403);
+    }
 
     #[tokio::test]
     async fn test_mcp_client_creation() {

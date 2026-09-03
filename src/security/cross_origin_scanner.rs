@@ -284,6 +284,8 @@ impl CrossOriginScanner {
                 ),
                 rule_metadata: Some(metadata.clone()),
                 owasp_tags: crate::taxonomy::tags_for_yara_rule("CrossDomainContamination"),
+                installed_version: None,
+                fixed_version: None,
                 phase: Some(match self.phase {
                     ScanPhase::PreScan => "pre-scan".to_string(),
                     ScanPhase::PostScan => "post-scan".to_string(),
@@ -308,6 +310,8 @@ impl CrossOriginScanner {
                     context: "Tool or resource using different domain than majority".to_string(),
                     rule_metadata: Some(metadata.clone()),
                     owasp_tags: crate::taxonomy::tags_for_yara_rule("DomainOutlier"),
+                    installed_version: None,
+                    fixed_version: None,
                     phase: Some(match self.phase {
                         ScanPhase::PreScan => "pre-scan".to_string(),
                         ScanPhase::PostScan => "post-scan".to_string(),
@@ -349,6 +353,8 @@ impl CrossOriginScanner {
                         .to_string(),
                 rule_metadata: Some(metadata.clone()),
                 owasp_tags: crate::taxonomy::tags_for_yara_rule("MixedSecuritySchemes"),
+                installed_version: None,
+                fixed_version: None,
                 phase: Some(match self.phase {
                     ScanPhase::PreScan => "pre-scan".to_string(),
                     ScanPhase::PostScan => "post-scan".to_string(),

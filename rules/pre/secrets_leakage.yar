@@ -9,9 +9,15 @@ rule SecretsLeakage
         version = "1.0"
         
     strings:
-        $api_key = /[Aa][Pp][Ii][-_]?[Kk][Ee][Yy].*[A-Za-z0-9]{20,}/
+        // Require an assignment between the name and the value. The previous
+        // form used `.*`, so the words "API keys" followed anywhere later by
+        // 20 alphanumeric characters matched — which is most prose about
+        // credentials. GitHub's own run_secret_scanning tool was flagged as a
+        // live credential leak by exactly that.
+        $api_key = /[Aa][Pp][Ii][-_]?[Kk][Ee][Yy]\s*[:=]\s*['"]?[A-Za-z0-9_\-]{20,}/
         $bearer_token = /[Bb]earer\s+[A-Za-z0-9\-_]{20,}/
-        $password = /[Pp]assword.*[A-Za-z0-9@#$%^&*]{8,}/
+        // Same `.*` problem: "passwords" plus any 8 later characters matched.
+        $password = /[Pp]assword\s*[:=]\s*['"]?[^\s'"]{8,}/
         $private_key = /-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----/
         $aws_key = /AKIA[0-9A-Z]{16}/
         $github_token = /ghp_[A-Za-z0-9]{36}/
@@ -98,47 +104,93 @@ rule EnvironmentVariableLeakage
 {
     meta:
         name = "Environment Variable Leakage"
-        description = "Detects exposure of sensitive environment variables and API keys"
+        description = "Detects exposure of sensitive environment variables (named service keys with quoted high-entropy values; bare process.env access alone is not a finding)"
         severity = "HIGH"
         category = "environment,secrets,api-keys,credentials"
         author = "Ramparts Security Team"
-        version = "1.0"
-        
+        version = "1.1"
+
     strings:
-        // Generic sensitive environment variables
-        $env_api_key = /[A-Z_]*API[_-]?KEY[A-Z_]*/i
-        $env_secret = /[A-Z_]*SECRET[A-Z_]*/i
-        $env_password = /[A-Z_]*PASSWORD[A-Z_]*/i
-        $env_token = /[A-Z_]*TOKEN[A-Z_]*/i
-        $env_auth = /[A-Z_]*AUTH[A-Z_]*/i
-        
-        // Specific service API keys
-        $aws_access_key = /AWS_ACCESS_KEY_ID/i
-        $aws_secret_key = /AWS_SECRET_ACCESS_KEY/i
-        $github_token = /GITHUB_TOKEN/i
-        $openai_key = /OPENAI_API_KEY/i
-        $anthropic_key = /ANTHROPIC_API_KEY/i
-        $google_api_key = /GOOGLE_API_KEY/i
-        $stripe_key = /STRIPE_[A-Z_]*KEY/i
-        
-        // Database credentials
-        $db_password = /DB_PASSWORD/i
-        $database_url = /DATABASE_URL/i
-        $redis_url = /REDIS_URL/i
-        
-        // Environment variable patterns with values
-        $env_with_value = /[A-Z_]+\s*=\s*["\']?[A-Za-z0-9+\/=@#$%^&*\-_.]{10,}["\']?/
-        
-        // Process environment access
-        $process_env = /process\.env\./
-        $os_environ = /os\.environ/
-        $getenv = /getenv\s*\(/
-        $env_var = /\$\{?[A-Z_]+\}?/
-        
+        // === Specific service API key NAMES ===
+        //
+        // These are exact env-var names. Mentioning them in setup
+        // instructions ("set OPENAI_API_KEY=...") is benign; the rule
+        // condition below requires either a literal high-entropy value
+        // or a co-occurrence with explicit theft language to fire.
+        $named_aws_access = /AWS_ACCESS_KEY_ID/
+        $named_aws_secret = /AWS_SECRET_ACCESS_KEY/
+        $named_github_token = /GITHUB_TOKEN/
+        $named_openai_key = /OPENAI_API_KEY/
+        $named_anthropic_key = /ANTHROPIC_API_KEY/
+        $named_google_api_key = /GOOGLE_API_KEY/
+        $named_stripe_key = /STRIPE_[A-Z_]*KEY/
+        $named_db_password = /DB_PASSWORD/
+        $named_database_url = /DATABASE_URL/
+        $named_redis_url = /REDIS_URL/
+
+        // === High-entropy value assignments ===
+        //
+        // Match a named env var with a quoted value that is at least
+        // 20 chars and contains both letters and digits (so it isn't
+        // a placeholder like "YOUR_KEY_HERE" or a short integer). The
+        // service-name prefix anchors the match to a credential-shaped
+        // env var, not arbitrary `FOO = "Hello, world!"`.
+        $named_assignment_with_value = /\b(API[_-]?KEY|SECRET|TOKEN|PASSWORD|ACCESS[_-]?KEY)\s*=\s*['"][A-Za-z0-9_\-+\/=]{20,}['"]/
+
+        // === Active credential-extraction language ===
+        //
+        // Bare mentions of `process.env`, `os.environ`, or `getenv()`
+        // are normal language constructs in any code-adjacent doc.
+        // They become a finding only when paired with explicit theft
+        // language (steal/exfiltrate/leak + credential noun) within
+        // a small window.
+        $env_access = /\b(process\.env\.|os\.environ\b|getenv\s*\()[A-Z_]{0,80}/
+        $theft_language = /\b(steal|exfiltrate|harvest|dump|leak)\b[^.\n]{0,40}\b(env|environment|secret|password|api[_\s-]?key|token|credential)\b/i
+
+        // === Exclusions ===
+
+        // Placeholder / template values — `OPENAI_API_KEY=YOUR_KEY_HERE`
+        // is documentation, not a leak.
+        $excl_placeholder = /\b(YOUR_[A-Z_]*KEY|YOUR_[A-Z_]*TOKEN|YOUR_[A-Z_]*SECRET|REPLACE_WITH|INSERT_KEY|CHANGE_?ME|PLACEHOLDER|<your[-_ ]|<insert[-_ ])\b/i
+
+        // Defensive language ("never log SECRET_KEY", "do not commit
+        // your tokens").
+        $excl_defensive = /\b(never|do\s+not|don't|must\s+not|should\s+not|avoid|prevent|reject|block)\b[^.\n]{0,30}\b(leak|expose|reveal|commit|log|print|dump)\b/i
+
+        // Security-doc / threat-model context.
+        $excl_security_doc = /\b(security[_\s-]?(check|audit|scan|monitor|review|guide|guardrail)|threat[_\s-]?(model|pattern|hunt)|attack[_\s-]?(example|surface|vector|pattern)|detection[_\s-]?(rule|pattern|engine)|YARA|MITRE|ATT&CK)\b/i
+
     condition:
-        any of ($env_api_key, $env_secret, $env_password, $env_token, $env_auth) or
-        any of ($aws_access_key, $aws_secret_key, $github_token, $openai_key, $anthropic_key, $google_api_key, $stripe_key) or
-        any of ($db_password, $database_url, $redis_url) or
-        $env_with_value or
-        any of ($process_env, $os_environ, $getenv, $env_var)
+        not $excl_placeholder and
+        not $excl_defensive and
+        not $excl_security_doc and
+        (
+            // High-entropy assignment to a credential-shaped name —
+            // the unambiguous leak signal.
+            $named_assignment_with_value or
+
+            // Active credential-extraction language paired with env
+            // access. Either signal alone is benign; together they
+            // strongly suggest theft.
+            ($theft_language and $env_access) or
+
+            // Specific named service env vars co-occurring with
+            // theft language.
+            (
+                ($named_aws_access or $named_aws_secret or $named_github_token or
+                 $named_openai_key or $named_anthropic_key or $named_google_api_key or
+                 $named_stripe_key or $named_db_password or $named_database_url or
+                 $named_redis_url)
+                and $theft_language
+            )
+
+            // Removed standalone-firing arms (high-FP on documentation):
+            //   - case-insensitive substring matches on SECRET / TOKEN /
+            //     AUTH / PASSWORD / API_KEY would fire on words like
+            //     `auth.GetClaims`, `// ALWAYS ...`, `secretly`, etc.
+            //   - $env_with_value matched any uppercase identifier with
+            //     a 10-char value, firing on `req.AccountID = claims.AccountID`
+            //   - bare `process.env`, `os.environ`, `getenv(`, `${VAR}`
+            //     are normal language constructs in code-adjacent docs
+        )
 }

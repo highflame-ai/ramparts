@@ -11,16 +11,50 @@ mcp_test_requests.json
 run_mcp_test.py
 test_mcp_client.py
 test_mcp_ecosystem.py
-examples/
+# Ignore CONTENTS of examples/ but not the directory itself — `dir/*`
+# form (not `dir/`) so the un-ignore rules below can re-include
+# specific committed files. With `dir/`, git wouldn't even descend
+# into the directory and the negations would be silently ignored.
+examples/*
+# Allowlist the user-facing example files that ARE intentionally
+# committed. Without these un-ignore lines, release-plz aborts on
+# the "tracked AND gitignored" check (same constraint as the
+# `Cargo.lock` block below).
+!examples/config_example.json
+!examples/servers.txt
+!examples/stdio_example.md
 testing/
 docs/proxy/*TEST*_RESULTS*.md
 /dist/
 **/*.rs.bk
 *.pdb
 
-# Cargo
+# Cargo. The root `Cargo.lock` is INTENTIONALLY committed: ramparts
+# ships as a binary crate (and a workspace with a binary at root +
+# path-only `ramparts-common`), and applications/binaries should
+# commit the lock file for reproducible builds + accurate dependency
+# advisories. Only library-only crates should gitignore `Cargo.lock`.
+#
+# We use a paired `Cargo.lock` + `!/Cargo.lock` pattern so that:
+# - the ROOT lockfile is un-ignored and tracked (release-plz needs
+#   this; it aborts when the lockfile is both .gitignored and
+#   committed)
+# - any per-workspace-member lockfile (e.g. `common/Cargo.lock`)
+#   that gets created by running `cargo` directly inside the member
+#   directory stays gitignored — workspace members don't need their
+#   own lockfiles and committing stale ones causes drift.
 Cargo.lock
-.cargo
+!/Cargo.lock
+
+# Project-local Cargo config overrides (e.g. `.cargo/config.toml`).
+# Kept out of the repo so contributors can use local-only registry
+# / target / build flags without polluting the canonical config.
+# `.cargo/audit.toml` is allowlisted because it's the project-wide
+# `cargo audit` policy and intentionally committed. Use `.cargo/*`
+# (not `.cargo/`) so git descends into the directory and honors
+# the un-ignore.
+.cargo/*
+!.cargo/audit.toml
 
 # IDE files
 .vscode/

@@ -456,6 +456,109 @@ echo "test content" | grep -E "your_pattern"
 RUST_LOG=debug ramparts scan <url>
 ```
 
+## Skill Scanning Issues
+
+### `No skill files found in: [...]`
+
+The discovery walker found nothing. Common causes:
+
+**Default discovery roots are empty.** `ramparts skills scan-config`
+walks `~/<dotdir>/{commands,skills}` and the same paths under the
+current workspace for the supported ecosystems
+(`.claude`, `.cursor`, `.codex`, `.windsurf`, `.gemini`,
+`.openai`). If none exist, the scan exits 1.
+
+```bash
+# Confirm at least one default root exists
+ls -d ~/.claude/commands ~/.cursor/commands ./.claude/commands 2>/dev/null
+
+# Add an explicit root
+ramparts skills scan ./path/to/skills
+
+# Or extend discovery with the env var (comma-separated, ~ expanded)
+export RAMPARTS_SKILL_ROOTS="~/work/skills,/srv/shared-skills"
+ramparts skills scan-config
+```
+
+**Walker conventions skip files unexpectedly.** The discovery walker
+mirrors `scan-config --root`: symlinks are not followed, common build
+directories (`.git`, `node_modules`, `target`, `dist`, `build`,
+`.venv`, `venv`, `__pycache__`) are skipped, depth is capped at 16,
+and dotdirs that aren't known skill locations are not descended into.
+Files named `README.md`, `CHANGELOG.md`, `LICENSE.md`, `CONTRIBUTING.md`,
+etc. are also skipped — these are project conventions, not skills.
+
+If your skills live in an unusual layout, point ramparts at the
+specific directory rather than relying on auto-discovery:
+
+```bash
+ramparts skills scan ./packages/my-org/skills
+```
+
+### `Skipping skill file <path> (N bytes > 2097152 byte limit)`
+
+Skill files larger than 2 MB are rejected pre-read to prevent a
+pathological input from monopolizing scan memory. Real skill files
+are kilobytes; if a `.md` file is multi-megabyte it's almost
+always misclassified content (a CHANGELOG, a SBOM, a generated doc).
+Move the offending file out of the skill directory or rename it to
+match a non-skill convention (e.g. `CHANGELOG.md`).
+
+### `All discovered skill files failed to parse`
+
+Every skill file the walker found returned `None` from the parser —
+typically because all skills had no description, no body, and no
+argument hint (effectively empty content). Confirm with debug logs:
+
+```bash
+RUST_LOG=debug ramparts skills scan ./.claude/commands 2>&1 | \
+  grep "Skipping"
+```
+
+The most common cause is pointing the scanner at a directory that
+contains placeholder `.md` files (`touch`-ed but not yet written).
+
+### Skill scan reports findings on legitimate skills
+
+The skill scanner inherits every YARA rule the live MCP scanner
+runs, plus the skill-targeted rules. If a finding looks wrong,
+inspect its `rule_name`:
+
+- Rules prefixed `Skill...` (e.g. `SkillEmbeddedPayload`,
+  `SkillCredentialHarvesting`) are skill-specific. Check the rule
+  description in the finding for the matched pattern.
+- Rules without that prefix (e.g. `CommandInjection`, `SQLInjection`)
+  are MCP-tool-description rules running over skill body content.
+  These are tuned to skip markdown-heading `#`, inline-code `` ` ``,
+  benign cleanup commands like `rm -rf node_modules`, and
+  function-call shape (so `docker exec` doesn't fire on bare
+  `exec`). If you still see a false positive on documentation
+  content, file an issue with the smallest reproducing skill.
+
+For structural heuristics (`OverbroadAllowedTools`,
+`VagueSkillTrigger`, etc.) the finding's description text says
+exactly what to fix — usually a one-line frontmatter change.
+
+### `RAMPARTS_SKILL_ROOTS` paths aren't being scanned
+
+The env var is parsed at scan-config time, not at scan time. Set it
+before invoking the binary, not via `cargo run`'s shell expansion:
+
+```bash
+# Works
+export RAMPARTS_SKILL_ROOTS="~/work/skills,/srv/skills"
+ramparts skills scan-config
+
+# Also works
+RAMPARTS_SKILL_ROOTS="~/work/skills" ramparts skills scan-config
+
+# Doesn't work — env var doesn't survive into ramparts' process
+echo $RAMPARTS_SKILL_ROOTS
+```
+
+`~/` at the start of an entry expands to `$HOME`. Other tilde forms
+(`~user/`) are not expanded — supply absolute paths instead.
+
 ## Performance Issues
 
 ### Slow Scanning

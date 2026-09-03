@@ -1,6 +1,14 @@
 [package]
 name = "ramparts"
-version = "0.8.0"
+# Bumped to 0.8.1 in this PR to bypass the orphan 0.8.0 state:
+# git tag 0.8.0 and a GitHub release 0.8.0 (binaries) exist, but
+# `cargo publish` for 0.8.0 never ran (the trigger workflow was
+# broken at the time). release-plz refuses to compute a "next
+# version" while the tag-exists / not-on-crates.io mismatch
+# persists. Publishing 0.8.1 cleanly skips the orphan; crates.io
+# users go 0.7.3 -> 0.8.1, GitHub's 0.8.0 binary release stays as
+# historical archive.
+version = "0.8.2"
 edition = "2021"
 authors = ["Sharath Rajasekar <sharath@highflame.com>"]
 description = "Security scanner for Model Context Protocol (MCP) servers and AI agent skills (Claude Code commands, agentskills.io bundles, Cursor / Codex / Windsurf / Gemini equivalents)."
@@ -10,14 +18,25 @@ keywords = ["mcp", "scanner", "skills", "llm", "security"]
 categories = ["command-line-utilities", "development-tools::testing"]
 include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
 
-# Cargo-release configuration for semantic versioning
-[package.metadata.release]
-allow-branch = ["main", "master"]
-tag = true
-push = true
-tag-name = "v{version}"
-sign-commit = false
-sign-tag = false
+# NOTE: A previous `[package.metadata.release]` block configured
+# `cargo-release` here (with `tag-name = "v{version}"`). It's been
+# removed because ramparts now uses **release-plz** (see
+# `release-plz.toml` + `.github/workflows/release-plz.yml`) and the
+# `v`-prefixed tag convention from cargo-release conflicts with
+# release-plz's bare-semver tags (which `release.yml`'s regex
+# `^[0-9]+\.[0-9]+\.[0-9]+$` enforces). If anyone ran `cargo release`
+# locally with the old block in place, they'd cut `v0.9.0` tags that
+# release.yml would then reject as malformed.
+
+# Workspace declaration. `ramparts-common` (in `common/`) needs to
+# be a true workspace member — not just a path dependency below —
+# so release-plz can manage its version in lockstep with the root
+# crate. Without this declaration, release-plz aborts with
+# "The following overrides are not present in the workspace:
+# `ramparts-common`. Check for typos" when reading the per-package
+# block from `release-plz.toml`.
+[workspace]
+members = ["common"]
 
 [features]
 default = ["yara-x-scanning"]
@@ -58,6 +77,11 @@ url = "2.4"
 # Regular expressions for environment variable expansion
 regex = "1.10"
 
+# NFKC folding for the evasion-resistant rescan pass (normalize.rs):
+# collapses fullwidth/mathematical-alphanumeric homoglyphs so YARA
+# rules match text an attacker spelled with Unicode variants.
+unicode-normalization = "0.1"
+
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -84,17 +108,32 @@ tower = "0.4"
 
 # JSON-RPC handling for microservice
 jsonrpc-core = "18.0"
-# Pinned to a post-v1.16.0 commit that bumps wasmtime from 43.0.1 to
-# 43.0.2, clearing RUSTSEC-2026-0114 (panic when allocating a table
-# exceeding the host's address space). Previous pin (178e2d697a, the
-# original wasmtime 43.0.1 bump) is still vulnerable. yara-x's tagged
-# v1.16.0 release ships the OLD wasmtime, so we hold the git pin
-# until v1.17 lands with the fix included. Switch back to a published
-# crates.io version then.
-yara-x = { git = "https://github.com/VirusTotal/yara-x", rev = "664cdfe66fd40826d160fa7009966d9c8a43cba6", optional = true }
+# yara-x is git-pinned to a post-v1.16.0 commit that bumps wasmtime
+# from 43.0.1 to 43.0.2, clearing RUSTSEC-2026-0114 (panic when
+# allocating a table exceeding the host's address space). This does
+# not clear RUSTSEC-2026-0222; keep that advisory documented in
+# .cargo/audit.toml until upstream depends on a patched wasmtime.
+#
+# `version = "1.16.0"` is required for `cargo publish` of the
+# `ramparts` crate — when ramparts is published, `path` and `git`
+# are stripped and only `version` remains in the published
+# tarball. Without it, `cargo publish` errors:
+#   "dependency `yara-x` does not specify a version".
+#
+# Note the divergence this creates:
+#   - Workspace + GitHub-released binaries: use the git pin (clears
+#     RUSTSEC-2026-0114, still affected by RUSTSEC-2026-0222).
+#   - `cargo install ramparts` from crates.io: resolves yara-x to
+#     the crates.io version (1.16.0, has the wasmtime CVE).
+# The CVE's attack vector (oversized table allocation in a WASM
+# module) is essentially unreachable from ramparts because we only
+# load bundled rules under `rules/pre/*.yar`, never user-supplied
+# WASM. Switch back to a clean `version = "1.17"` (no git pin)
+# once yara-x cuts that release.
+yara-x = { git = "https://github.com/VirusTotal/yara-x", rev = "664cdfe66fd40826d160fa7009966d9c8a43cba6", version = "1.16.0", optional = true }
 
 # Official Rust MCP SDK
-rmcp = { version = "1.5", features = [
+rmcp = { version = "3.1", features = [
     "client",
     "server",
     "macros",
@@ -126,8 +165,15 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 # subject to platform-verifier's "no CAs loaded" failure mode.
 webpki-roots = "1"
 
-# Bring in common as path dependency
-ramparts-common = { path = "common" }
+# Workspace member. Both `path` and `version` are required:
+# - `path` is used during workspace builds (so this crate uses the
+#   local source, not the registry copy)
+# - `version` is what gets written to the published `ramparts`
+#   tarball's Cargo.toml (path metadata is stripped at publish
+#   time). `cargo publish` REJECTS a manifest where a workspace
+#   dependency lacks a version — `cargo publish --dry-run` catches
+#   this locally. Must move in lockstep with `common/Cargo.toml`.
+ramparts-common = { path = "common", version = "0.8.1" }
 
 # Atomic file writes for `scan-config --fix` (NamedTempFile::persist handles
 # Windows replace-existing semantics that plain rename does not).

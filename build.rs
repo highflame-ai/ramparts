@@ -24,7 +24,22 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Capture git commit information
+    // Capture git commit information. Defaults are `"unknown"` for
+    // all three so that:
+    //
+    // - Downstream JSON / SARIF consumers see the literal string
+    //   `"unknown"` for non-git builds (e.g. `cargo install ramparts`
+    //   off crates.io) — backward-compatible with how
+    //   `ScanResult.ramparts_commit` has always been populated.
+    //   Empty strings serialize to `""` which some consumers don't
+    //   handle gracefully (`if (result.ramparts_commit)` would
+    //   branch incorrectly).
+    //
+    // - The display-side consumers in `src/banner.rs` and
+    //   `src/utils.rs` (markdown report header) check both
+    //   `is_empty()` AND `== "unknown"` to mean "no commit info" and
+    //   suppress the `(<sha>)` suffix. The defense-in-depth check
+    //   handles either default value cleanly.
     let git_commit = get_git_output(&["rev-parse", "--short", "HEAD"], "unknown");
     let git_commit_full = get_git_output(&["rev-parse", "HEAD"], "unknown");
     let git_branch = get_git_output(&["rev-parse", "--abbrev-ref", "HEAD"], "unknown");

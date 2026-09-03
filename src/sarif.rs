@@ -104,11 +104,28 @@ fn build_run(scan: &ScanResult) -> Value {
             "executionSuccessful": matches!(scan.status, crate::types::ScanStatus::Success),
             "endTimeUtc": scan.timestamp.to_rfc3339(),
         }],
-        "originalUriBaseIds": {
-            "MCP_SERVER": { "uri": scan.url }
-        },
+        "originalUriBaseIds": uri_base_ids(&scan.url),
         "results": sarif_results,
     })
+}
+
+/// Pick a URI-base-ID name that reflects what the scan actually
+/// targeted. SARIF consumers (GitHub code-scanning, etc.) display the
+/// base ID in the location breadcrumb, so a skill scan rendering as
+/// `MCP_SERVER` is misleading.
+fn uri_base_ids(url: &str) -> Value {
+    let key = if url.starts_with("skills:") {
+        "SKILL_ROOT"
+    } else {
+        "MCP_SERVER"
+    };
+    // `(key)` (with parens) is `serde_json::json!`'s dynamic-key
+    // syntax. Without the parens it would emit the literal field
+    // name `"key"` and ignore the variable — caught on PR #114 by
+    // Copilot. The whole point of this function is to swap
+    // `SKILL_ROOT` vs `MCP_SERVER` per scan type, so the dynamic
+    // expansion is load-bearing.
+    json!({ (key): { "uri": url } })
 }
 
 fn build_rule_from_yara(yara: &YaraScanResult) -> Value {
@@ -150,11 +167,27 @@ fn build_result_from_yara(scan: &ScanResult, yara: &YaraScanResult) -> Value {
         .unwrap_or("MEDIUM");
     let level = severity_to_sarif_level(severity);
 
-    let message = yara
-        .matched_text
+    // Message resolution order:
+    // 1. `matched_text` if present (real YARA matches give us the
+    //    matched substring; pair it with the context for legibility).
+    // 2. `rule_metadata.description` for parser-emitted findings (the
+    //    skill-heuristic descriptions have the actual finding text;
+    //    `context` for those is `"source: <path>"` which is path-as-
+    //    breadcrumb, not a useful SARIF result message).
+    // 3. `context` as a last resort (built-in YARA rules without a
+    //    matched_text fall here).
+    let message = if let Some(t) = yara.matched_text.as_ref() {
+        format!("{}: {}", yara.context, t)
+    } else if let Some(desc) = yara
+        .rule_metadata
         .as_ref()
-        .map(|t| format!("{}: {}", yara.context, t))
-        .unwrap_or_else(|| yara.context.clone());
+        .and_then(|m| m.description.as_deref())
+        .filter(|d| !d.is_empty())
+    {
+        desc.to_string()
+    } else {
+        yara.context.clone()
+    };
 
     let mut props = Map::new();
     props.insert("security-severity".into(), severity_score_value(severity));
@@ -260,10 +293,15 @@ fn logical_location(server_url: &str, target_name: &str, target_kind: &str) -> V
         "server" | "domain-analysis" | "outlier-analysis" | "scheme-analysis" => "module",
         _ => "function",
     };
+    // For skill scans, strip the `skills:` URL scheme and use just the
+    // path so the fully-qualified name reads as `<path>::<skill_name>`
+    // (e.g. `~/.claude/commands::cred`) — SARIF consumers display this
+    // verbatim, and a literal `skills:` prefix is just noise.
+    let qualifier = server_url.strip_prefix("skills:").unwrap_or(server_url);
     json!({
         "logicalLocations": [{
             "name": target_name,
-            "fullyQualifiedName": format!("{server_url}::{target_name}"),
+            "fullyQualifiedName": format!("{qualifier}::{target_name}"),
             "kind": kind
         }]
     })
@@ -283,7 +321,7 @@ fn severity_score_value(sev: &str) -> Value {
 fn owasp_tags_value(tags: &[crate::taxonomy::OwaspTag]) -> Value {
     Value::Array(
         tags.iter()
-            .map(|t| Value::String(format!("owasp-mcp-top-10:{}:{}", t.version, t.id)))
+            .map(|t| Value::String(format!("{}:{}:{}", t.framework, t.version, t.id)))
             .collect(),
     )
 }

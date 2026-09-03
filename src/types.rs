@@ -24,7 +24,10 @@ pub struct YaraRuleMetadata {
     pub category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    // `default` is required so `replay` can read JSON we previously wrote
+    // — `skip_serializing_if` omits the field when empty, and without
+    // `default` deserialization fails on the missing key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
 
@@ -46,6 +49,15 @@ pub struct YaraScanResult {
     /// exists yet for the rule — the finding is still reported.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owasp_tags: Vec<OwaspTag>,
+    // OSV dependency findings only: the installed package version that was
+    // matched and the version the advisory says the fix landed in (absent when
+    // OSV lists no fixed version). `default` + `skip_serializing_if` keep these
+    // omitted for every non-dependency finding and back-compatible with
+    // `replay` reading older JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_version: Option<String>,
     // Execution summary fields (when target_type is "summary")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
@@ -252,6 +264,23 @@ pub struct ScanResult {
     pub security_issues: Option<SecurityScanResult>,
     pub yara_results: Vec<YaraScanResult>,
     pub errors: Vec<String>,
+    /// Ramparts release version that produced this scan
+    /// (`env!("CARGO_PKG_VERSION")`). Useful for triage when an
+    /// archived JSON / replayed scan turns up months later — the
+    /// reader can correlate detections to a specific scanner build.
+    #[serde(default)]
+    pub ramparts_version: String,
+    /// Short git commit ramparts was built from (e.g. `c70cdce`).
+    /// The literal string `"unknown"` when built outside a git
+    /// checkout (e.g. from a crates.io tarball via `cargo install
+    /// ramparts`). Consumers should treat both `""` (legacy) and
+    /// `"unknown"` (current) as "no commit info"; never branch on
+    /// `if (ramparts_commit)` truthiness in a downstream language.
+    #[serde(default)]
+    pub ramparts_commit: String,
+    /// Server name from config file (preserves user's naming, not server's self-reported name)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
     /// IDE source that provided this server configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ide_source: Option<String>,
@@ -303,6 +332,9 @@ impl ScanResult {
             security_issues: None,
             yara_results: Vec::new(),
             errors: Vec::new(),
+            ramparts_version: env!("CARGO_PKG_VERSION").to_string(),
+            ramparts_commit: env!("GIT_COMMIT_SHORT").to_string(),
+            server_name: None,
             ide_source: None,
             llm_prompts: None,
         }
@@ -568,6 +600,8 @@ mod tests {
             context: "test context".to_string(),
             rule_metadata: None,
             owasp_tags: Vec::new(),
+            installed_version: None,
+            fixed_version: None,
             phase: Some("pre-scan".to_string()),
             rules_executed: Some(vec![
                 "secrets_leakage:SecretsLeakage".to_string(),

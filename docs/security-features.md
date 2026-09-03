@@ -2,7 +2,7 @@
 
 When you're connecting AI agents to MCP servers, you're essentially giving them access to tools that can read files, execute commands, query databases, and call APIs. That's incredibly powerful, but it also opens up a whole range of security risks that traditional web security doesn't cover.
 
-Ramparts looks for 11+ different types of attacks that are specific to the MCP ecosystem. Some are familiar from web security (like SQL injection), but others are entirely new categories that emerge when AI agents start using tools autonomously.
+Ramparts looks for many different types of attacks that are specific to the MCP and agent-skill ecosystem. Some are familiar from web security (like SQL injection), but others are entirely new categories that emerge when AI agents start using tools and skills autonomously.
 
 ## The MCP-Specific Threats
 
@@ -24,7 +24,13 @@ This is the "bait and switch" of the MCP world. You approve a tool based on its 
 
 The danger here is that once you've approved a tool and added it to your MCP server, you might not notice when its capabilities expand. That innocent "email sending" tool might suddenly gain the ability to access your contacts, or a "text formatting" tool might start executing system commands.
 
-Ramparts looks for signs that tools might be designed to change behavior post-approval. It flags tools with overly generic descriptions that could cover a wide range of functionality, tools that seem to have more capabilities than their descriptions suggest, and tools with implementation patterns that suggest they're designed to be modified.
+Ramparts catches this by content-fingerprinting what you approved and comparing it on every subsequent scan. Three baselines are maintained under `~/.ramparts/`:
+
+- **`MCPConfigChanged`** — the server's launch definition (`command`/`args`/`env`) differs from the stored baseline (`mcp-baseline.json`). Catches a swapped launch command.
+- **`MCPToolChanged`** — an individual tool's name, description, or input schema differs from the baseline recorded when the server was first scanned (`content-baseline.json`). Catches a tool definition that was quietly rewritten after approval.
+- **`SkillContentChanged`** — a skill file's body differs from the baseline recorded when it was first scanned. Catches the hot-reload-abuse / malicious-update pattern where a reviewed skill is edited afterwards.
+
+First sight silently establishes the baseline; a change keeps firing until you re-baseline (delete the relevant file under `~/.ramparts/`). Fingerprints are sha256 over length-prefixed fields, so an attacker cannot craft a colliding edit. This is drift detection, not prediction — Ramparts does not guess which tools are "designed to be modified"; it tells you when one actually changed.
 
 ### Cross-Origin Escalation
 
@@ -120,6 +126,195 @@ Jailbreak attacks involve sophisticated attempts to bypass AI safety measures an
 
 Ramparts looks for patterns that suggest tools might be designed to enable jailbreaking, including tools that could be chained together to bypass restrictions, tools that seem designed to manipulate AI behavior, and tools that might provide pathways around safety measures.
 
+### Skill Scanning (Agent Skill Files)
+
+Beyond live MCP servers, ramparts also scans **agent skills** —
+markdown files containing prompt instructions an agent loads and
+executes by name (Claude Code custom slash commands, Cursor agent
+skills, Codex / Windsurf / Gemini equivalents). Skills share a threat
+model with MCP prompts (untrusted instructions an agent may follow),
+so the existing security pipeline applies directly: each skill body
+becomes a synthetic `MCPPrompt` that runs through LLM analysis, the
+YARA pre-scan, OWASP MCP Top 10 tagging, and every renderer.
+
+```bash
+ramparts skills scan ./.claude/commands              # directory or file
+ramparts skills scan-config                          # auto-discover roots
+ramparts skills scan ./.claude/commands --format sarif > skills.sarif
+```
+
+In addition to running every existing rule against skill bodies,
+the parser emits skill-specific findings the live-MCP pipeline
+can't produce. These split into the groups below.
+
+**Skill-targeted YARA rules over the body content (10 rules)**:
+
+- `PromptInjectionSignature`, `UnicodeSteganography`,
+  `CoerciveInjection`, `IndirectPromptInjection` — the four classic
+  prompt-injection classes adapted for skill prose.
+- `CovertExfiltration` — an embedded instruction to send data offsite
+  while concealing it from the user (concealment is the discriminator).
+- `AutonomyAbuse` — skip-confirmation, override-user, infinite-retry,
+  self-modification, privilege-escalation language.
+- `CapabilityInflation` — keyword stuffing, "use this first" priority
+  manipulation, deceptive certification claims, hidden activation
+  triggers.
+- `SkillCredentialHarvesting` — vendor-specific token formats
+  (`AKIA...`, `ghp_...`, `sk-ant-api...`, `sk-proj-...`,
+  `AIzaSy...`, `xox[abprs]-...`), inline PEM private-key blocks,
+  active credential-theft verbs (`steal/exfiltrate <credential>`),
+  quoted env-var assignments with non-placeholder values.
+- `SkillToolChainingExfiltration` — credential-file read combined
+  with network egress to known exfil destinations (Discord webhooks,
+  Telegram bot API, pastebin, ngrok / requestbin / webhook.site
+  tunnels) or attacker-named hosts.
+- `SkillSystemManipulation` — disk-wiping (`dd if=/dev/zero`,
+  `wipefs`, `shred`), recursive deletion of system roots
+  (`rm -rf /etc`, `/usr`, `$HOME`), permission/ownership manipulation
+  (`chmod 777 /`, `chown root /`), critical-file writes
+  (`/etc/sudoers`, `/etc/shadow`), privilege escalation (`sudo -i`,
+  `runuser`, `doas`, `pkexec`), `LD_PRELOAD=` hijack, PATH poisoning.
+
+**Structural heuristics over the frontmatter (5 findings)**:
+
+- `OverbroadAllowedTools` (MCP03) — `allowed-tools:` grant gives
+  unrestricted code execution. Catches bare `Bash`, `Bash(*)`,
+  `Bash(*:*)`, `*` token, and the colon-form variants. Bounded
+  grants like `Bash(git status:*)` are silent.
+- `DataExfiltrationGrant` (MCP06+09) — `WebFetch` / `WebSearch` /
+  `Fetch` / `Browse` grant. Flagged informationally so the operator
+  knows the skill talks to the network.
+- `VagueSkillTrigger` (MCP02+03) — substantive skill body with a
+  missing or one-word `description` — easy to mis-invoke.
+- `GenericSkillTrigger` (MCP02+03) — description is a semantically
+  vacuous trigger phrase (`"help"`, `"a general purpose
+  assistant"`, `"do anything"`) that causes the agent's router to
+  invoke the skill on unrelated requests.
+- `SkillNameCollision` (MCP02+03) — two or more skill files declare
+  the same `name` (case-insensitive). One shadows the other in the
+  agent's router. Cross-skill check; runs once per scan.
+
+**Body-content heuristics (4 findings)**:
+
+- `SkillSensitiveFileReference` (MCP06+09) — Claude Code's
+  `@<path>` syntax inlines the referenced file's contents into
+  prompt context. Flags references to known sensitive paths (SSH /
+  AWS / GnuPG / kube / docker credentials, `.env`, `.netrc`,
+  `.npmrc`, `.pypirc`, certificates).
+- `SkillEmbeddedPayload` (MCP01+10) — body contains a 500+
+  character base64 / hex blob. Embedded payloads bypass plaintext
+  YARA rules and LLM analysis by deferring decoding to runtime.
+  Markdown image data URIs (`data:image/...;base64,...`) are
+  excluded.
+- `AgentIdentityFileWrite` (MCP03+09) — an instruction to write into
+  an agent identity/memory file (`SOUL.md`, `MEMORY.md`, `AGENTS.md`,
+  `CLAUDE.md`, `.claude/settings`, `.cursorrules`). Content written
+  there survives skill uninstall and is re-loaded into context every
+  session — the memory-poisoning / identity-backdoor persistence
+  pattern. Read references are not flagged; only write-verb proximity.
+- `ExternalReferenceInventory` (MCP10, **LOW**) — inventory of the
+  external URL hosts a skill references. Referenced content is mutable
+  and outside the trust boundary; this gives fleet operators the
+  "which skills fetch from which sources" visibility needed to catch
+  an author rug-pull. A signal, not a conviction.
+
+**agentskills.io bundle validation (4 findings)**:
+
+Activated when ramparts encounters an exact `SKILL.md` filename
+(case-sensitive byte-equal). Bundle mode walks sibling `scripts/` and
+`references/` directories one level deep, YARA-scans every script and
+reference file (cap: 256 files per subdir, `MAX_SKILL_FILE_BYTES` per
+file), and adds these spec-validation findings on top of the
+groups above. All four map to **OWASP MCP02** (supply chain /
+hidden behavior).
+
+- `AgentskillsNameMismatch` (**HIGH**) — frontmatter `name:` is
+  present and does not match the parent directory name. The
+  [agentskills.io spec](https://github.com/agentskills/agentskills)
+  requires both to match; a mismatch is a deception signal (attacker
+  ships a bundle in a directory called `helpful-helper/` but with
+  `name: ssh-key-stealer`, or vice versa).
+- `AgentskillsInvalidName` (**MEDIUM**) — resolved name (from
+  frontmatter or the parent-dir fallback) violates the spec's name
+  rules: 1–64 chars, lowercase `[a-z0-9-]`, no leading or trailing
+  hyphen, no consecutive hyphens. Finding text identifies whether
+  the violation is on the frontmatter `name:` value or on the parent
+  directory's basename, so the fix location is obvious.
+- `AgentskillsMissingName` (**MEDIUM**) — bundle has no `name:` field
+  and the parent directory has no usable name (mutually exclusive
+  with `AgentskillsInvalidName`).
+- `AgentskillsUnknownFrontmatterField` (**LOW**) — frontmatter
+  contains key(s) outside the spec's six-field set (`name`,
+  `description`, `license`, `compatibility`, `metadata`,
+  `allowed-tools`). Single rolled-up finding per bundle listing all
+  unknown keys — potential smuggling vector or just a typo. (A spoofed
+  `risk_tier:` field is caught here, since it isn't a spec field.)
+
+**Insecure-metadata attacks (frontmatter / manifest parsing)**:
+
+- `UnsafeYamlDeserialization` (MCP01+10 / AST04, **HIGH**) — SKILL.md
+  frontmatter contains a dangerous YAML tag (`!!python/object`,
+  `!!python/apply`, `!ruby/object`, `!!java`, `!!binary`, …). ramparts
+  parses with a safe deserializer so these never execute here, but a
+  loader that opts into an unsafe loader (PyYAML `FullLoader`/
+  `UnsafeLoader`, Ruby `Psych.load`) would run the payload at load time.
+- `BrandImpersonation` (MCP02 / AST04, **MEDIUM**) — the skill name or
+  description pairs a known vendor brand (`google`, `openai`, `stripe`,
+  `solana`, …) with an official-sounding cue (`official`, `integration`,
+  `connector`, `wallet`, …) but authorship can't be verified from the
+  files. Catches typosquat/brand-impersonation skills that capture traffic
+  from users searching for the real integration. Conservative — requires
+  both a brand token and a cue.
+- `JsonPrototypePollution` (MCP10 / AST04, **HIGH**) — a bundled
+  `package.json` / `manifest.json` contains a `__proto__`, `constructor`,
+  or `prototype` key. A Node.js loader that deep-merges the manifest
+  poisons the prototype for every object in the runtime.
+
+**Bundle cross-checks and drift (declared-vs-actual, supply chain, rug-pull)**:
+
+- `UndeclaredNetworkEgress` (MCP02+09, **HIGH**) — the `allowed-tools`
+  manifest declares no network-capable grant, but a bundled script
+  performs network egress (`curl`, `requests.`, `fetch(`, `axios`,
+  `net/http`, `Invoke-WebRequest`, …). The declared permission set
+  understates what the skill actually does — the pattern used to hide
+  exfiltration behind a clean manifest. Only fires when a manifest is
+  present to contradict.
+- `SkillContentChanged` (MCP10, **HIGH**) — the skill body differs
+  from the baseline recorded when it was first scanned (see *MCP Rug
+  Pulls* above). Catches a reviewed skill edited afterwards.
+- `ScanCoverageIncomplete` (**MEDIUM**) — one or more bundle files
+  were skipped (oversize, unreadable as UTF-8, or the per-directory
+  file cap was reached). A clean result over a partially-scanned
+  bundle is not evidence the bundle is clean, so the gap is surfaced
+  as a finding rather than only a log line.
+- `VulnerableDependency` (MCP10) — exactly-pinned dependencies in a
+  bundle's `requirements.txt` / `package.json` are queried against
+  OSV.dev, the same lookup `npx`/`uvx` launch commands get. Skill
+  bundle dependencies are the actual delivery mechanism for
+  staged-loader / dependency-confusion attacks. Fail-soft: a network
+  failure yields no findings, never a failed scan.
+
+Bundled scripts (Python, Bash, JS, TypeScript, Ruby, Perl, PowerShell)
+and reference markdown files are funneled through the existing YARA
+pre-scan as synthetic resources in a local scratch buffer, then
+re-tagged as prompt-typed findings before merging. The terminal,
+JSON, and SARIF renderers all show the bundled-file findings under
+their parent skill (`my-skill (4 findings) ... [HIGH] SecretsLeakage
+in scripts/exfil.py`). Synthetic resources are discarded after the
+scan — they never appear in `result.resources`, so JSON output stays
+clean.
+
+`scan-config` walks the per-user (`$HOME`) and per-workspace (CWD)
+variants of every supported ecosystem dotdir
+(`.claude`, `.cursor`, `.codex`, `.windsurf`, `.gemini`, `.openai`)
+plus the tool-agnostic agentskills.io locations (`~/.skills/`
+unconditionally; `./skills/` probe-gated by the presence of at least
+one `<name>/SKILL.md` bundle, so unrelated repos with a top-level
+`skills/` directory aren't accidentally scanned).
+Operators can supply additional roots via the
+**`RAMPARTS_SKILL_ROOTS`** environment variable (comma-separated
+paths, leading `~/` expanded).
+
 ### Vulnerable Dependencies (Supply Chain)
 
 When a stdio MCP server is launched via `npx` (npm) or `uvx` (PyPI),
@@ -132,13 +327,22 @@ underlying library with known CVEs (ReDoS, prototype pollution,
 arbitrary code execution, etc.). The check runs in parallel with the
 main scan and fails soft.
 
+The same OSV lookup also runs over **skill-bundle dependency manifests**:
+exactly-pinned entries in a bundle's `requirements.txt` (`name==version`)
+or `package.json` (`dependencies` / `devDependencies` with an exact
+version) are queried against OSV.dev. Range specifiers (`>=`, `^`, `~`)
+are skipped because OSV needs an exact version to answer usefully. This
+closes the staged-loader gap where the `SKILL.md` is clean but a
+referenced dependency carries the payload. Bounded to 64 unique
+dependencies per scan.
+
 ## How Ramparts Detects These Threats
 
-Ramparts uses a three-layer approach to catch these security issues:
+Ramparts combines several detection layers:
 
 **Static Analysis** catches the obvious stuff—tools with suspicious parameter names, dangerous function calls, and clear mismatches between descriptions and capabilities.
 
-**YARA-X Pattern Matching** looks for known vulnerability patterns, secret formats (like AWS keys or GitHub tokens), and suspicious code structures that might indicate security issues. Each YARA rule includes comprehensive metadata that provides rich context for security findings:
+**YARA-X Pattern Matching** looks for known vulnerability patterns, secret formats (like AWS keys or GitHub tokens), and suspicious code structures that might indicate security issues. Every YARA rule is additionally run over an **evasion-resistant rescan**: a normalized view (invisible/zero-width characters stripped, NFKC homoglyph folding) and iteratively base64/hex-decoded views, so a keyword split by zero-width characters, spelled in fullwidth homoglyphs, or hidden inside an encoded blob still matches the same rules. Each YARA rule includes comprehensive metadata that provides rich context for security findings:
 
 - **Severity Assessment**: Every rule has a severity level (CRITICAL, HIGH, MEDIUM, LOW) based on the security impact
 - **Detailed Attribution**: Rule author, version, and comprehensive descriptions help you understand the finding
@@ -149,20 +353,32 @@ This metadata makes it easy to prioritize security findings and understand their
 
 **LLM-Powered Analysis** is where things get interesting. Ramparts uses AI models to understand the semantic meaning of tools and catch subtle issues that static analysis might miss. It can detect when a tool's description doesn't match its actual behavior, identify tools that might be designed to be deceptive, and spot complex attack patterns that require understanding context.
 
-## OWASP MCP Top 10 Mapping
+**Cross-origin, supply-chain, and drift** layers round this out: a cross-origin graph scanner over the tool/resource URL set, OSV.dev lookups for launch-command and skill-bundle dependencies, and content-baseline fingerprinting for rug-pull / update-drift detection across server configs, tool definitions, and skill files.
 
-Every finding ramparts emits is tagged with one or more entries from the
-**OWASP MCP Top 10** so consumers (terminal output, JSON, SARIF, the
-markdown report) can group and prioritize results against a recognized
-framework. The taxonomy is pinned to a versioned YAML file
-(`taxonomies/owasp-mcp-top-10/2025.yaml`) — when the official list
-publishes a new revision, it lands as a new file rather than mutating
-the existing one, so previously-tagged findings stay interpretable.
+## OWASP Taxonomy Mapping
+
+Ramparts tags findings against **two** OWASP frameworks so consumers
+(terminal output, JSON, SARIF, the markdown report) can group and
+prioritize results:
+
+- **OWASP MCP Top 10** (`MCP01`–`MCP10`) — attached to **every** finding,
+  on both the MCP-server and skill surfaces.
+- **OWASP Agentic Skills Top 10** (`AST01`–`AST10`) — attached **only** to
+  findings produced on the **skill** scan surface (`ramparts skills scan` /
+  `scan-config` over skill files). MCP-server scans stay MCP-tagged, because
+  AST is a skill-specific framework and MCP-server findings would be
+  spurious under it.
+
+Each is pinned to a versioned YAML file
+(`taxonomies/owasp-mcp-top-10/2025.yaml`,
+`taxonomies/owasp-agentic-skills-top-10/2026.yaml`) — when a list
+publishes a new revision it lands as a new file rather than mutating the
+existing one, so previously-tagged findings stay interpretable.
 
 | ID | Category | Example ramparts findings |
 |---|---|---|
 | MCP01 | Prompt Injection | `PromptInjection`, `Jailbreak` |
-| MCP02 | Tool Poisoning | `ToolPoisoning`, `MCPConfigChanged` (baseline drift) |
+| MCP02 | Tool Poisoning | `ToolPoisoning`, `MCPConfigChanged`, `MCPToolChanged` (baseline drift), `UndeclaredNetworkEgress` |
 | MCP03 | Excessive Agency | `Jailbreak`, overscoped capabilities |
 | MCP04 | Insecure Tool Output Handling | `PathTraversalVulnerability` |
 | MCP05 | Cross-Origin Tool Confusion | `CrossDomainContamination`, `DomainOutlier`, `MixedSecuritySchemes` |
@@ -170,14 +386,34 @@ the existing one, so previously-tagged findings stay interpretable.
 | MCP07 | Command and SQL Injection | `CommandInjection`, `SQLInjection`, `MCPConfigRisk` |
 | MCP08 | Authentication & Authorization Bypass | `AuthBypass` |
 | MCP09 | Sensitive Data Exposure | `PIILeakage`, secret findings |
-| MCP10 | Supply Chain | `MCPConfigRisk`, `VulnerableDependency` (OSV.dev) |
+| MCP10 | Supply Chain | `MCPConfigRisk`, `VulnerableDependency` (OSV.dev), `SkillContentChanged`, `ExternalReferenceInventory` |
+
+**OWASP Agentic Skills Top 10** — skill-surface findings additionally carry:
+
+| ID | Category | Example ramparts findings |
+|---|---|---|
+| AST01 | Malicious Skills | `PromptInjectionSignature`, `CovertExfiltration`, `SkillCredentialHarvesting`, `SkillSystemManipulation`, malware/webshell/cryptominer IOCs, `AgentIdentityFileWrite` |
+| AST02 | Supply Chain Compromise | `VulnerableDependency`, `UndeclaredNetworkEgress` |
+| AST03 | Over-Privileged Skills | `OverbroadAllowedTools`, `DataExfiltrationGrant`, `AutonomyAbuse`, `SkillSensitiveFileReference`, `AgentIdentityFileWrite` |
+| AST04 | Insecure Metadata | `Agentskills*` validation, `CapabilityInflation`, `VagueSkillTrigger`, `GenericSkillTrigger`, `UnsafeYamlDeserialization`, `BrandImpersonation`, `JsonPrototypePollution` |
+| AST05 | Untrusted External Instructions | `IndirectPromptInjection`, `ExternalReferenceInventory` |
+| AST06 | Weak Isolation | `SkillNameCollision` (router shadowing) |
+| AST07 | Update Drift | `SkillContentChanged` (rug-pull baseline) |
+| AST08 | Poor Scanning | `ScanCoverageIncomplete` |
+
+AST06/09/10 are largely runtime and governance controls outside a static
+scanner's reach; ramparts covers the statically-detectable slice
+(shadowing for AST06) and feeds the rest via its inventory/SARIF output.
 
 Tags appear in:
 
-- **Terminal**: `OWASP MCP Top 10: MCP05, MCP06` after each finding
-- **JSON**: `owasp_tags` array on every `SecurityIssue` and `YaraScanResult`
+- **Terminal**: `OWASP MCP Top 10: MCP05, MCP06` and, on the skill surface,
+  `OWASP Agentic Skills Top 10: AST01, AST03` after each finding
+- **JSON**: `owasp_tags` array on every `SecurityIssue` and
+  `YaraScanResult`; each tag carries its `framework`, `id`, and `version`
 - **SARIF**: `properties.tags` on every `result` and `rule` definition
-  (e.g. `owasp-mcp-top-10:2025-draft:MCP05`)
+  (e.g. `owasp-mcp-top-10:2025-draft:MCP05`,
+  `owasp-agentic-skills-top-10:2026:AST01`)
 
 ## Severity Levels and What They Mean
 

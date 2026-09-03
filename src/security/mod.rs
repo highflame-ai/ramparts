@@ -188,7 +188,7 @@ pub struct SecurityIssue {
 
 impl SecurityIssue {
     pub fn new(issue_type: SecurityIssueType, description: String) -> Self {
-        let message = format!("{}: {}", issue_type.default_message(), &description);
+        let message = format!("{}: {}", issue_type.default_message(), description);
         Self {
             issue_type,
             tool_name: None,
@@ -342,12 +342,32 @@ impl SecurityScanner {
         })
     }
 
-    /// Generic batch scanner for any type that implements `BatchScannableItem`
+    /// Generic batch scanner for any type that implements `BatchScannableItem`.
+    /// Uses `T::item_type_plural()` as the spinner subject — most callers
+    /// want this default. Use `scan_batch_with_subject` to override when
+    /// the wire-level item type and the user-facing subject diverge
+    /// (e.g. skill scans send `MCPPrompt` to the LLM but the user sees
+    /// "Scanning Skills...").
     async fn scan_batch<T: BatchScannableItem>(
         &self,
         items: &[T],
         prompt_creator: impl Fn(&str) -> String,
         show_details: bool,
+    ) -> Result<Vec<SecurityIssue>> {
+        self.scan_batch_with_subject(items, prompt_creator, show_details, T::item_type_plural())
+            .await
+    }
+
+    /// Like `scan_batch`, but with an explicit `subject` for the
+    /// spinner status line. Lets the skill scan path show
+    /// `Scanning Skills...` even though the underlying batch is over
+    /// `MCPPrompt`s.
+    async fn scan_batch_with_subject<T: BatchScannableItem>(
+        &self,
+        items: &[T],
+        prompt_creator: impl Fn(&str) -> String,
+        show_details: bool,
+        subject: &str,
     ) -> Result<Vec<SecurityIssue>> {
         if items.is_empty() {
             tracing::debug!(
@@ -400,7 +420,7 @@ impl SecurityScanner {
                 T::item_type_plural()
             );
 
-            let response = self.query_llm(&prompt_text, show_details).await?;
+            let response = self.query_llm(&prompt_text, show_details, subject).await?;
 
             tracing::debug!(
                 "Received batch LLM response for {} batch {}: {}",
@@ -489,7 +509,9 @@ impl SecurityScanner {
                 MCPTool::item_type_plural()
             );
 
-            let response = self.query_llm(&prompt, show_details).await?;
+            let response = self
+                .query_llm(&prompt, show_details, MCPTool::item_type_plural())
+                .await?;
 
             tracing::debug!(
                 "Received batch LLM response for {} batch {}: {}",
@@ -525,6 +547,26 @@ impl SecurityScanner {
     ) -> Result<Vec<SecurityIssue>> {
         self.scan_batch(prompts, Self::create_prompts_analysis_prompt, show_details)
             .await
+    }
+
+    /// Scan agent skill files for security vulnerabilities. Mechanically
+    /// identical to `scan_prompts_batch` (skills are routed through the
+    /// `MCPPrompt` shape so every existing analyzer applies), but the
+    /// spinner subject is overridden to "skills" so the user sees
+    /// `Scanning Skills for security vulnerabilities...` instead of the
+    /// generic `Scanning Prompts...`.
+    pub async fn scan_skills_batch(
+        &self,
+        prompts: &[MCPPrompt],
+        show_details: bool,
+    ) -> Result<Vec<SecurityIssue>> {
+        self.scan_batch_with_subject(
+            prompts,
+            Self::create_prompts_analysis_prompt,
+            show_details,
+            "skills",
+        )
+        .await
     }
 
     /// Batch scan resources for security vulnerabilities
@@ -701,8 +743,32 @@ If no genuine security issues found, return empty array []."
         self.model_endpoint.clone()
     }
 
-    /// Query the LLM with the given prompt
-    async fn query_llm(&self, prompt: &str, show_details: bool) -> Result<String> {
+    /// Uppercase the first ASCII character of `s` (used to format the
+    /// spinner status as a complete sentence: "Scanning Skills..."
+    /// rather than "Scanning skills..."). Returns owned `String`
+    /// because callers need it in `format!` and the per-scan cost is
+    /// trivial.
+    fn capitalize_first_inline(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        if let Some(c) = chars.next() {
+            for u in c.to_uppercase() {
+                out.push(u);
+            }
+        }
+        out.push_str(chars.as_str());
+        out
+    }
+
+    /// Query the LLM with the given prompt.
+    ///
+    /// `subject` is a human-readable label for what we're scanning
+    /// (e.g. "skills", "tools", "prompts") and is only used to build
+    /// the spinner message. Callers thread `T::item_type_plural()`
+    /// through `scan_batch` so the message reads "Scanning skills for
+    /// security vulnerabilities..." instead of the previous generic
+    /// "Scanning for security vulnerabilities...".
+    async fn query_llm(&self, prompt: &str, show_details: bool, subject: &str) -> Result<String> {
         // Enhanced validation with detailed error messages
         if !self.is_llm_configured() {
             let endpoint_status = if self.model_endpoint.is_some() {
@@ -738,7 +804,15 @@ If no genuine security issues found, return empty array []."
             ));
         }
 
-        let client = Client::new();
+        // Build through the shared TLS config like every other outbound
+        // client. A bare Client::new() falls back to rustls-platform-verifier,
+        // the exact component src/tls.rs exists to bypass — so on the macOS
+        // setups that motivated tls.rs, MCP connections worked while LLM
+        // analysis failed with an opaque "builder error".
+        let client = Client::builder()
+            .use_preconfigured_tls((*crate::tls::default_tls_config()).clone())
+            .build()
+            .map_err(|e| anyhow!("Failed to build LLM HTTP client: {}", e))?;
 
         // Get configuration values, with defaults if not configured
         let temperature = self.config.as_ref().map_or(0.1, |c| c.llm.temperature);
@@ -754,15 +828,11 @@ If no genuine security issues found, return empty array []."
         debug!("   Temperature: {}", temperature);
         debug!("   Max tokens: {}", max_tokens);
         debug!("   Timeout: {}s", timeout);
-        debug!(
-            "   API key: {}...{}",
-            &api_key[..8.min(api_key.len())],
-            if api_key.len() > 16 {
-                &api_key[api_key.len() - 8..]
-            } else {
-                "***"
-            }
-        );
+        // Never log key material, not even a prefix. Report presence and
+        // length only. The previous version also sliced the String by BYTE
+        // index, which panics with "byte index is not a char boundary" when a
+        // key contains a multi-byte character.
+        debug!("   API key: present ({} chars)", api_key.chars().count());
 
         let request_body = json!({
             "model": self.model_name,
@@ -797,10 +867,15 @@ Example valid response: [{\"tool_name\": \"example\", \"found_issue\": true, \"i
         // Start spinner only when stdout is an interactive terminal. In CI,
         // pipelines, or any redirected output the animation re-prints
         // hundreds of frames per scan, drowning the actual results.
+        // The capitalized subject (e.g. "Skills", "Tools") makes the
+        // status line read naturally as a complete sentence.
+        let subject_display = Self::capitalize_first_inline(subject);
         let mut sp = std::io::stdout().is_terminal().then(|| {
             Spinner::new(
                 Spinners::Dots9,
-                "Scanning for security vulnerabilities...(this may take a while)".into(),
+                format!(
+                    "Scanning {subject_display} for security vulnerabilities... (this may take a while)"
+                ),
             )
         });
 
@@ -819,6 +894,11 @@ Example valid response: [{\"tool_name\": \"example\", \"found_issue\": true, \"i
             Err(e) => {
                 if let Some(s) = sp.as_mut() {
                     s.stop();
+                    // The spinners crate doesn't emit a trailing
+                    // newline on stop, so the next line of output
+                    // overprints the spinner's last frame. Force
+                    // one explicitly.
+                    println!();
                 }
                 error!("🚨 LLM API Request Failed:");
                 error!("   Endpoint: {}", endpoint);
@@ -863,9 +943,12 @@ Example valid response: [{\"tool_name\": \"example\", \"found_issue\": true, \"i
                     error!(
                         "   💡 Hint: Check your API key is correct and has sufficient permissions"
                     );
+                    // Do not echo any part of the key. This branch runs at
+                    // error! level, which the default filter shows, so the
+                    // most common failure was also the loudest leak.
                     error!(
-                        "   💡 Current key starts with: {}...",
-                        &api_key[..8.min(api_key.len())]
+                        "   💡 The configured key is {} characters long",
+                        api_key.chars().count()
                     );
                 }
                 403 => {
@@ -1276,7 +1359,7 @@ mod tests {
             config: None,
         };
 
-        let result = scanner.query_llm("test prompt", false).await;
+        let result = scanner.query_llm("test prompt", false, "items").await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

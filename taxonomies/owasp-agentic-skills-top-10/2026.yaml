@@ -1,0 +1,85 @@
+# OWASP Agentic Skills Top 10 (2026)
+#
+# Canonical, versioned definition of the OWASP Agentic Skills Top 10, the
+# framework Ramparts tags skill-surface findings against (in addition to
+# the OWASP MCP Top 10). Published August 2026. Pinned to its version key;
+# when a new revision lands, add a new file (e.g. `2027.yaml`) and migrate
+# rule mappings in `src/taxonomy.rs` explicitly rather than editing this
+# file in place.
+#
+# AST tags are attached only to findings produced on the skill scan
+# surface — MCP-server findings are tagged with the MCP Top 10 only.
+version: "2026"
+title: "OWASP Agentic Skills Top 10 (2026)"
+url: "https://owasp.org/www-project-agentic-skills-top-10/"
+items:
+  - id: AST01
+    name: Malicious Skills
+    description: >-
+      A skill published with hidden payloads — credential stealers, reverse
+      shells, backdoors, or social-engineering instructions embedded in
+      SKILL.md prose or bundled code. Exploits both the code layer and the
+      natural-language instruction layer. Includes memory/identity-file
+      persistence and covert exfiltration.
+  - id: AST02
+    name: Supply Chain Compromise
+    description: >-
+      Skill registries and distribution channels lack provenance controls.
+      Registry flooding, dependency confusion, config-file hijacking, and
+      maintainer account takeover deliver malicious skills or poisoned
+      bundled dependencies.
+  - id: AST03
+    name: Over-Privileged Skills
+    description: >-
+      A skill is granted broader permissions than its stated function
+      requires — no permission manifest, blanket consent, or grants that
+      hand out unrestricted code execution, network egress, or writes to
+      agent identity/memory files.
+  - id: AST04
+    name: Insecure Metadata
+    description: >-
+      A skill's metadata (name, description, permissions, risk_tier, and the
+      YAML/JSON it is written in) is an attacker-controlled input the loader
+      reads with little validation — enabling brand impersonation,
+      permission understating, risk-tier spoofing, discovery manipulation,
+      and unsafe deserialization.
+  - id: AST05
+    name: Untrusted External Instructions
+    description: >-
+      A skill references external documentation at a URL or remote file that
+      the agent loads and follows as instructions with full permissions.
+      The referenced content is mutable, lives outside the trust boundary,
+      and can be rug-pulled after review.
+  - id: AST06
+    name: Weak Isolation
+    description: >-
+      Skills execute in the host agent's security context with full file,
+      shell, and network access because sandboxing is unavailable, optional,
+      or disabled. Includes skill shadowing, where one skill overrides
+      another in the agent's router.
+  - id: AST07
+    name: Update Drift
+    description: >-
+      Skills are installed and forgotten. Without immutable pinning and
+      update verification, a reviewed skill drifts from its known-good
+      version — via malicious update, rollback, or hot-reload of an edited
+      SKILL.md.
+  - id: AST08
+    name: Poor Scanning
+    description: >-
+      Scanners insufficient for skills, which combine natural-language
+      instructions with executable content and metadata. Covers
+      natural-language bypass, obfuscated instructions, evasion, and
+      incomplete scan coverage reported as clean.
+  - id: AST09
+    name: No Governance
+    description: >-
+      Organizations lack the inventories, policies, review processes, and
+      audit trails needed to manage skills at scale — a shadow-AI layer
+      security teams cannot see or control.
+  - id: AST10
+    name: Cross-Platform Reuse
+    description: >-
+      Skills ported across platforms without translating the security
+      properties of the source format — manifest stripping, context loss,
+      and implicit privilege escalation as skills move between ecosystems.
