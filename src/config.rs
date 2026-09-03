@@ -744,6 +744,16 @@ impl MCPConfigManager {
         }
     }
 
+    /// Return all discovered (path, client) pairs that exist on disk.
+    /// Used by `scan-config --fix` to enumerate fixable files.
+    pub fn existing_config_paths(&self) -> Vec<(PathBuf, MCPClient)> {
+        self.config_paths
+            .iter()
+            .filter(|(p, _)| p.exists() && !p.is_symlink())
+            .cloned()
+            .collect()
+    }
+
     /// Discover MCP configuration paths based on platform and IDE
     fn discover_config_paths() -> Vec<(PathBuf, MCPClient)> {
         let mut paths = Vec::new();

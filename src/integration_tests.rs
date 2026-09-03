@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::core::{MCPScannerCore, RegisterServerRequest};
+    use serial_test::serial;
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -97,6 +98,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_api_keys)]
     async fn test_environment_variable_mapping() {
         let _ = tracing_subscriber::fmt::try_init();
 
@@ -124,6 +126,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_api_keys)]
     async fn test_env_mapping_function() {
         // Clean up any existing env vars first
         std::env::remove_var("LLM_API_KEY");
@@ -156,6 +159,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_api_keys)]
     async fn test_env_mapping_respects_existing_headers() {
         // Clean up any existing env vars first
         std::env::remove_var("LLM_API_KEY");

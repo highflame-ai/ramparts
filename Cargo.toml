@@ -175,9 +175,19 @@ webpki-roots = "1"
 #   this locally. Must move in lockstep with `common/Cargo.toml`.
 ramparts-common = { path = "common", version = "0.8.1" }
 
+# Atomic file writes for `scan-config --fix` (NamedTempFile::persist handles
+# Windows replace-existing semantics that plain rename does not).
+tempfile = "3.8"
+
+# Unified diff rendering for `scan-config --dry-run` / `--fix`.
+similar = "2"
+
 [build-dependencies]
 chrono = "0.4"
 
 [dev-dependencies]
 tokio-test = "0.4"
-tempfile = "3.8"
+# Serialise tests that mutate process-wide environment variables. Several
+# tests in `integration_tests.rs` race on `LLM_API_KEY` / `X_API_KEY` /
+# `API_KEY` and flake under parallel execution.
+serial_test = "3"
