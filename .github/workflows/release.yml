@@ -31,7 +31,7 @@ jobs:
             echo "Valid version format: ${{ env.RELEASE_NAME }}"
           else
             echo "Invalid version format: ${{ env.RELEASE_NAME }}"
-            echo "Expected bare semver (X.Y.Z); got: ${{ env.RELEASE_NAME }}"
+            echo "Expected v-prefixed semver (vX.Y.Z); got: ${{ env.RELEASE_NAME }}"
             exit 1
           fi
 

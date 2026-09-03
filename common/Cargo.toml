@@ -1,8 +1,8 @@
 [package]
 name = "ramparts-common"
-# Bumped to 0.8.1 in lockstep with the root crate. ramparts-common
-# is being published to crates.io for the first time as part of
-# this version (see release-plz.toml `publish = true`).
+# Stamped in lockstep with the root crate by `release.yml` from the
+# GitHub release name. Must be on crates.io at the same version as
+# `ramparts` or `cargo publish` of the root crate fails.
 version = "0.8.1"
 edition = "2021"
 authors = ["Sharath Rajasekar <sharath@highflame.com>"]

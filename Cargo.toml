@@ -1,13 +1,7 @@
 [package]
 name = "ramparts"
-# Bumped to 0.8.1 in this PR to bypass the orphan 0.8.0 state:
-# git tag 0.8.0 and a GitHub release 0.8.0 (binaries) exist, but
-# `cargo publish` for 0.8.0 never ran (the trigger workflow was
-# broken at the time). release-plz refuses to compute a "next
-# version" while the tag-exists / not-on-crates.io mismatch
-# persists. Publishing 0.8.1 cleanly skips the orphan; crates.io
-# users go 0.7.3 -> 0.8.1, GitHub's 0.8.0 binary release stays as
-# historical archive.
+# 0.8.1 skipped an orphan 0.8.0: git tag + GitHub release existed,
+# but crates.io publish never ran. crates.io users go 0.7.3 -> 0.8.1.
 version = "0.8.2"
 edition = "2021"
 authors = ["Sharath Rajasekar <sharath@highflame.com>"]
@@ -18,23 +12,9 @@ keywords = ["mcp", "scanner", "skills", "llm", "security"]
 categories = ["command-line-utilities", "development-tools::testing"]
 include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
 
-# NOTE: A previous `[package.metadata.release]` block configured
-# `cargo-release` here (with `tag-name = "v{version}"`). It's been
-# removed because ramparts now uses **release-plz** (see
-# `release-plz.toml` + `.github/workflows/release-plz.yml`) and the
-# `v`-prefixed tag convention from cargo-release conflicts with
-# release-plz's bare-semver tags (which `release.yml`'s regex
-# `^[0-9]+\.[0-9]+\.[0-9]+$` enforces). If anyone ran `cargo release`
-# locally with the old block in place, they'd cut `v0.9.0` tags that
-# release.yml would then reject as malformed.
-
-# Workspace declaration. `ramparts-common` (in `common/`) needs to
-# be a true workspace member — not just a path dependency below —
-# so release-plz can manage its version in lockstep with the root
-# crate. Without this declaration, release-plz aborts with
-# "The following overrides are not present in the workspace:
-# `ramparts-common`. Check for typos" when reading the per-package
-# block from `release-plz.toml`.
+# Workspace: `ramparts-common` (in `common/`) is a real member, not
+# only a path dependency. `release.yml` stamps both Cargo.toml files
+# from the GitHub release name (`vX.Y.Z`) at publish time.
 [workspace]
 members = ["common"]
 

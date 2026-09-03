@@ -17,9 +17,8 @@ test_mcp_ecosystem.py
 # into the directory and the negations would be silently ignored.
 examples/*
 # Allowlist the user-facing example files that ARE intentionally
-# committed. Without these un-ignore lines, release-plz aborts on
-# the "tracked AND gitignored" check (same constraint as the
-# `Cargo.lock` block below).
+# committed. Without these un-ignore lines, git would treat them as
+# ignored (same constraint as the `Cargo.lock` block below).
 !examples/config_example.json
 !examples/servers.txt
 !examples/stdio_example.md
@@ -36,9 +35,7 @@ docs/proxy/*TEST*_RESULTS*.md
 # advisories. Only library-only crates should gitignore `Cargo.lock`.
 #
 # We use a paired `Cargo.lock` + `!/Cargo.lock` pattern so that:
-# - the ROOT lockfile is un-ignored and tracked (release-plz needs
-#   this; it aborts when the lockfile is both .gitignored and
-#   committed)
+# - the ROOT lockfile is un-ignored and tracked
 # - any per-workspace-member lockfile (e.g. `common/Cargo.lock`)
 #   that gets created by running `cargo` directly inside the member
 #   directory stays gitignored — workspace members don't need their
