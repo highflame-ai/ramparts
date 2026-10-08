@@ -52,11 +52,13 @@ Options:
 Scan a single MCP server for tools, resources, and security vulnerabilities.
 
 ### Usage
+
 ```bash
 ramparts scan <URL> [OPTIONS]
 ```
 
 ### Arguments
+
 - `<URL>` - MCP server URL or endpoint to scan
 
 ### Options
@@ -82,28 +84,33 @@ Options:
 ### Examples
 
 **Basic scan:**
+
 ```bash
 ramparts scan https://api.githubcopilot.com/mcp/
 ```
 
 **Scan with authentication:**
+
 ```bash
 ramparts scan https://api.githubcopilot.com/mcp/ \
   --auth-headers "Authorization: Bearer $TOKEN"
 ```
 
 **JSON output:**
+
 ```bash
 ramparts scan https://api.githubcopilot.com/mcp/ --format json
 ```
 
 **SARIF output for GitHub code scanning:**
+
 ```bash
 ramparts scan https://api.githubcopilot.com/mcp/ --format sarif > ramparts.sarif
 # Then upload via github/codeql-action/upload-sarif in CI
 ```
 
 **Custom timeout:**
+
 ```bash
 ramparts scan https://api.githubcopilot.com/mcp/ \
   --timeout 120 \
@@ -111,16 +118,19 @@ ramparts scan https://api.githubcopilot.com/mcp/ \
 ```
 
 **Scan only tool definitions (skip prompts and resources):**
+
 ```bash
 ramparts scan https://api.githubcopilot.com/mcp/ --only tools
 ```
 
 **Generate detailed markdown report:**
+
 ```bash
 ramparts scan https://api.githubcopilot.com/mcp/ --report
 ```
 
 **STDIO server scan:**
+
 ```bash
 # Format: stdio:<command>:<arg1>:<arg2>:...
 ramparts scan "stdio:npx:-y:@modelcontextprotocol/server-everything"
@@ -140,6 +150,7 @@ ramparts scan "stdio:node:/path/to/server.js"
 Scan MCP servers from IDE configuration files.
 
 ### Usage
+
 ```bash
 ramparts scan-config [OPTIONS]
 ```
@@ -165,11 +176,13 @@ Options:
 ### Examples
 
 **Scan from IDE configs:**
+
 ```bash
 ramparts scan-config
 ```
 
 **With authentication:**
+
 ```bash
 ramparts scan-config \
   --auth-headers "Authorization: Bearer $TOKEN" \
@@ -177,11 +190,13 @@ ramparts scan-config \
 ```
 
 **Generate report:**
+
 ```bash
 ramparts scan-config --report
 ```
 
 **Scan a checked-in repo of IDE configs (e.g. in CI):**
+
 ```bash
 # `--root` walks the directory recursively, picks up `mcp.json`,
 # `*.mcp.json`, `claude_desktop_config.json`, `settings.json`, etc.
@@ -191,6 +206,7 @@ ramparts scan-config --root ./ide-configs --format sarif > ramparts.sarif
 ```
 
 **Only tool definitions (skip prompts/resources):**
+
 ```bash
 ramparts scan-config --only tools
 ```
@@ -208,6 +224,122 @@ Ramparts automatically discovers and reads MCP server configurations from:
 - **Neovim**: `~/.config/nvim/mcp.json`
 - **Helix**: `~/.config/helix/mcp.json`
 - **Zed**: `~/.config/zed/mcp.json`
+
+### Auto-Fix Mode (`--fix`, `--dry-run`, `--undo`)
+
+> ⚠ **Auto-fix modifies your IDE configuration files in place.** It always
+> writes a backup first (see "Backups" below), but you should still close
+> your IDE before running `--fix --yes` so the IDE doesn't race-rewrite the
+> file from its in-memory state.
+
+Auto-fix applies a small, conservative set of deterministic remediations to
+discovered IDE config files. Anything that requires LLM judgement, network
+resolution, or schema inference is intentionally **not** auto-fixed.
+
+#### Usage
+
+```bash
+# Show what would change. Exits 1 if any fixes would be applied (CI-usable).
+ramparts scan-config --dry-run
+
+# Same as --dry-run when --yes is omitted: prints the diff, doesn't write.
+ramparts scan-config --fix
+
+# Actually apply. Backs up every touched file first.
+ramparts scan-config --fix --yes
+
+# Restore the most recent fix run from backup, then delete the backup.
+ramparts scan-config --undo
+
+# Apply even if some target files have uncommitted git changes (override).
+ramparts scan-config --fix --yes --force
+
+# Run a subset of rules.
+ramparts scan-config --fix --yes --disable-rule allowlist-tightening
+```
+
+#### Fix rules shipped
+
+| Rule                     | What it does                                                                                                                                                                                                                                                                                                     |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `http-to-https`          | Rewrites `http://` URLs in `url` fields to `https://`. Loopback hosts (`localhost`, `127.x.x.x`, `0.0.0.0`, `::1`) are preserved.                                                                                                                                                                                |
+| `secret-externalization` | Replaces inline `SCREAMING_SNAKE` env values with `${VAR}` references. Already-referenced values, empty values, and `dangerous-flag` keys are skipped. If the config dir already contains a `.env.example`, new placeholder lines (`VAR=`) are appended; otherwise the suggested contents are printed to stderr. |
+| `dangerous-flag-removal` | Removes a closed list of opt-out flags that disable security: `NODE_TLS_REJECT_UNAUTHORIZED=0`, `DANGEROUSLY_OMIT_AUTH=true`, `MCP_DISABLE_AUTH=1`, `PYTHONHTTPSVERIFY=0`, `GIT_SSL_NO_VERIFY=true`.                                                                                                             |
+| `allowlist-tightening`   | Drops over-broad sentinel entries (`*`, `**`, `/`, `~`, `0.0.0.0/0`, `::/0`) from `allowedDirectories` / `allowedHosts` arrays **only when more specific entries are also present**. If a sentinel is the sole entry, the list is left alone (no signal for what to narrow to).                                  |
+
+Rules can be selected per-run with `--enable-rule NAME` and `--disable-rule NAME` (repeatable).
+
+#### Git-cleanliness check (`--force`)
+
+If a target file lives inside a git repository and has uncommitted changes
+(working-tree or index), `--fix --yes` refuses by default to avoid
+overwriting the user's in-progress edits. The error lists the dirty paths;
+commit/stash and re-run, or pass `--force` to override. Files outside any
+git repo (most IDE configs in `~/Library/Application Support/...` etc.) are
+unaffected by this check. The backup is written regardless of `--force`.
+
+#### Backups and `--undo`
+
+Every `--fix --yes` run creates a directory under
+`~/.ramparts/fixes/<run-id>/` containing:
+
+- `manifest.json` listing every file touched, with `sha256_before` and
+  `sha256_after` fingerprints and the rules that fired.
+- One `<hash>.bak` file per touched file, holding the pre-fix bytes.
+
+`--undo` finds the most recent run-dir and restores each entry **only when
+the current target file's SHA-256 still matches `sha256_after`**. If you
+edited a file after the fix, undo skips that entry rather than clobber your
+changes; the backup directory stays around so you can inspect or recover
+manually.
+
+A clean undo deletes the run-dir. A partial undo (anything skipped) leaves
+the run-dir in place.
+
+#### Refusal cases (the engine intentionally does nothing)
+
+Auto-fix is conservative and refuses to touch any file where it can't
+guarantee a lossless write-back:
+
+- **The file uses formatting we don't preserve.** Before any fix, ramparts
+  re-serializes the parsed JSON via `serde_json::to_string_pretty` and
+  compares to the original bytes (modulo a single trailing newline). If
+  they differ, the file likely contains comments, trailing commas, custom
+  indentation, or fields outside the schemas ramparts understands. We
+  refuse rather than mangle. JSONC files (VS Code `settings.json`,
+  Claude Code `settings.json`) commonly fall into this bucket.
+- **The file is a symlink.** We don't follow symlinks for fixes.
+- **The file is not valid JSON.** Reported with a clear error; skipped.
+
+Refused files are listed in the dry-run output. Other discovered files
+that pass the round-trip check still get fixed.
+
+#### Recovery
+
+If something looks wrong after a fix:
+
+1. Run `ramparts scan-config --undo` to revert the most recent run.
+2. If undo reports drift on a file you intended to revert, the original
+   bytes are still in `~/.ramparts/fixes/<run-id>/<hash>.bak` — copy them
+   back manually.
+3. If you've manually edited backup files or the manifest, restore can be
+   done with `cp` from the backup directly to the target path.
+
+#### Limitations and caveats
+
+- **Git-cleanliness check is best-effort.** Files outside any git repo
+  (e.g. `~/Library/Application Support/Claude/claude_desktop_config.json`)
+  are not gated by the check — the backup is the safety net for those.
+  When the check does fire, override with `--force` if intentional.
+- **`fsync(2)` only on Unix.** macOS's `fsync` does not guarantee
+  platter-level durability — `F_FULLFSYNC` would. We accept this for v1;
+  the backup makes a power-loss-during-fix recoverable on next boot.
+- **Concurrent IDE writes can race.** If Cursor / Claude Desktop / VS Code
+  is running, it may rewrite the config file from its in-memory state
+  after the fix completes, silently undoing it. Close the IDE first.
+- **Discovery scope.** `--fix` operates on the same file set as
+  `scan-config`'s normal discovery — ramparts will not write to files
+  outside that set.
 
 If a file's content uses a different schema than the path suggests (e.g. a
 Claude-Desktop-style `{"mcpServers": ...}` document saved at a VS Code path),
@@ -442,17 +574,20 @@ a JSON scan in CI, then convert it to SARIF** for GitHub code-scanning
 ingestion as a separate step.
 
 ### Usage
+
 ```bash
 ramparts replay <PATH> [--format <FORMAT>]
 ```
 
 ### Arguments
+
 - `<PATH>` — Path to a JSON file containing a `ScanResult` (single-server,
   emitted by `ramparts scan`) or a `Vec<ScanResult>` (multi-server, emitted
   by `ramparts scan-config`). The renderer auto-detects which shape is
   present.
 
 ### Options
+
 ```bash
 Options:
       --format <FORMAT>   Output format [default: from config.yaml]
@@ -480,6 +615,7 @@ already-emitted findings.
 Start the MCP Scanner microservice.
 
 ### Usage
+
 ```bash
 ramparts server [OPTIONS]
 ```
@@ -497,16 +633,19 @@ Options:
 ### Examples
 
 **Default server:**
+
 ```bash
 ramparts server
 ```
 
 **Custom port and host:**
+
 ```bash
 ramparts server --port 8080 --host 127.0.0.1
 ```
 
 **With custom config:**
+
 ```bash
 ramparts server --config /path/to/custom-config.yaml
 ```
@@ -516,6 +655,7 @@ ramparts server --config /path/to/custom-config.yaml
 Create a custom configuration file with default settings.
 
 ### Usage
+
 ```bash
 ramparts init-config [OPTIONS]
 ```
@@ -531,11 +671,13 @@ Options:
 ### Examples
 
 **Create default config:**
+
 ```bash
 ramparts init-config
 ```
 
 **Overwrite existing config:**
+
 ```bash
 ramparts init-config --force
 ```
@@ -549,31 +691,40 @@ suppressed automatically so downstream parsers (jq, `codeql-action/upload-sarif`
 etc.) get clean stdout.
 
 ### Table Format (Default)
+
 Human-readable table format with colored output:
+
 ```bash
 ramparts scan <url>
 ramparts scan <url> --format table
 ```
 
 ### JSON Format
+
 Machine-readable structured output:
+
 ```bash
 ramparts scan <url> --format json
 ```
 
 ### Text Format
+
 Simple text output:
+
 ```bash
 ramparts scan <url> --format text
 ```
 
 ### Raw Format
+
 Raw JSON preserving original MCP server responses with embedded security data:
+
 ```bash
 ramparts scan <url> --format raw
 ```
 
 ### SARIF Format
+
 SARIF 2.1.0 output for GitHub Advanced Security code-scanning, GitLab, Azure
 DevOps, Microsoft Defender, and most enterprise security dashboards:
 
@@ -582,6 +733,7 @@ ramparts scan <url> --format sarif > ramparts.sarif
 ```
 
 Each finding includes:
+
 - `ruleId` — YARA rule name or `ramparts.security.<IssueType>`
 - `level` — `error` (CRITICAL/HIGH), `warning` (MEDIUM), `note` (LOW)
 - `properties.security-severity` — numeric 0–10 score so GitHub renders the
@@ -589,6 +741,7 @@ Each finding includes:
 - `properties.tags` — OWASP MCP Top 10 IDs (e.g. `owasp-mcp-top-10:2025-draft:MCP05`)
 
 CI integration example with GitHub Code Scanning:
+
 ```yaml
 - name: Run ramparts
   run: ramparts scan-config --format sarif > ramparts.sarif
@@ -604,6 +757,7 @@ CI integration example with GitHub Code Scanning:
 Ramparts respects the following environment variables:
 
 ### Logging
+
 ```bash
 RUST_LOG=debug ramparts scan <url>        # Debug logging
 RUST_LOG=info ramparts scan <url>         # Info logging
@@ -612,12 +766,15 @@ RUST_LOG=error ramparts scan <url>        # Error logging only
 ```
 
 ### Configuration
+
 ```bash
 RAMPARTS_CONFIG=/path/to/config.yaml ramparts scan <url>
 ```
 
 ### API Keys
+
 You can use environment variables in auth headers:
+
 ```bash
 ramparts scan <url> --auth-headers "Authorization: Bearer $TOKEN"
 ramparts scan <url> --auth-headers "X-API-Key: $API_KEY"
@@ -637,6 +794,7 @@ Ramparts uses standard exit codes:
 ## Advanced Usage
 
 ### Batch Scanning from File
+
 ```bash
 # Create a file with URLs
 echo "https://server1.com/mcp/
@@ -650,6 +808,7 @@ done < servers.txt
 ```
 
 ### Using with jq for Processing
+
 ```bash
 # Extract security issue count
 ramparts scan <url> --output json | jq '.security_issues.total_issues'
@@ -663,6 +822,7 @@ ramparts scan <url> --output json | jq -r '.tools[].name'
 ```
 
 ### Combining with Other Tools
+
 ```bash
 # Save scan results with timestamp
 ramparts scan <url> --output json > "scan-$(date +%Y%m%d-%H%M%S).json"
@@ -693,26 +853,30 @@ Ramparts looks for configuration files in the following order:
 Generate shell completion scripts:
 
 ### Bash
+
 ```bash
 ramparts --generate-completion bash > /etc/bash_completion.d/ramparts
 ```
 
 ### Zsh
+
 ```bash
 ramparts --generate-completion zsh > ~/.zsh/completions/_ramparts
 ```
 
 ### Fish
+
 ```bash
 ramparts --generate-completion fish > ~/.config/fish/completions/ramparts.fish
 ```
 
 ### PowerShell
+
 ```powershell
 ramparts --generate-completion powershell > ramparts.ps1
 ```
 
-*Note: Completion generation may not be available in all versions.*
+_Note: Completion generation may not be available in all versions._
 
 ## Advanced Usage Examples
 
@@ -759,17 +923,20 @@ ramparts scan --batch servers.txt
 ### Output Format Details
 
 **Table Format (Default)**
+
 - Human-readable with colored output
 - Tree-style security issue display with inline details
 - Progress indicators and summaries
 - Color-coded severity levels (🔴 CRITICAL, 🟠 HIGH, 🟡 MEDIUM, 🟢 LOW)
 
 **JSON Format**
+
 - Machine-readable structured output
 - Perfect for scripts and automation
 - Use `--pretty` for formatted output
 
 **Raw Format**
+
 - Preserves original MCP server responses
 - Useful for debugging and analysis
 - Minimal processing of server data
@@ -777,5 +944,6 @@ ramparts scan --batch servers.txt
 ### Integration Examples
 
 **Server Mode Integration:**
+
 - 📚 **[Complete API Documentation](docs/api.md)** - REST endpoints and request/response formats
 - 🔧 **[Integration Patterns](docs/integration.md)** - CI/CD, Docker, Kubernetes, and monitoring examples
