@@ -1,15 +1,15 @@
 name: Release Build - Ramparts
 
 on:
-  release:
-    types:
-      - published
+  push:
+    tags:
+      - "v*.*.*"
 
 env:
   PY_VER: 3.11.8
   RELEASE_BRANCH: "main"
   REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
-  RELEASE_NAME: ${{ github.event.release.name }}
+  RELEASE_NAME: ${{ github.event.release.tag_name || github.ref_name }}
 
 jobs:
   highflame-validate:
@@ -214,24 +214,42 @@ jobs:
             ${{ github.event.repository.name }}
 
       - name: Upload release assets
-        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./release/${{ steps.set_env.outputs.crate_release }}
-          asset_name: ${{ steps.set_env.outputs.crate_release }}
-          asset_content_type: application/octet-stream
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        shell: bash
+        run: |
+          gh release upload \
+            "${RELEASE_NAME}" \
+            "./release/${{ steps.set_env.outputs.crate_release }}"
 
       - name: Upload checksums
-        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./release/${{ matrix.target }}-${{ matrix.arch }}_checksums.txt
-          asset_name: ${{ matrix.target }}-${{ matrix.arch }}_checksums.txt
-          asset_content_type: text/plain
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        shell: bash
+        run: |
+          gh release upload \
+            "${RELEASE_NAME}" \
+            "./release/${{ matrix.target }}-${{ matrix.arch }}_checksums.txt"
+
+      # - name: Upload release assets
+      #   uses: actions/upload-release-asset@v1
+      #   env:
+      #     GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+      #   with:
+      #     upload_url: ${{ github.event.release.upload_url }}
+      #     asset_path: ./release/${{ steps.set_env.outputs.crate_release }}
+      #     asset_name: ${{ steps.set_env.outputs.crate_release }}
+      #     asset_content_type: application/octet-stream
+
+      # - name: Upload checksums
+      #   uses: actions/upload-release-asset@v1
+      #   env:
+      #     GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+      #   with:
+      #     upload_url: ${{ github.event.release.upload_url }}
+      #     asset_path: ./release/${{ matrix.target }}-${{ matrix.arch }}_checksums.txt
+      #     asset_name: ${{ matrix.target }}-${{ matrix.arch }}_checksums.txt
+      #     asset_content_type: text/plain
 
   highflame-crate:
     needs:

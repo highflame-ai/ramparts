@@ -1,9 +1,9 @@
 name: Release Build - Highflame Ramparts Server
 
 on:
-  release:
-    types:
-      - published
+  push:
+    tags:
+      - "v*.*.*"
 
 env:
   DEVOPS_REPO: "highflame-cloud"
@@ -11,7 +11,7 @@ env:
   CICD_TRIGGER: "enable"
   CICD_WORKFLOW: "trigger-release-deploy-ramparts-server.yml"
   REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
-  RELEASE_NAME: ${{ github.event.release.name }}
+  RELEASE_NAME: ${{ github.event.release.tag_name || github.ref_name }}
 
 jobs:
   reusable-vars:
@@ -80,4 +80,4 @@ jobs:
           gh workflow run ${{ env.CICD_WORKFLOW }} \
             --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \
             --ref ${{ env.DEVOPS_BRANCH }} \
-            -f RELEASE_VER=${{ github.event.release.tag_name }}
+            -f RELEASE_VER=${{ github.event.release.tag_name || github.ref_name }}
