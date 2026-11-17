@@ -35,7 +35,7 @@ Ramparts provides **security scanning** of the MCP-and-skill ecosystem by:
 
 1. **MCP server discovery & analysis** — scans MCP endpoints for tools/resources/prompts; multi-transport (HTTP, SSE, stdio, subprocess) with intelligent fallback and session management
 2. **Skill scanning** — same threat model applied to agent skill files on disk (Claude Code commands, agentskills.io bundles incl. bundled `scripts/` + `references/`, Cursor / Codex / Windsurf / Gemini variants)
-3. **Static analysis (YARA)** — 40 pre-scan rules across both surfaces: 10 skill-targeted rules (prompt-injection variants, credential harvesting, tool-chaining exfil, system manipulation, authority abuse, covert exfiltration) plus malware-IOC rules adapted from [NVIDIA SkillSpector](https://github.com/NVIDIA/SkillSpector) (cryptominers, reverse shells / C2 / info-stealers, webshells, offensive hack tools)
+3. **Static analysis (YARA)** — 45 pre-scan rules across both surfaces: 10 skill-targeted rules (prompt-injection variants, credential harvesting, tool-chaining exfil, system manipulation, authority abuse, covert exfiltration) plus malware-IOC rules adapted from [NVIDIA SkillSpector](https://github.com/NVIDIA/SkillSpector) (cryptominers, reverse shells / C2 / info-stealers, webshells, offensive hack tools), and risky-operation rules (cloud-metadata SSRF, privileged containers, bucket exfiltration, unsafe deserialization, refusal suppression)
 4. **Evasion-resistant rescan** — every YARA rule is also run over a normalized view (invisible/zero-width chars stripped, NFKC homoglyph folding) and iteratively base64/hex-decoded views, so a keyword split by zero-width characters, spelled in fullwidth homoglyphs, or hidden in an encoded blob still matches
 5. **LLM-powered analysis** — sophisticated semantic issues no static rule can spot (tool descriptions that lie about behavior, sneaky permission requests, etc.)
 6. **Cross-origin analysis** — detects tools spanning multiple domains, a context-hijacking / injection vector
@@ -114,6 +114,10 @@ ramparts skills scan-config
 
 # SARIF output for code-scanning ingestion
 ramparts skills scan ./.claude/commands --format sarif > skills.sarif
+
+# CI gate: exit 1 if any finding is HIGH or above (works on scan, scan-config,
+# skills scan, skills scan-config; the report still goes to stdout)
+ramparts skills scan ./skills --fail-on-findings high
 ```
 
 **Skill formats supported out of the box:**
