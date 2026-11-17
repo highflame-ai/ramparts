@@ -81,12 +81,17 @@ rule PHPWebshellKnown
         $weevely       = "weevely" nocase
         $p0wny         = "p0wny" nocase
         $antsword      = "antSword" nocase
-        $behinder      = "behinder" nocase
         $godzilla      = "GodzillaShell" nocase
         $china_chopper = "China Chopper" nocase
+        // Behinder: the bare tool name shows up in security write-ups, so
+        // match its hard-coded default AES key next to a server-page tag.
+        $behinder_key  = "e45e329feb5d925b"
+        $server_tag    = /<\?(php|=|[ \t\r\n])|<%(@|[ \t\r\n])/ nocase
 
     condition:
-        any of them
+        any of ($c99, $c99v2, $r57, $wso, $b374k, $alfa, $weevely,
+                $p0wny, $antsword, $godzilla, $china_chopper)
+        or ($behinder_key and $server_tag)
 }
 
 rule PythonWebshell
