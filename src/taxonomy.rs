@@ -137,7 +137,9 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         // (hooks, helper commands, guardrail settings).
         "AgentHookRemoteExec" => vec![OwaspTag::new("MCP07"), OwaspTag::new("MCP10")],
         "AgentConfigTamper" => vec![OwaspTag::new("MCP03"), OwaspTag::new("MCP10")],
-        "LLMBaseUrlOverride" => vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")],
+        "LLMBaseUrlOverride" | "AgentTrafficInterception" => {
+            vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
+        }
         "AutoApprovedProjectMcpServers" | "WildcardAgentPermission" => {
             vec![OwaspTag::new("MCP03")]
         }
@@ -408,6 +410,7 @@ mod tests {
             "AgentHookRemoteExec",
             "AgentConfigTamper",
             "LLMBaseUrlOverride",
+            "AgentTrafficInterception",
             "AutoApprovedProjectMcpServers",
             "WildcardAgentPermission",
             "CrossOriginEscalation",

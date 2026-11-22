@@ -106,6 +106,8 @@ MCP servers. It covers committed project files like `.claude/settings.json`,
 - **Guardrail-weakening settings**: `bypassPermissions` or `Bash(*)`
   permissions, `enableAllProjectMcpServers`, and a model API base URL
   (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, …) pointed at an unknown host.
+- **Traffic interception env**: `HTTPS_PROXY`, `NODE_TLS_REJECT_UNAUTHORIZED=0`,
+  `NODE_EXTRA_CA_CERTS`, or `NODE_OPTIONS=--require …`.
 
 ### 2. Scan AI agent skills
 

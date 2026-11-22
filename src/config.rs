@@ -2346,7 +2346,10 @@ impl MCPConfigManager {
                 .filter(|dir| dir.file_name().is_some_and(|n| n == ".cursor"))
                 .map(|dir| dir.join("hooks.json"));
             for candidate in std::iter::once(path.clone()).chain(cursor_hooks) {
-                if candidate.is_file() && !out.contains(&candidate) {
+                if is_agent_config_file(&candidate)
+                    && candidate.is_file()
+                    && !out.contains(&candidate)
+                {
                     out.push(candidate);
                 }
             }
@@ -2457,6 +2460,25 @@ impl MCPConfigManager {
     }
 }
 
+/// Files an agent client reads hooks or guardrail settings from: anything
+/// under `.claude/`, `.gemini/`, `.cursor/` or `.vscode/`, plus
+/// `.claude.json`, `managed-settings.json` and `.mcp.json`. A `--root` walk
+/// also finds app files like `src/config/settings.json`; auditing those
+/// would only produce false findings and parse errors.
+fn is_agent_config_file(path: &Path) -> bool {
+    let named = |p: Option<&std::ffi::OsStr>, names: &[&str]| {
+        p.and_then(|n| n.to_str())
+            .is_some_and(|n| names.contains(&n))
+    };
+    named(
+        path.file_name(),
+        &[".claude.json", "managed-settings.json", ".mcp.json"],
+    ) || named(
+        path.parent().and_then(Path::file_name),
+        &[".claude", ".gemini", ".cursor", ".vscode"],
+    )
+}
+
 /// `.cursor/hooks.json`: Cursor's hooks file, audited but not an MCP config.
 fn is_cursor_hooks_file(path: &Path) -> bool {
     path.file_name().is_some_and(|n| n == "hooks.json")
@@ -2485,6 +2507,19 @@ mod tests {
             manager.config_paths.is_empty(),
             "hooks.json is not an MCP config"
         );
+    }
+
+    #[test]
+    fn root_walk_audits_only_agent_config_files() {
+        let dir = tempdir().unwrap();
+        let claude = dir.path().join(".claude").join("settings.json");
+        let app = dir.path().join("app").join("config").join("settings.json");
+        for p in [&claude, &app] {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, "{}").unwrap();
+        }
+        let manager = MCPConfigManager::with_root(dir.path());
+        assert_eq!(manager.agent_config_paths(), vec![claude]);
     }
 
     #[test]

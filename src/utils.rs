@@ -1712,6 +1712,17 @@ fn print_multi_server_tree(results: &[ScanResult], _detailed: bool) {
                 total_warnings += server_warnings;
             }
         }
+        // Agent-config findings have no security_issues entry; count them
+        // here so a dangerous hook never reads as "all passed".
+        let config_findings = result
+            .yara_results
+            .iter()
+            .filter(|y| y.target_type == "config")
+            .count();
+        if config_findings > 0 {
+            servers_with_warnings += 1;
+            total_warnings += config_findings;
+        }
     }
 
     // Print scan summary statistics
@@ -1782,11 +1793,16 @@ fn print_multi_server_tree(results: &[ScanResult], _detailed: bool) {
             let server_yara_results: Vec<&crate::types::YaraScanResult> = result
                 .yara_results
                 .iter()
-                .filter(|y| y.target_type == "server")
+                .filter(|y| y.target_type == "server" || y.target_type == "config")
                 .collect();
 
             if !server_yara_results.is_empty() {
-                println!("{ide_continuation}{continuation}🔒 Server Security:");
+                let heading = if result.url.starts_with("config:") {
+                    "Config Security"
+                } else {
+                    "Server Security"
+                };
+                println!("{ide_continuation}{continuation}🔒 {heading}:");
                 for (idx, yara_result) in server_yara_results.iter().enumerate() {
                     let is_last_server_issue = idx == server_yara_results.len() - 1;
                     let branch = if is_last_server_issue {
@@ -1799,9 +1815,9 @@ fn print_multi_server_tree(results: &[ScanResult], _detailed: bool) {
                         .rule_metadata
                         .as_ref()
                         .and_then(|m| m.severity.as_ref())
-                        .map(|s| s.as_str())
-                        .unwrap_or("MEDIUM");
-                    let severity_color = match severity {
+                        .map(|s| s.to_ascii_uppercase())
+                        .unwrap_or_else(|| "MEDIUM".to_string());
+                    let severity_color = match severity.as_str() {
                         "CRITICAL" => "🔴 CRITICAL".red(),
                         "HIGH" => "🟠 HIGH".yellow(),
                         "MEDIUM" => "🟡 MEDIUM".blue(),
