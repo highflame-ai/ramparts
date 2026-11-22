@@ -1472,6 +1472,11 @@ impl MCPConfigManager {
 
         let content = fs::read_to_string(path)
             .map_err(|e| anyhow!("Failed to read IDE config file {}: {}", path.display(), e))?;
+        // Windows editors often save JSON with a UTF-8 BOM, which serde rejects.
+        let content = match content.strip_prefix('\u{feff}') {
+            Some(rest) => rest.to_string(),
+            None => content,
+        };
 
         // Detect IDE type by checking the client type from path
         let client = Self::detect_client(path);
@@ -2330,6 +2335,12 @@ impl MCPConfigManager {
         Ok(())
     }
 
+    /// Any MCP config or hooks-only agent config exists.
+    pub fn has_config_files(&self) -> bool {
+        self.config_paths.iter().any(|(path, _)| path.exists())
+            || self.agent_only_paths.iter().any(|p| p.is_file())
+    }
+
     /// Config files for the agent-config audit (`src/agent_config.rs`):
     /// every existing config file, Cursor `hooks.json` beside any `.cursor/`
     /// directory we already look in, and hooks files a `--root` walk found.
@@ -2507,6 +2518,30 @@ mod tests {
             manager.config_paths.is_empty(),
             "hooks.json is not an MCP config"
         );
+    }
+
+    #[test]
+    fn non_agent_mcp_config_still_counts_as_found() {
+        let dir = tempdir().unwrap();
+        let windsurf = dir.path().join(".windsurf").join("mcp.json");
+        fs::create_dir_all(windsurf.parent().unwrap()).unwrap();
+        fs::write(&windsurf, r#"{"mcpServers":{}}"#).unwrap();
+        let manager = MCPConfigManager::with_root(dir.path());
+        assert!(manager.has_config_files());
+        assert!(manager.agent_config_paths().is_empty());
+    }
+
+    #[test]
+    fn mcp_config_with_utf8_bom_is_parsed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("claude_desktop_config.json");
+        fs::write(
+            &path,
+            "\u{feff}{\"mcpServers\":{\"x\":{\"command\":\"echo\"}}}",
+        )
+        .unwrap();
+        let cfg = MCPConfigManager::load_config_from_path(&path).unwrap();
+        assert_eq!(cfg.servers.map(|s| s.len()), Some(1));
     }
 
     #[test]

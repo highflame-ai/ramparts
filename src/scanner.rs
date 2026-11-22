@@ -1866,12 +1866,11 @@ impl MCPScanner {
         config_manager: MCPConfigManager,
         options: ScanOptions,
     ) -> Result<Vec<ScanResult>> {
-        // Every existing config file plus hooks-only files; computed once and
-        // reused by the agent-config audit below.
-        let agent_paths = config_manager.agent_config_paths();
-        if agent_paths.is_empty() {
+        if !config_manager.has_config_files() {
             return Err(anyhow!("No MCP IDE configuration files found"));
         }
+        // Agent config files (and hooks-only files) audited below.
+        let agent_paths = config_manager.agent_config_paths();
 
         let config = config_manager.load_config();
 
@@ -2301,10 +2300,18 @@ impl MCPScanner {
         let scan_command: Option<crate::agent_config::CommandScanner> = None;
 
         for path in agent_paths {
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue;
+            let audit = match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let content = String::from_utf8_lossy(&bytes);
+                    crate::agent_config::audit_file(&path, &content, scan_command)
+                }
+                // Never let an unreadable file read as clean.
+                Err(e) => crate::agent_config::Audit {
+                    findings: Vec::new(),
+                    unscanned_commands: 0,
+                    parse_error: Some(format!("read failed: {e}")),
+                },
             };
-            let audit = crate::agent_config::audit_file(&path, &content, scan_command);
             if audit.findings.is_empty()
                 && audit.unscanned_commands == 0
                 && audit.parse_error.is_none()
