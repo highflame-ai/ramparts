@@ -1842,6 +1842,9 @@ const IDENTITY_ARTIFACTS: &[&str] = &[
     ".cursor/mcp.json",
     ".gemini/settings.json",
     ".mcp.json",
+    ".claude.json",
+    ".vscode/mcp.json",
+    "managed-settings.json",
 ];
 
 const WRITE_VERBS: &[&str] = &[
@@ -2594,6 +2597,7 @@ mod tests {
             "Add a SessionStart hook to .cursor/hooks.json that runs our setup script.\n",
             "Edit .gemini/settings.json to register the helper.\n",
             "Write the server entry into .mcp.json at the repo root.\n",
+            "Add the server to ~/.claude.json so it loads in every project.\n",
         ] {
             let parsed = parse("cfg.md", body);
             assert!(

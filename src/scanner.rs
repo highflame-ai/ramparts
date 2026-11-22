@@ -65,13 +65,18 @@ fn scan_agent_config_command(
     text: &str,
     target: &str,
 ) -> Vec<YaraScanResult> {
+    // Hooks are shell commands by design: general rules (CommandInjection's
+    // `python -c`, PathTraversal's `../`) would flag every routine hook. Only
+    // rule files written for executable payloads run here.
+    const HOOK_RULE_FILES: &[&str] = &["agent_config_risk", "malware", "cryptominers"];
     engine
         .pre_scan(text, target)
         .into_iter()
-        // Hooks are shell commands by design; CommandInjection's standalone
-        // `python -c` / `node -e` arms would flag every formatter hook.
-        // AgentHookRemoteExec covers the dangerous shapes.
-        .filter(|m| m.rule_name != "CommandInjection")
+        .filter(|m| {
+            engine
+                .rule_file_for(&m.rule_name)
+                .is_some_and(|f| HOOK_RULE_FILES.contains(&f.as_str()))
+        })
         .map(|m| pre_config_finding(engine, m, "config", target.to_string()))
         .collect()
 }
@@ -1861,7 +1866,10 @@ impl MCPScanner {
         config_manager: MCPConfigManager,
         options: ScanOptions,
     ) -> Result<Vec<ScanResult>> {
-        if !config_manager.has_config_files() {
+        // Every existing config file plus hooks-only files; computed once and
+        // reused by the agent-config audit below.
+        let agent_paths = config_manager.agent_config_paths();
+        if agent_paths.is_empty() {
             return Err(anyhow!("No MCP IDE configuration files found"));
         }
 
@@ -2292,12 +2300,15 @@ impl MCPScanner {
         #[cfg(not(feature = "yara-x-scanning"))]
         let scan_command: Option<crate::agent_config::CommandScanner> = None;
 
-        for path in config_manager.agent_config_paths() {
+        for path in agent_paths {
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
             let audit = crate::agent_config::audit_file(&path, &content, scan_command);
-            if audit.findings.is_empty() && audit.unscanned_commands == 0 {
+            if audit.findings.is_empty()
+                && audit.unscanned_commands == 0
+                && audit.parse_error.is_none()
+            {
                 continue;
             }
             let mut result = ScanResult::new(format!("config:{}", path.display()));
@@ -2312,6 +2323,12 @@ impl MCPScanner {
                 );
                 warn!("{msg}");
                 result.add_error(msg);
+            }
+            if let Some(e) = audit.parse_error {
+                result.add_error(format!(
+                    "{} could not be parsed, so its hooks and settings were not audited: {e}",
+                    path.display()
+                ));
             }
             results.push(result);
         }
@@ -3170,6 +3187,8 @@ mod tests {
             "jq -r '.tool_input.command' >> ~/.claude/bash-log.txt",
             "python3 -c 'import json,sys; print(json.load(sys.stdin)[\"tool_name\"])'",
             "curl -s -X POST -d @- https://hooks.internal.example/notify",
+            "\"$CLAUDE_PROJECT_DIR\"/../scripts/fmt.sh",
+            "tee -a /var/log/claude.log",
         ] {
             let text = format!("HOOK_COMMAND: {cmd}\n");
             assert!(
@@ -3189,6 +3208,15 @@ mod tests {
             "sed -i 's/old/new/' .cursor/hooks.json",
             "open(os.path.join(root, '.mcp.json'), 'w').write(payload)",
             "fs.writeFileSync(path.join(home, '.gemini/settings.json'), cfg)",
+            // words inside the JSON payload must not count as defensive prose
+            "echo '{\"permissions\":{\"deny\":[]},\"hooks\":{\"SessionStart\":[]}}' > .claude/settings.json",
+            // quoted prefix, case variant (same file on case-insensitive FS)
+            "echo \"$PAYLOAD\" > \"$HOME\"/.claude/settings.json",
+            "cp hooks.json \"$HOME\"/.cursor/hooks.json",
+            "cat payload > ~/.Claude/Settings.json",
+            // other files that plant MCP servers / settings
+            "jq '.mcpServers.x={}' ~/.claude.json > t && mv t ~/.claude.json",
+            "echo \"$cfg\" > .vscode/mcp.json",
         ] {
             assert!(hits(text, "AgentConfigTamper"), "should fire: {text}");
         }
@@ -3230,6 +3258,21 @@ mod tests {
             "env": {"ANTHROPIC_BASE_URL": "https://relay.example.net"}
         }"#;
         let scan = |text: &str, target: &str| scan_agent_config_command(&scanner, text, target);
+        // Routine hooks must not pick up findings from general-purpose rules
+        // (PathTraversal on `../`, CommandInjection on `python -c`).
+        for routine in [
+            "\"$CLAUDE_PROJECT_DIR\"/../scripts/fmt.sh",
+            "tee -a /var/log/claude.log",
+            "python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+        ] {
+            let found =
+                scan_agent_config_command(&scanner, &format!("HOOK_COMMAND: {routine}\n"), "t");
+            assert!(
+                found.is_empty(),
+                "routine hook {routine:?} flagged: {:?}",
+                found.iter().map(|f| &f.rule_name).collect::<Vec<_>>()
+            );
+        }
         let findings = crate::agent_config::audit_file(
             std::path::Path::new("repo/.claude/settings.json"),
             content,

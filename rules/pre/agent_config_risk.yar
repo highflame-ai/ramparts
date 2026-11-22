@@ -7,10 +7,11 @@
 //                          config audit (src/agent_config.rs) emits, so it
 //                          never fires on skill prose or MCP tool text.
 //   - AgentConfigTamper:   skill/tool content that writes an agent config
-//                          file (.claude/settings*.json, .cursor/hooks.json,
-//                          .cursor/mcp.json, .gemini/settings.json,
+//                          file (.claude/settings*.json, ~/.claude.json,
+//                          managed-settings.json, .cursor/{hooks,mcp}.json,
+//                          .vscode/mcp.json, .gemini/settings.json,
 //                          .mcp.json) through the shell or file APIs. That
-//                          is how a malicious hook gets planted.
+//                          is how a malicious hook or MCP server is planted.
 //
 // OWASP mappings live in `src/taxonomy.rs`.
 
@@ -63,11 +64,14 @@ rule AgentConfigTamper
         //     the same line, so a markdown blockquote (`> .claude/...`) doesn't
         //     read as a redirect
         //   sed -i, mv / cp / install, and file-write APIs
-        $write = /([^\s>][ \t]*>>?|\btee\s+(-a\s+)?)\s*["']?[^\s"'|;&<>]*(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|(^|[\s\/"'])\.mcp\.json)|\bsed\s+(-[a-zA-Z]*i[a-zA-Z]*|--in-place)\b[^\n]{0,200}(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json)|\b(mv|cp|install)\s+(-[a-zA-Z]+\s+)*\S+\s+["']?[^\s"']*(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json)|open\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json)[^\n]{0,40}["'][wa]\+?["']|(writeFileSync|writeFile|appendFileSync|write_text|write_bytes)\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json)/
+        $write = /([^\s>][ \t]*>>?|\btee\s+(-a\s+)?)\s*["']?[^\s|;&<>]*(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|(^|[\s\/"'])\.mcp\.json)|\bsed\s+(-[a-zA-Z]*i[a-zA-Z]*|--in-place)\b[^\n]{0,200}(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)|\b(mv|cp|install)\s+(-[a-zA-Z]+\s+)*\S+\s+[^\s|;&<>]*(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)|open\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)[^\n]{0,40}["'][wa]\+?["']|(writeFileSync|writeFile|appendFileSync|write_text|write_bytes)\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)/ nocase
 
         $excl_security_doc = /\b(threat[_\s-]?(model|pattern|hunt)|detection[_\s-]?(rule|pattern)|security[_\s-]?(guide|audit|review|scan)|attack[_\s-]?(example|pattern)|MITRE|ATT&CK|YARA)\b/i
-        $excl_defensive    = /\b(never|do\s+not|don't|must\s+not|should\s+not|avoid|prevent|block|deny)\b[^.\n]{0,60}(\.claude\/settings|\.cursor\/|\.gemini\/settings|\.mcp\.json|hooks?)\b/i
+        $excl_defensive    = /(^|[\n.!?]\s*|\/\/\s*|#\s*)(never|do\s+not|don't|must\s+not|should\s+not|avoid)\b[^.\n"'{}\[\]]{0,60}(\.claude\/settings|\.claude\.json|\.cursor\/|\.vscode\/mcp|\.gemini\/settings|\.mcp\.json|managed-settings|hooks?)\b/i
 
+    // The defensive exclusion needs a sentence-initial negation with no
+    // quotes or braces in between, so words inside a JSON payload
+    // (`"deny":[]`, `"decision":"block"`) can't suppress the write.
     // Exclusions only suppress a write they sit next to. File-wide
     // exclusions let one unrelated "don't skip the hooks step" or
     // "see our security review" line hide every write in the file.

@@ -2354,14 +2354,6 @@ impl MCPConfigManager {
         out
     }
 
-    /// Check if any IDE / agent configuration files exist. A repo whose
-    /// only agent config is a hooks file still counts, so it gets audited
-    /// instead of erroring out.
-    pub fn has_config_files(&self) -> bool {
-        self.config_paths.iter().any(|(path, _)| path.exists())
-            || !self.agent_config_paths().is_empty()
-    }
-
     /// Build a `MCPConfigManager` whose `config_paths` are discovered by
     /// walking `root` for known MCP configuration filenames. Used by
     /// `scan-config --root <PATH>` (see ramparts#51) to scan a checked-in
@@ -2488,10 +2480,6 @@ mod tests {
         fs::write(&hooks, r#"{"version":1,"hooks":{}}"#).unwrap();
 
         let manager = MCPConfigManager::with_root(dir.path());
-        assert!(
-            manager.has_config_files(),
-            "hooks-only repo must not error out"
-        );
         assert_eq!(manager.agent_config_paths(), vec![hooks]);
         assert!(
             manager.config_paths.is_empty(),
