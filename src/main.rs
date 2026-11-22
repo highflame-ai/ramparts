@@ -4,6 +4,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use crate::config::ScannerConfig;
 
+mod agent_config;
 mod banner;
 mod baseline;
 mod cache;

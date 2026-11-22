@@ -2325,6 +2325,27 @@ impl MCPConfigManager {
     }
 
     /// Check if any IDE configuration files exist
+    /// Config files for the agent-config audit (`src/agent_config.rs`):
+    /// every existing config file, plus Cursor `hooks.json` beside any
+    /// `.cursor/` directory we already look in.
+    // ponytail: a --root repo whose .cursor/ holds only hooks.json (no mcp.json)
+    // is missed; add hooks.json to the root walk if that shape shows up.
+    pub fn agent_config_paths(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for (path, _) in &self.config_paths {
+            let cursor_hooks = path
+                .parent()
+                .filter(|dir| dir.file_name().is_some_and(|n| n == ".cursor"))
+                .map(|dir| dir.join("hooks.json"));
+            for candidate in std::iter::once(path.clone()).chain(cursor_hooks) {
+                if candidate.is_file() && !out.contains(&candidate) {
+                    out.push(candidate);
+                }
+            }
+        }
+        out
+    }
+
     pub fn has_config_files(&self) -> bool {
         self.config_paths.iter().any(|(path, _)| path.exists())
     }

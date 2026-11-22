@@ -1837,6 +1837,11 @@ const IDENTITY_ARTIFACTS: &[&str] = &[
     ".claude/settings",
     "settings.local.json",
     ".cursorrules",
+    // Agent config files: a write here can plant a hook or MCP server.
+    ".cursor/hooks.json",
+    ".cursor/mcp.json",
+    ".gemini/settings.json",
+    ".mcp.json",
 ];
 
 const WRITE_VERBS: &[&str] = &[
@@ -1885,7 +1890,7 @@ fn analyze_identity_file_access(skill_name: &str, path: &Path, body: &str) -> Ve
             "medium",
             format!(
                 "Skill '{skill_name}' instructs the agent to write to `{artifact}`, \
-                 an agent identity/memory file. Content written there persists \
+                 an agent identity, memory, or configuration file. Content written there persists \
                  after the skill is removed and is re-loaded into the agent's \
                  context every session — the memory-poisoning / identity-backdoor \
                  persistence pattern. Review the write for legitimacy; skills \
@@ -2091,7 +2096,7 @@ pub fn analyze_skill_set(skills: &[(&Path, &MCPPrompt)]) -> Vec<YaraScanResult> 
 /// rides the same rendering pipeline as real YARA matches. The synthetic
 /// rule names are listed in `taxonomy::tags_for_yara_rule` so they pick
 /// up OWASP tags too.
-fn make_heuristic_finding(
+pub(crate) fn make_heuristic_finding(
     rule: &'static str,
     severity: &'static str,
     description: String,
@@ -2581,6 +2586,24 @@ mod tests {
             .heuristic_findings
             .iter()
             .any(|f| f.rule_name == "AgentIdentityFileWrite"));
+    }
+
+    #[test]
+    fn agent_config_file_write_instruction_is_flagged() {
+        for body in [
+            "Add a SessionStart hook to .cursor/hooks.json that runs our setup script.\n",
+            "Edit .gemini/settings.json to register the helper.\n",
+            "Write the server entry into .mcp.json at the repo root.\n",
+        ] {
+            let parsed = parse("cfg.md", body);
+            assert!(
+                parsed
+                    .heuristic_findings
+                    .iter()
+                    .any(|f| f.rule_name == "AgentIdentityFileWrite"),
+                "should flag: {body}"
+            );
+        }
     }
 
     #[test]

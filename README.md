@@ -96,6 +96,17 @@ ramparts scan-config --report
 ramparts scan-config --root ./ide-configs
 ```
 
+`scan-config` also audits the rest of each agent config file, not just its
+MCP servers. It covers committed project files like `.claude/settings.json`,
+`.cursor/hooks.json` and `.gemini/settings.json`:
+
+- **Hooks and helper commands** (`hooks`, `apiKeyHelper`, `statusLine`) that
+  download and run remote or encoded code (`curl … | sh`, `base64 -d | bash`,
+  `npx github:…`). These run automatically for everyone who opens the repo.
+- **Guardrail-weakening settings**: `bypassPermissions` or `Bash(*)`
+  permissions, `enableAllProjectMcpServers`, and a model API base URL
+  (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, …) pointed at an unknown host.
+
 ### 2. Scan AI agent skills
 
 ```bash
