@@ -25,12 +25,14 @@ rule AgentHookRemoteExec
         version = "1.0"
 
     strings:
-        // curl ... | sh / python / iex
-        $fetch_pipe    = /HOOK_COMMAND:[^\n]*\b(curl|wget|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b[^\n]*\|\s*(sudo\s+)?((ba|z|da|k)?sh|python[0-9.]*|node|perl|ruby|iex|Invoke-Expression)\b/ nocase
+        // curl ... | sh / python / iex, also via an absolute path
+        // (| /bin/bash), sudo with flags (| sudo -E bash) or env (| env sh)
+        $fetch_pipe    = /HOOK_COMMAND:[^\n]*\b(curl|wget|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b[^\n]*\|\s*(sudo(\s+-[a-zA-Z]+)*\s+|env(\s+-[a-zA-Z]+|\s+\w+=\S*)*\s+)?(\/[\w.\/-]*\/)?((ba|z|da|k)?sh|python[0-9.]*|node|perl|ruby|iex|Invoke-Expression)\b/ nocase
         // bash -c "$(curl ...)" / sh <(curl ...)
         $fetch_subst   = /HOOK_COMMAND:[^\n]*\b((ba|z|da|k)?sh|python[0-9.]*|node)\b[^\n]{0,20}(\$\(|<\(|`)\s*(curl|wget)\b/ nocase
-        // download to disk, then run it
-        $download_run  = /HOOK_COMMAND:[^\n]*\b(curl|wget)\b[^\n]*\s(-[a-zA-Z]*[oO]|--output)(\s|=)[^\n]*(&&|;)[^\n]*(chmod\s+[0-7+]*x|\.\/|\b(ba|z)?sh\s|\bpython[0-9.]*\s|\bnode\s)/ nocase
+        // download to disk, then make it executable or run it (chmod +x,
+        // u+x, 755, ./file, /abs/path, or via an interpreter)
+        $download_run  = /HOOK_COMMAND:[^\n]*\b(curl|wget)\b[^\n]*\s(-[a-zA-Z]*[oO]|--output)(\s|=)[^\n]*(&&|;)([^\n]*(chmod\s+([ugoa]*\+[rwxXst]*x|0?[1357][0-7]{2})\b|\.\/|\b(ba|z)?sh\s|\bpython[0-9.]*\s|\bnode\s)|\s*(\/|~\/)[\w.\/-]+(\s|$|&|;|\|))/ nocase
         // decode an inline blob and execute it
         $decode_run    = /HOOK_COMMAND:[^\n]*(base64\s+(-d|-D|--decode)|xxd\s+-r|openssl\s+(enc\s+)?(-d|-base64\s+-d)|FromBase64String)[^\n]*(\|\s*(ba|z|da)?sh\b|\|\s*python|\biex\b|Invoke-Expression|\beval\b)/ nocase
         $ps_encoded    = /HOOK_COMMAND:[^\n]*\b(powershell|pwsh)(\.exe)?\b[^\n]*\s-(e|ec|enc|encodedcommand)\s+[A-Za-z0-9+\/=]{20,}/ nocase
@@ -55,16 +57,23 @@ rule AgentConfigTamper
         version = "1.0"
 
     strings:
-        $redirect = /(>>?|\btee\s+(-a\s+)?)\s*["']?[^\s"'|;&<>]*(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|(^|[\s\/"'])\.mcp\.json)/
-        $in_place = /\bsed\s+(-[a-zA-Z]*i[a-zA-Z]*|--in-place)\b[^\n]{0,200}(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json)/
-        $move     = /\b(mv|cp|install)\s+(-[a-zA-Z]+\s+)*\S+\s+["']?[^\s"']*(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json)/
-        $api      = /(open\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json)[^\n]{0,40}["'][wa]\+?["']|(writeFileSync|writeFile|appendFileSync|write_text|write_bytes)\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json))/
+        // One string so the exclusions below can be checked per occurrence.
+        // Alternatives, in order:
+        //   redirect / tee: `>` must follow a non-space, non-`>` character on
+        //     the same line, so a markdown blockquote (`> .claude/...`) doesn't
+        //     read as a redirect
+        //   sed -i, mv / cp / install, and file-write APIs
+        $write = /([^\s>][ \t]*>>?|\btee\s+(-a\s+)?)\s*["']?[^\s"'|;&<>]*(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|(^|[\s\/"'])\.mcp\.json)|\bsed\s+(-[a-zA-Z]*i[a-zA-Z]*|--in-place)\b[^\n]{0,200}(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json)|\b(mv|cp|install)\s+(-[a-zA-Z]+\s+)*\S+\s+["']?[^\s"']*(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json)|open\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json)[^\n]{0,40}["'][wa]\+?["']|(writeFileSync|writeFile|appendFileSync|write_text|write_bytes)\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.cursor\/(hooks|mcp)\.json|\.gemini\/settings\.json|\.mcp\.json)/
 
         $excl_security_doc = /\b(threat[_\s-]?(model|pattern|hunt)|detection[_\s-]?(rule|pattern)|security[_\s-]?(guide|audit|review|scan)|attack[_\s-]?(example|pattern)|MITRE|ATT&CK|YARA)\b/i
         $excl_defensive    = /\b(never|do\s+not|don't|must\s+not|should\s+not|avoid|prevent|block|deny)\b[^.\n]{0,60}(\.claude\/settings|\.cursor\/|\.gemini\/settings|\.mcp\.json|hooks?)\b/i
 
+    // Exclusions only suppress a write they sit next to. File-wide
+    // exclusions let one unrelated "don't skip the hooks step" or
+    // "see our security review" line hide every write in the file.
     condition:
-        not $excl_security_doc and
-        not $excl_defensive and
-        any of ($redirect, $in_place, $move, $api)
+        for any i in (1..#write) : (
+            not ($excl_security_doc in (@write[i] - 300..@write[i] + 300)) and
+            not ($excl_defensive in (@write[i] - 120..@write[i] + 60))
+        )
 }

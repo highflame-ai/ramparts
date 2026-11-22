@@ -699,6 +699,10 @@ static CONFIG_PATHS_CACHE: LazyLock<Vec<(PathBuf, MCPClient)>> =
 /// IDE configuration file manager for MCP scanner
 pub struct MCPConfigManager {
     config_paths: Vec<(PathBuf, MCPClient)>,
+    /// Files only the agent-config audit reads (Cursor `.cursor/hooks.json`
+    /// found by a `--root` walk). Kept out of `config_paths` so the MCP
+    /// loader never tries to parse them as server configs.
+    agent_only_paths: Vec<PathBuf>,
 }
 
 impl MCPConfigManager {
@@ -731,6 +735,7 @@ impl MCPConfigManager {
     pub fn new() -> Self {
         Self {
             config_paths: CONFIG_PATHS_CACHE.clone(),
+            agent_only_paths: Vec::new(),
         }
     }
 
@@ -741,6 +746,7 @@ impl MCPConfigManager {
         let paths = Self::discover_config_paths();
         Self {
             config_paths: paths,
+            agent_only_paths: Vec::new(),
         }
     }
 
@@ -2324,14 +2330,16 @@ impl MCPConfigManager {
         Ok(())
     }
 
-    /// Check if any IDE configuration files exist
     /// Config files for the agent-config audit (`src/agent_config.rs`):
-    /// every existing config file, plus Cursor `hooks.json` beside any
-    /// `.cursor/` directory we already look in.
-    // ponytail: a --root repo whose .cursor/ holds only hooks.json (no mcp.json)
-    // is missed; add hooks.json to the root walk if that shape shows up.
+    /// every existing config file, Cursor `hooks.json` beside any `.cursor/`
+    /// directory we already look in, and hooks files a `--root` walk found.
     pub fn agent_config_paths(&self) -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = Vec::new();
+        let mut out: Vec<PathBuf> = self
+            .agent_only_paths
+            .iter()
+            .filter(|p| p.is_file())
+            .cloned()
+            .collect();
         for (path, _) in &self.config_paths {
             let cursor_hooks = path
                 .parent()
@@ -2346,8 +2354,12 @@ impl MCPConfigManager {
         out
     }
 
+    /// Check if any IDE / agent configuration files exist. A repo whose
+    /// only agent config is a hooks file still counts, so it gets audited
+    /// instead of erroring out.
     pub fn has_config_files(&self) -> bool {
         self.config_paths.iter().any(|(path, _)| path.exists())
+            || !self.agent_config_paths().is_empty()
     }
 
     /// Build a `MCPConfigManager` whose `config_paths` are discovered by
@@ -2356,8 +2368,12 @@ impl MCPConfigManager {
     /// repository of IDE configs without relying on the user's home
     /// directory state.
     pub fn with_root(root: &Path) -> Self {
+        let (hooks, config_paths): (Vec<_>, Vec<_>) = Self::discover_config_paths_in_root(root)
+            .into_iter()
+            .partition(|(p, _)| is_cursor_hooks_file(p));
         Self {
-            config_paths: Self::discover_config_paths_in_root(root),
+            config_paths,
+            agent_only_paths: hooks.into_iter().map(|(p, _)| p).collect(),
         }
     }
 
@@ -2427,7 +2443,10 @@ impl MCPConfigManager {
                     }
                     walk(&path, depth + 1, max_depth, skip_dirs, filenames, out);
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if filenames.contains(&name) || name.ends_with(".mcp.json") {
+                    if filenames.contains(&name)
+                        || name.ends_with(".mcp.json")
+                        || is_cursor_hooks_file(&path)
+                    {
                         let client =
                             MCPConfigManager::detect_client(&path).unwrap_or(MCPClient::VSCode);
                         out.push((path, client));
@@ -2446,11 +2465,39 @@ impl MCPConfigManager {
     }
 }
 
+/// `.cursor/hooks.json`: Cursor's hooks file, audited but not an MCP config.
+fn is_cursor_hooks_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == "hooks.json")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == ".cursor")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn root_walk_audits_hooks_only_cursor_dir_without_mcp_parsing() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".cursor")).unwrap();
+        let hooks = dir.path().join(".cursor").join("hooks.json");
+        fs::write(&hooks, r#"{"version":1,"hooks":{}}"#).unwrap();
+
+        let manager = MCPConfigManager::with_root(dir.path());
+        assert!(
+            manager.has_config_files(),
+            "hooks-only repo must not error out"
+        );
+        assert_eq!(manager.agent_config_paths(), vec![hooks]);
+        assert!(
+            manager.config_paths.is_empty(),
+            "hooks.json is not an MCP config"
+        );
+    }
 
     #[test]
     fn test_load_config_from_path() {
