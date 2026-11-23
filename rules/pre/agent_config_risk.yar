@@ -39,6 +39,8 @@ rule AgentHookRemoteExec
         $redirect_run  = /HOOK_COMMAND:[^\n]*\b(curl|wget)\b[^\n|]*>\s*(\S+)[^\n]*(&&|;)\s*(\b(ba|z|da|k)?sh\s|\bpython[0-9.]*\s|\bnode\s|chmod\s|\.\/|\/|~\/)/ nocase
         // IEX (New-Object Net.WebClient).DownloadString(...) and friends
         $ps_cradle     = /HOOK_COMMAND:[^\n]*\b(iex|Invoke-Expression)\b[^\n]{0,40}(DownloadString|DownloadData|Invoke-WebRequest|Invoke-RestMethod|\biwr\b|\birm\b)/ nocase
+        // interactive reverse shell back to a remote host
+        $reverse_shell = /HOOK_COMMAND:[^\n]*(\/dev\/(tcp|udp)\/[\w.\-]+\/[0-9]+|\b(nc|ncat|netcat)\b[^\n|;&]*\s-[a-zA-Z]*[ec]\s|\bsocat\b[^\n]*\bexec:|\bmkfifo\b[^\n]*\b(nc|ncat|netcat)\b|\b(ba|z|da|k)?sh\s+-i\s*[<>]?&)/ nocase
         // decode an inline blob and execute it
         $decode_run    = /HOOK_COMMAND:[^\n]*(base64\s+(-d|-D|--decode)|xxd\s+-r|openssl\s+(enc\s+)?(-d|-base64\s+-d)|FromBase64String)[^\n]*(\|\s*(ba|z|da)?sh\b|\|\s*python|\biex\b|Invoke-Expression|\beval\b)/ nocase
         $ps_encoded    = /HOOK_COMMAND:[^\n]*\b(powershell|pwsh)(\.exe)?\b[^\n]*\s-(e|ec|enc|encodedcommand)\s+[A-Za-z0-9+\/=]{20,}/ nocase
@@ -63,10 +65,12 @@ rule AgentConfigTamper
         version = "1.0"
 
     strings:
-        // Redirect / tee: `>` must follow a non-space, non-`>` character on
-        // the same line, so a markdown blockquote (`> .claude/...`) doesn't
-        // read as a redirect.
-        $redirect = /([^\s>][ \t]*>>?|\btee\s+(-a\s+)?)\s*["']?[^\s|;&<>]*(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|(^|[\s\/"'])\.mcp\.json)/ nocase
+        // Redirect / tee. `>` must follow either a word plus whitespace on
+        // the same line (`cat x > f`) or a quote, `)`, digit or `&`
+        // (`"$P">f`, `2>f`). That rules out markdown blockquotes
+        // (`\n> .claude/...`), HTML tags (`<code>.claude/...`) and arrows
+        // (`Settings -> ...`, `=> ...`).
+        $redirect = /([^\s>=<\-][ \t]+>>?|["')}\]0-9&]>>?|\btee\s+(-a\s+)?)\s*["']?[^\s|;&<>]*(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|(^|[\s\/"'])\.mcp\.json)/ nocase
         $sed_i    = /\bsed\s+(-[a-zA-Z]*i[a-zA-Z]*|--in-place)\b[^\n]{0,200}(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)/ nocase
         $mv_cp    = /\b(mv|cp|install|ln)\s+(-[a-zA-Z]+\s+)*\S+\s+["']?[^\s|;&<>]*(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)/ nocase
         // curl -o FILE / wget -O FILE (flag may be combined: -sSLo)

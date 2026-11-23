@@ -2342,8 +2342,8 @@ impl MCPConfigManager {
     }
 
     /// Config files for the agent-config audit (`src/agent_config.rs`):
-    /// every existing config file, Cursor `hooks.json` beside any `.cursor/`
-    /// directory we already look in, and hooks files a `--root` walk found.
+    /// every existing config file, a Cursor / Windsurf `hooks.json` beside
+    /// any config we already look in, and hooks files a `--root` walk found.
     pub fn agent_config_paths(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = self
             .agent_only_paths
@@ -2354,8 +2354,8 @@ impl MCPConfigManager {
         for (path, _) in &self.config_paths {
             let cursor_hooks = path
                 .parent()
-                .filter(|dir| dir.file_name().is_some_and(|n| n == ".cursor"))
-                .map(|dir| dir.join("hooks.json"));
+                .map(|dir| dir.join("hooks.json"))
+                .filter(|p| is_hooks_only_file(p));
             for candidate in std::iter::once(path.clone()).chain(cursor_hooks) {
                 if is_agent_config_file(&candidate)
                     && candidate.is_file()
@@ -2376,7 +2376,7 @@ impl MCPConfigManager {
     pub fn with_root(root: &Path) -> Self {
         let (hooks, config_paths): (Vec<_>, Vec<_>) = Self::discover_config_paths_in_root(root)
             .into_iter()
-            .partition(|(p, _)| is_cursor_hooks_file(p));
+            .partition(|(p, _)| is_hooks_only_file(p));
         Self {
             config_paths,
             agent_only_paths: hooks.into_iter().map(|(p, _)| p).collect(),
@@ -2406,6 +2406,7 @@ impl MCPConfigManager {
             "settings.json",
             "settings.local.json",
             "managed-settings.json",
+            ".claude.json",
         ];
         const MAX_DEPTH: usize = 16;
 
@@ -2451,7 +2452,7 @@ impl MCPConfigManager {
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if filenames.contains(&name)
                         || name.ends_with(".mcp.json")
-                        || is_cursor_hooks_file(&path)
+                        || is_hooks_only_file(&path)
                     {
                         let client =
                             MCPConfigManager::detect_client(&path).unwrap_or(MCPClient::VSCode);
@@ -2472,7 +2473,8 @@ impl MCPConfigManager {
 }
 
 /// Files an agent client reads hooks or guardrail settings from: anything
-/// under `.claude/`, `.gemini/`, `.cursor/` or `.vscode/`, plus
+/// under `.claude/`, `.gemini/`, `.cursor/`, `.vscode/`, `.windsurf/` or
+/// `~/.codeium/`, plus
 /// `.claude.json`, `managed-settings.json` and `.mcp.json`. A `--root` walk
 /// also finds app files like `src/config/settings.json`; auditing those
 /// would only produce false findings and parse errors.
@@ -2486,17 +2488,19 @@ fn is_agent_config_file(path: &Path) -> bool {
         &[".claude.json", "managed-settings.json", ".mcp.json"],
     ) || named(
         path.parent().and_then(Path::file_name),
-        &[".claude", ".gemini", ".cursor", ".vscode"],
-    )
+        &[".claude", ".gemini", ".cursor", ".vscode", ".windsurf"],
+    ) || path.components().any(|c| c.as_os_str() == ".codeium")
 }
 
-/// `.cursor/hooks.json`: Cursor's hooks file, audited but not an MCP config.
-fn is_cursor_hooks_file(path: &Path) -> bool {
+/// `hooks.json` under `.cursor/`, `.windsurf/` or `~/.codeium/windsurf/`:
+/// a hooks file, audited but not an MCP config.
+fn is_hooks_only_file(path: &Path) -> bool {
     path.file_name().is_some_and(|n| n == "hooks.json")
         && path
             .parent()
             .and_then(Path::file_name)
-            .is_some_and(|n| n == ".cursor")
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| matches!(n, ".cursor" | ".windsurf" | "windsurf"))
 }
 
 #[cfg(test)]
@@ -2521,11 +2525,25 @@ mod tests {
     }
 
     #[test]
+    fn root_walk_audits_windsurf_hooks_and_claude_json() {
+        let dir = tempdir().unwrap();
+        let hooks = dir.path().join(".windsurf").join("hooks.json");
+        let claude = dir.path().join(".claude.json");
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        fs::write(&hooks, r#"{"hooks":{}}"#).unwrap();
+        fs::write(&claude, r#"{"projects":{}}"#).unwrap();
+        let mut found = MCPConfigManager::with_root(dir.path()).agent_config_paths();
+        found.sort();
+        let mut want = vec![hooks, claude];
+        want.sort();
+        assert_eq!(found, want);
+    }
+
+    #[test]
     fn non_agent_mcp_config_still_counts_as_found() {
         let dir = tempdir().unwrap();
-        let windsurf = dir.path().join(".windsurf").join("mcp.json");
-        fs::create_dir_all(windsurf.parent().unwrap()).unwrap();
-        fs::write(&windsurf, r#"{"mcpServers":{}}"#).unwrap();
+        let desktop = dir.path().join("claude_desktop_config.json");
+        fs::write(&desktop, r#"{"mcpServers":{}}"#).unwrap();
         let manager = MCPConfigManager::with_root(dir.path());
         assert!(manager.has_config_files());
         assert!(manager.agent_config_paths().is_empty());

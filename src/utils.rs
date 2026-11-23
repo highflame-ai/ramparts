@@ -1767,10 +1767,12 @@ fn print_multi_server_tree(results: &[ScanResult], _detailed: bool) {
             let continuation = if is_last { "    " } else { "│   " };
 
             // Server name and status
-            let server_name = result
-                .server_info
-                .as_ref()
-                .map_or_else(|| "Unknown Server".to_string(), |info| info.name.clone());
+            let is_agent_config = result.url.starts_with("config:");
+            let server_name = match &result.server_info {
+                Some(info) => info.name.clone(),
+                None if is_agent_config => "Agent config".to_string(),
+                None => "Unknown Server".to_string(),
+            };
 
             let status_emoji = match &result.status {
                 crate::types::ScanStatus::Success => "✅",
@@ -1789,6 +1791,15 @@ fn print_multi_server_tree(results: &[ScanResult], _detailed: bool) {
                 result.url
             );
 
+            // Agent-config results carry their problems (unparseable file,
+            // commands not checked) in `errors`; show them so a skipped
+            // check never reads as clean.
+            if is_agent_config {
+                for err in &result.errors {
+                    println!("{ide_continuation}{continuation}⚠️  {err}");
+                }
+            }
+
             // Always show server-level YARA findings (even if scan failed)
             let server_yara_results: Vec<&crate::types::YaraScanResult> = result
                 .yara_results
@@ -1797,7 +1808,7 @@ fn print_multi_server_tree(results: &[ScanResult], _detailed: bool) {
                 .collect();
 
             if !server_yara_results.is_empty() {
-                let heading = if result.url.starts_with("config:") {
+                let heading = if is_agent_config {
                     "Config Security"
                 } else {
                     "Server Security"
@@ -1824,7 +1835,22 @@ fn print_multi_server_tree(results: &[ScanResult], _detailed: bool) {
                         _ => "🟢 LOW".green(),
                     };
 
-                    if !yara_result.context.is_empty() {
+                    if yara_result.target_type == "config" {
+                        // Name the exact setting (or hook script) and say why,
+                        // so findings in one file are distinguishable.
+                        let pipe = if is_last_server_issue { " " } else { "│" };
+                        println!(
+                            "{ide_continuation}{continuation}    {branch} {severity_color} {} – {}",
+                            yara_result.rule_name, yara_result.target_name
+                        );
+                        if let Some(desc) = yara_result
+                            .rule_metadata
+                            .as_ref()
+                            .and_then(|m| m.description.as_deref())
+                        {
+                            println!("{ide_continuation}{continuation}    {pipe}    {desc}");
+                        }
+                    } else if !yara_result.context.is_empty() {
                         println!(
                             "{}{}    {} {} (YARA) {} – {}",
                             ide_continuation,
@@ -1848,7 +1874,7 @@ fn print_multi_server_tree(results: &[ScanResult], _detailed: bool) {
             }
 
             // Show basic stats and detailed results for successful scans
-            if matches!(result.status, crate::types::ScanStatus::Success) {
+            if !is_agent_config && matches!(result.status, crate::types::ScanStatus::Success) {
                 println!(
                     "{}{}📋 {} tools, {} resources, {} prompts",
                     ide_continuation,
@@ -1992,8 +2018,9 @@ fn print_multi_server_tree(results: &[ScanResult], _detailed: bool) {
                 }
 
                 // YARA results are now embedded with each tool above
-            } else {
-                // Show enhanced error details for failed scans
+            } else if !is_agent_config {
+                // Show enhanced error details for failed scans. Agent-config
+                // errors are already listed under the entry above.
                 print_enhanced_error_details(result, ide_continuation, continuation);
             }
         }
