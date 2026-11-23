@@ -137,10 +137,16 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         // (hooks, helper commands, guardrail settings).
         "AgentHookRemoteExec" => vec![OwaspTag::new("MCP07"), OwaspTag::new("MCP10")],
         "AgentConfigTamper" => vec![OwaspTag::new("MCP03"), OwaspTag::new("MCP10")],
+        // ai_credentials.yar
+        "AIProviderKeyExposure" | "AICredentialFileAccess" => {
+            vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
+        }
+        // install_lures.yar
+        "RemoteScriptInstallInstruction" => vec![OwaspTag::new("MCP07"), OwaspTag::new("MCP10")],
         "LLMBaseUrlOverride" | "AgentTrafficInterception" => {
             vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
         }
-        "AutoApprovedProjectMcpServers" | "WildcardAgentPermission" => {
+        "AutoApprovedProjectMcpServers" | "WildcardAgentPermission" | "AutoRunWorkspaceTask" => {
             vec![OwaspTag::new("MCP03")]
         }
         "ExternalReferenceInventory" => vec![OwaspTag::new("MCP10")],
@@ -338,8 +344,12 @@ pub fn ast_tags_for_rule(rule_name: &str) -> Vec<OwaspTag> {
             vec![OwaspTag::ast("AST03")]
         }
         "AgentIdentityFileWrite" => vec![OwaspTag::ast("AST01"), OwaspTag::ast("AST03")],
-        "AgentHookRemoteExec" | "AgentConfigTamper" => vec![OwaspTag::ast("AST01")],
-        "AutoApprovedProjectMcpServers" | "WildcardAgentPermission" => {
+        "AgentHookRemoteExec"
+        | "AgentConfigTamper"
+        | "AIProviderKeyExposure"
+        | "AICredentialFileAccess"
+        | "RemoteScriptInstallInstruction" => vec![OwaspTag::ast("AST01")],
+        "AutoApprovedProjectMcpServers" | "WildcardAgentPermission" | "AutoRunWorkspaceTask" => {
             vec![OwaspTag::ast("AST03")]
         }
         "PrivilegeEscalationTools" => vec![OwaspTag::ast("AST01"), OwaspTag::ast("AST03")],
@@ -432,6 +442,10 @@ mod tests {
             "AgentConfigTamper",
             "LLMBaseUrlOverride",
             "AgentTrafficInterception",
+            "AIProviderKeyExposure",
+            "AICredentialFileAccess",
+            "RemoteScriptInstallInstruction",
+            "AutoRunWorkspaceTask",
             "AutoApprovedProjectMcpServers",
             "WildcardAgentPermission",
             "CrossOriginEscalation",

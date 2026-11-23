@@ -2342,8 +2342,8 @@ impl MCPConfigManager {
     }
 
     /// Config files for the agent-config audit (`src/agent_config.rs`):
-    /// every existing config file, a Cursor / Windsurf `hooks.json` beside
-    /// any config we already look in, and hooks files a `--root` walk found.
+    /// every existing config file, a Cursor / Windsurf `hooks.json` or VS
+    /// Code `tasks.json` beside any config we already look in, and hooks files a `--root` walk found.
     pub fn agent_config_paths(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = self
             .agent_only_paths
@@ -2352,11 +2352,14 @@ impl MCPConfigManager {
             .cloned()
             .collect();
         for (path, _) in &self.config_paths {
-            let cursor_hooks = path
-                .parent()
-                .map(|dir| dir.join("hooks.json"))
-                .filter(|p| is_hooks_only_file(p));
-            for candidate in std::iter::once(path.clone()).chain(cursor_hooks) {
+            // Hooks / tasks files beside a config we already look in.
+            let siblings = path.parent().into_iter().flat_map(|dir| {
+                ["hooks.json", "tasks.json"]
+                    .map(|f| dir.join(f))
+                    .into_iter()
+                    .filter(|p| is_agent_only_file(p))
+            });
+            for candidate in std::iter::once(path.clone()).chain(siblings) {
                 if is_agent_config_file(&candidate)
                     && candidate.is_file()
                     && !out.contains(&candidate)
@@ -2376,7 +2379,7 @@ impl MCPConfigManager {
     pub fn with_root(root: &Path) -> Self {
         let (hooks, config_paths): (Vec<_>, Vec<_>) = Self::discover_config_paths_in_root(root)
             .into_iter()
-            .partition(|(p, _)| is_hooks_only_file(p));
+            .partition(|(p, _)| is_agent_only_file(p));
         Self {
             config_paths,
             agent_only_paths: hooks.into_iter().map(|(p, _)| p).collect(),
@@ -2452,7 +2455,7 @@ impl MCPConfigManager {
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if filenames.contains(&name)
                         || name.ends_with(".mcp.json")
-                        || is_hooks_only_file(&path)
+                        || is_agent_only_file(&path)
                     {
                         let client =
                             MCPConfigManager::detect_client(&path).unwrap_or(MCPClient::VSCode);
@@ -2492,15 +2495,19 @@ fn is_agent_config_file(path: &Path) -> bool {
     ) || path.components().any(|c| c.as_os_str() == ".codeium")
 }
 
-/// `hooks.json` under `.cursor/`, `.windsurf/` or `~/.codeium/windsurf/`:
-/// a hooks file, audited but not an MCP config.
-fn is_hooks_only_file(path: &Path) -> bool {
-    path.file_name().is_some_and(|n| n == "hooks.json")
-        && path
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| matches!(n, ".cursor" | ".windsurf" | "windsurf"))
+/// Files audited for commands the client runs, but not MCP configs:
+/// `hooks.json` under `.cursor/`, `.windsurf/` or `~/.codeium/windsurf/`,
+/// and `.vscode/tasks.json` (folder-open tasks).
+fn is_agent_only_file(path: &Path) -> bool {
+    let dir = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str());
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some("hooks.json") => matches!(dir, Some(".cursor" | ".windsurf" | "windsurf")),
+        Some("tasks.json") => dir == Some(".vscode"),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -2537,6 +2544,17 @@ mod tests {
         let mut want = vec![hooks, claude];
         want.sort();
         assert_eq!(found, want);
+    }
+
+    #[test]
+    fn vscode_tasks_json_is_audited_not_mcp_parsed() {
+        let dir = tempdir().unwrap();
+        let tasks = dir.path().join(".vscode").join("tasks.json");
+        fs::create_dir_all(tasks.parent().unwrap()).unwrap();
+        fs::write(&tasks, r#"{"version":"2.0.0","tasks":[]}"#).unwrap();
+        let manager = MCPConfigManager::with_root(dir.path());
+        assert_eq!(manager.agent_config_paths(), vec![tasks]);
+        assert!(manager.config_paths.is_empty());
     }
 
     #[test]
