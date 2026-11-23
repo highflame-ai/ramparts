@@ -50,7 +50,7 @@ RAMPARTS_API_TOKEN=change-me ramparts server --port 8080 --host 0.0.0.0
 |---|---|---|
 | `--host` | `127.0.0.1` | Bind address. Use `0.0.0.0` only together with `RAMPARTS_API_TOKEN` or an authenticating proxy. |
 | `RAMPARTS_API_TOKEN` | unset | When set, every `/v1/ramparts/*` endpoint except `/v1/ramparts/health` requires `Authorization: Bearer <token>`. |
-| `RAMPARTS_CORS_ORIGINS` | unset (no CORS) | Comma-separated origins allowed to call the API from a browser, or `*`. |
+| `RAMPARTS_CORS_ORIGINS` | unset | Comma-separated origins allowed to call the API from a browser, or `*`. When unset: no CORS on a loopback bind; any origin on an exposed bind (as the deployed service needs for browser clients). |
 | Host check | on for a loopback bind without a token | Requests must be addressed to a loopback host (`localhost`, `127.0.0.1`, `[::1]`), so web pages can't reach the API via DNS rebinding. |
 
 Scan targets (`url`, `urls`, `reference_url`) must be `http` or `https` URLs. Private and loopback MCP servers can be scanned; cloud metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`) are refused.
@@ -765,10 +765,11 @@ The API uses standard HTTP status codes and provides detailed error messages:
 
 ### CORS Support
 
-CORS is off by default, so browsers block cross-origin calls. To allow a browser-based client, list its origin(s) in `RAMPARTS_CORS_ORIGINS` (comma-separated, or `*`). The server then sends:
-- `Access-Control-Allow-Origin`: the matching listed origin
-- `Access-Control-Allow-Methods: GET, POST, OPTIONS`
-- `Access-Control-Allow-Headers: Authorization, Content-Type, X-Javelin-Apikey`
+- **Loopback bind** (the default): no CORS headers, so web pages can't call a scanner running on your machine.
+- **Exposed bind** (`--host 0.0.0.0`): any origin is allowed, so browser clients work out of the box; use `RAMPARTS_API_TOKEN` for access control.
+- **`RAMPARTS_CORS_ORIGINS`** (comma-separated, or `*`) restricts allowed origins on any bind.
+
+Allowed methods are `GET, POST, OPTIONS`; any request header is allowed.
 
 Invalid entries are ignored with a warning in the server log.
 

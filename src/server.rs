@@ -121,15 +121,25 @@ fn validate_scan_targets(request: &mut ScanRequest) -> Result<(), (StatusCode, J
     Ok(())
 }
 
-/// CORS is off unless `RAMPARTS_CORS_ORIGINS` lists allowed origins
-/// (comma-separated, or `*`).
-fn cors_layer() -> Option<CorsLayer> {
-    let raw = std::env::var("RAMPARTS_CORS_ORIGINS").ok()?;
+/// CORS policy.
+///
+/// - `RAMPARTS_CORS_ORIGINS` set: only those origins (comma-separated, or
+///   `*`), on any bind.
+/// - Unset, loopback bind: off, so web pages can't drive a scanner running
+///   on the user's machine.
+/// - Unset, exposed bind (the deployed service): any origin, as before.
+///   Browser clients such as Studio call it cross-origin, and the API is
+///   already reachable directly, so CORS adds no protection there; use
+///   RAMPARTS_API_TOKEN for access control.
+fn cors_layer(bind_host: &str) -> Option<CorsLayer> {
+    let raw = std::env::var("RAMPARTS_CORS_ORIGINS").unwrap_or_default();
     let origins = raw.trim();
-    if origins.is_empty() {
-        return None;
-    }
-    let allow = if origins == "*" {
+    let allow = if origins.is_empty() {
+        if crate::net_policy::is_loopback_host(bind_host) {
+            return None;
+        }
+        AllowOrigin::from(Any)
+    } else if origins == "*" {
         AllowOrigin::from(Any)
     } else {
         let mut valid = Vec::new();
@@ -149,11 +159,7 @@ fn cors_layer() -> Option<CorsLayer> {
         CorsLayer::new()
             .allow_origin(allow)
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-            .allow_headers([
-                header::AUTHORIZATION,
-                header::CONTENT_TYPE,
-                header::HeaderName::from_static("x-javelin-apikey"),
-            ]),
+            .allow_headers(Any),
     )
 }
 
@@ -245,7 +251,7 @@ impl MCPScannerServer {
             .route("/livez", get(probe_ok))
             .route("/v1/ramparts/health", get(health_check))
             .merge(api);
-        let app = match cors_layer() {
+        let app = match cors_layer(&self.config.host) {
             Some(cors) => app.layer(cors),
             None => app,
         };
@@ -1003,6 +1009,16 @@ mod tests {
             req.reference_url.as_deref(),
             Some("https://ref.example.com")
         );
+    }
+
+    #[test]
+    fn cors_is_off_on_loopback_and_open_when_exposed_by_default() {
+        if std::env::var("RAMPARTS_CORS_ORIGINS").is_ok() {
+            return; // explicit config overrides the defaults under test
+        }
+        assert!(cors_layer("127.0.0.1").is_none());
+        assert!(cors_layer("::1").is_none());
+        assert!(cors_layer("0.0.0.0").is_some());
     }
 
     #[test]
