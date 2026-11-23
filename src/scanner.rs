@@ -1610,6 +1610,48 @@ impl MCPScanner {
         Ok(result)
     }
 
+    /// OSV.dev findings for a stdio server's launch package. Empty when the
+    /// command isn't a package launcher (e.g. `python3 x.py`: local code,
+    /// nothing to look up); `Err` when the lookup itself failed.
+    async fn launch_package_findings(
+        &self,
+        command: &str,
+        args: &[String],
+    ) -> Result<Vec<YaraScanResult>, String> {
+        match crate::osv::parse_package_spec_from_command(command, args) {
+            Some(spec) => {
+                debug!("OSV lookup for {}/{}", spec.ecosystem, spec.name);
+                crate::osv::check_osv(self.client.clone(), spec).await
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Result for a server that was deliberately not started or contacted:
+    /// static mode, or a launch package flagged as malicious.
+    fn not_started_result(
+        display_url: String,
+        findings: Vec<YaraScanResult>,
+        static_only: bool,
+    ) -> ScanResult {
+        let mut result = ScanResult::new(display_url);
+        let malicious: Vec<String> = findings
+            .iter()
+            .filter(|f| crate::osv::is_malicious_finding(f))
+            .map(|f| f.target_name.clone())
+            .collect();
+        result.yara_results = findings;
+        if !malicious.is_empty() {
+            result.add_error(format!(
+                "Server not started: launch package {} is listed as malicious",
+                malicious.join(", ")
+            ));
+        } else if static_only {
+            debug!("Static mode: {} not started", result.url);
+        }
+        result
+    }
+
     /// Scan a STDIO MCP server using subprocess transport
     async fn scan_stdio_server(
         &self,
@@ -1629,17 +1671,32 @@ impl MCPScanner {
 
         let mut result = ScanResult::new(display_url.clone());
 
-        // Kick off a parallel OSV.dev lookup for this server's launch package
-        // (e.g. `npx -y @scope/pkg@1.2.3` -> npm:@scope/pkg@1.2.3). We don't
-        // wait on it inline — the future is awaited after the scan body so
-        // the OSV roundtrip overlaps with the actual MCP handshake + tool
-        // enumeration. Returns an empty Vec when no recognizable package
-        // spec can be parsed from the command (e.g. raw `python3 script.py`).
-        let osv_findings_future =
-            crate::osv::parse_package_spec_from_command(command, args).map(|spec| {
-                debug!("Launching OSV lookup for {}/{}", spec.ecosystem, spec.name);
-                crate::osv::query_osv(self.client.clone(), spec)
-            });
+        // Check the launch package (e.g. `npx -y @scope/pkg@1.2.3` ->
+        // npm:@scope/pkg@1.2.3) against OSV.dev *before* starting anything:
+        // starting a stdio server runs its code, so a package listed as
+        // malicious must never be launched just to scan it.
+        let osv_findings = match self.launch_package_findings(command, args).await {
+            Ok(findings) => findings,
+            // Fail closed: no verdict, no launch.
+            Err(e) if !options.static_only => {
+                let mut result = ScanResult::new(display_url);
+                result.add_error(format!(
+                    "Server not started: its launch package could not be checked ({e})"
+                ));
+                return Ok(result);
+            }
+            Err(e) => {
+                warn!("{e}");
+                Vec::new()
+            }
+        };
+        if options.static_only || osv_findings.iter().any(crate::osv::is_malicious_finding) {
+            return Ok(Self::not_started_result(
+                display_url,
+                osv_findings,
+                options.static_only,
+            ));
+        }
 
         // Wrap the entire connect-and-scan pipeline in `options.timeout` so a
         // hung subprocess (no MCP handshake response, deadlocked tool, etc.)
@@ -1666,14 +1723,9 @@ impl MCPScanner {
         })
         .await;
 
-        // Drain the OSV future (no-op if no spec was parseable). Findings
-        // append to result.yara_results regardless of whether the main scan
-        // succeeded — supply-chain risks are real even if the server is
-        // unreachable right now.
-        let osv_findings = match osv_findings_future {
-            Some(fut) => fut.await,
-            None => Vec::new(),
-        };
+        // OSV findings append to result.yara_results regardless of whether
+        // the main scan succeeded: supply-chain risks are real even if the
+        // server is unreachable right now.
 
         match scan_result {
             Ok((session, mut scan_data)) => {
@@ -2141,7 +2193,15 @@ impl MCPScanner {
 
                         let scan_future = async {
                             // Scan the MCP server - HTTP or STDIO
-                            let mut result = if let Some(url) = server.scan_url() {
+                            let mut result = if server_options.static_only
+                                && server.command.is_none()
+                            {
+                                // Static mode: no connection. Config findings only.
+                                let mut res = ScanResult::new(server.to_display_url());
+                                res.ide_source = Some(ide_source);
+                                attach_findings(&mut res);
+                                res
+                            } else if let Some(url) = server.scan_url() {
                                 // HTTP server scanning
                                 match scanner.scan_single(url, server_options).await {
                                     Ok(mut result) => {
@@ -3152,5 +3212,64 @@ mod tests {
         // Post-scan rules should be empty for now
         assert!(stats.post_scan_rules.is_empty());
         println!("Post-scan rules: {:?}", stats.post_scan_rules);
+    }
+
+    /// Static mode never spawns the server command; a normal scan does
+    /// (here it fails because the binary doesn't exist, which proves the
+    /// spawn was attempted).
+    #[tokio::test]
+    async fn static_mode_never_starts_a_stdio_server() {
+        let scanner = MCPScanner::with_timeout(5).unwrap();
+        let server = MCPServerConfig {
+            name: Some("probe".to_string()),
+            url: None,
+            command: Some("/nonexistent/ramparts-test-binary".to_string()),
+            args: Some(vec![]),
+            env: None,
+            description: None,
+            auth_headers: None,
+            options: None,
+        };
+        let static_opts = ScanOptions {
+            timeout: 5,
+            static_only: true,
+            ..ScanOptions::default()
+        };
+        let result = scanner
+            .scan_stdio_server(&server, static_opts)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result.status, ScanStatus::Success),
+            "{:?}",
+            result.status
+        );
+        assert!(result.tools.is_empty());
+
+        let live_opts = ScanOptions {
+            timeout: 5,
+            ..ScanOptions::default()
+        };
+        let live = scanner.scan_stdio_server(&server, live_opts).await;
+        assert!(
+            live.is_err() || !matches!(live.unwrap().status, ScanStatus::Success),
+            "a normal scan should have tried (and failed) to start the binary"
+        );
+    }
+
+    #[test]
+    fn malicious_launch_package_is_reported_not_started() {
+        let finding: YaraScanResult = serde_json::from_value(serde_json::json!({
+            "target_type": "dependency",
+            "target_name": "npm/evil@?",
+            "rule_name": "MaliciousDependency",
+            "context": ""
+        }))
+        .unwrap();
+        let result =
+            MCPScanner::not_started_result("stdio:npx evil".to_string(), vec![finding], false);
+        assert!(matches!(result.status, ScanStatus::Failed(_)));
+        assert!(result.errors[0].contains("npm/evil@?"));
+        assert_eq!(result.yara_results.len(), 1);
     }
 }

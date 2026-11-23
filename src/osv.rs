@@ -26,6 +26,19 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 const OSV_QUERY_URL: &str = "https://api.osv.dev/v1/query";
+
+/// OSV query endpoint. `RAMPARTS_OSV_URL` points the lookup at a mirror or
+/// proxy for networks that can't reach api.osv.dev; it must be https.
+fn osv_query_url() -> String {
+    match std::env::var("RAMPARTS_OSV_URL") {
+        Ok(url) if url.starts_with("https://") => url,
+        Ok(url) if !url.is_empty() => {
+            warn!("Ignoring RAMPARTS_OSV_URL={url}: must be an https:// URL");
+            OSV_QUERY_URL.to_string()
+        }
+        _ => OSV_QUERY_URL.to_string(),
+    }
+}
 const OSV_QUERY_TIMEOUT_SECS: u64 = 5;
 
 /// A parsed (ecosystem, name, version) triple ready to send to OSV.
@@ -279,13 +292,23 @@ struct OsvRangeEvent {
 /// `PackageSpec` by value so callers can spawn the resulting future onto
 /// a `tokio::task` without lifetime gymnastics.
 pub async fn query_osv(client: Client, spec: PackageSpec) -> Vec<YaraScanResult> {
+    check_osv(client, spec).await.unwrap_or_else(|e| {
+        warn!("{e}");
+        Vec::new()
+    })
+}
+
+/// Like `query_osv`, but a failed lookup is an `Err` instead of an empty
+/// list, so a caller that must not proceed without a verdict (starting a
+/// stdio server) can tell "no advisories" from "couldn't check".
+pub async fn check_osv(client: Client, spec: PackageSpec) -> Result<Vec<YaraScanResult>, String> {
     debug!(
         "Querying OSV.dev for {}/{} ({:?})",
         spec.ecosystem, spec.name, spec.version
     );
     let request_body = build_osv_request(&spec);
     let response = match client
-        .post(OSV_QUERY_URL)
+        .post(osv_query_url())
         .timeout(Duration::from_secs(OSV_QUERY_TIMEOUT_SECS))
         .json(&request_body)
         .send()
@@ -293,37 +316,41 @@ pub async fn query_osv(client: Client, spec: PackageSpec) -> Vec<YaraScanResult>
     {
         Ok(r) => r,
         Err(e) => {
-            warn!(
+            return Err(format!(
                 "OSV query failed for {}/{}: {}",
                 spec.ecosystem, spec.name, e
-            );
-            return Vec::new();
+            ))
         }
     };
     if !response.status().is_success() {
-        warn!(
+        return Err(format!(
             "OSV returned {} for {}/{}",
             response.status(),
             spec.ecosystem,
             spec.name
-        );
-        return Vec::new();
+        ));
     }
-    let body: OsvQueryResponse = match response.json().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                "Failed to parse OSV response for {}/{}: {}",
-                spec.ecosystem, spec.name, e
-            );
-            return Vec::new();
-        }
-    };
+    let body: OsvQueryResponse = response.json().await.map_err(|e| {
+        format!(
+            "Failed to parse OSV response for {}/{}: {}",
+            spec.ecosystem, spec.name, e
+        )
+    })?;
 
-    body.vulns
+    Ok(body
+        .vulns
         .into_iter()
         .map(|v| osv_finding_to_yara_result(&spec, v))
-        .collect()
+        .collect())
+}
+
+fn is_malicious_id(id: &str) -> bool {
+    id.starts_with("MAL-")
+}
+
+/// True for an OSV finding that marks the package itself as malware.
+pub fn is_malicious_finding(f: &YaraScanResult) -> bool {
+    f.rule_name == "MaliciousDependency"
 }
 
 fn build_osv_request(spec: &PackageSpec) -> serde_json::Value {
@@ -365,6 +392,15 @@ fn osv_finding_to_yara_result(spec: &PackageSpec, vuln: OsvVulnerability) -> Yar
         summary
     );
     let fixed_version = extract_fixed_version(spec, &vuln.affected);
+    // OSV's malicious-package records use `MAL-` IDs (GitHub malware
+    // advisories carry one as an alias). These aren't bugs to patch: the
+    // package itself is the payload.
+    let malicious = is_malicious_id(&vuln.id) || vuln.aliases.iter().any(|a| is_malicious_id(a));
+    let (rule, name, severity) = if malicious {
+        ("MaliciousDependency", "Malicious Dependency", "CRITICAL")
+    } else {
+        ("VulnerableDependency", "Vulnerable Dependency", severity)
+    };
     YaraScanResult {
         target_type: "dependency".to_string(),
         target_name: format!(
@@ -373,12 +409,12 @@ fn osv_finding_to_yara_result(spec: &PackageSpec, vuln: OsvVulnerability) -> Yar
             spec.name,
             spec.version.as_deref().unwrap_or("?")
         ),
-        rule_name: "VulnerableDependency".to_string(),
+        rule_name: rule.to_string(),
         rule_file: Some("osv".to_string()),
         matched_text: Some(vuln.id.clone()),
         context,
         rule_metadata: Some(YaraRuleMetadata {
-            name: Some("Vulnerable Dependency".to_string()),
+            name: Some(name.to_string()),
             author: Some("OSV.dev".to_string()),
             date: None,
             version: None,
@@ -388,7 +424,7 @@ fn osv_finding_to_yara_result(spec: &PackageSpec, vuln: OsvVulnerability) -> Yar
             confidence: Some("HIGH".to_string()),
             tags: vec!["dependency".to_string(), "osv".to_string()],
         }),
-        owasp_tags: crate::taxonomy::tags_for_yara_rule("VulnerableDependency"),
+        owasp_tags: crate::taxonomy::tags_for_yara_rule(rule),
         installed_version: spec.version.clone(),
         fixed_version,
         phase: Some("pre-scan".to_string()),
@@ -556,6 +592,32 @@ mod tests {
         assert!(
             parse_package_spec_from_command("docker", &["run".into(), "image".into()]).is_none()
         );
+    }
+
+    #[test]
+    fn malicious_package_records_are_classified_separately() {
+        let spec = PackageSpec {
+            ecosystem: "npm",
+            name: "some-pkg".to_string(),
+            version: None,
+        };
+        let vuln = |id: &str, aliases: &[&str]| -> OsvVulnerability {
+            serde_json::from_value(serde_json::json!({ "id": id, "aliases": aliases })).unwrap()
+        };
+        let by_id = osv_finding_to_yara_result(&spec, vuln("MAL-2026-1", &[]));
+        let by_alias =
+            osv_finding_to_yara_result(&spec, vuln("GHSA-aaaa-bbbb-cccc", &["MAL-2026-2"]));
+        let cve = osv_finding_to_yara_result(&spec, vuln("GHSA-dddd-eeee-ffff", &["CVE-2026-1"]));
+        for f in [&by_id, &by_alias] {
+            assert!(is_malicious_finding(f));
+            assert_eq!(f.rule_name, "MaliciousDependency");
+            assert_eq!(
+                f.rule_metadata.as_ref().unwrap().severity.as_deref(),
+                Some("CRITICAL")
+            );
+        }
+        assert!(!is_malicious_finding(&cve));
+        assert_eq!(cve.rule_name, "VulnerableDependency");
     }
 
     #[test]

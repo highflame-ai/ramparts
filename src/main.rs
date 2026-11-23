@@ -173,6 +173,12 @@ enum Commands {
         /// `tools`, `prompts`, `resources` (singular forms also accepted).
         #[arg(long, value_name = "KINDS")]
         only: Option<String>,
+
+        /// Static analysis only: never start a stdio MCP server or connect
+        /// to an HTTP one. Configs, launch packages (OSV) and agent settings
+        /// are still checked. Use this in CI and on untrusted configs.
+        #[arg(long = "static")]
+        static_only: bool,
     },
 
     /// Generate a default config.yaml file
@@ -523,6 +529,7 @@ async fn execute_command(
             http_timeout,
             root,
             only,
+            static_only,
         } => {
             handle_scan_config_command(
                 auth_headers,
@@ -532,6 +539,7 @@ async fn execute_command(
                 http_timeout,
                 root,
                 only,
+                static_only,
                 &scanner_config,
                 scanner,
             )
@@ -1108,13 +1116,14 @@ async fn handle_scan_config_command(
     http_timeout: Option<u64>,
     root: Option<std::path::PathBuf>,
     only: Option<String>,
+    static_only: bool,
     scanner_config: &ScannerConfig,
     scanner: Option<MCPScanner>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_headers_map = parse_auth_headers(&auth_headers);
     let output_format = format.unwrap_or(scanner_config.scanner.format.clone());
     let only_kinds = parse_only_filter(only)?;
-    let options = build_scan_options(
+    let mut options = build_scan_options(
         scanner_config,
         &output_format,
         auth_headers_map,
@@ -1122,6 +1131,7 @@ async fn handle_scan_config_command(
         http_timeout,
         only_kinds,
     );
+    options.static_only = static_only;
 
     validate_scan_config(&options);
 

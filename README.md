@@ -94,7 +94,16 @@ ramparts scan-config --report
 
 # Or walk a checked-in configs-only repo (great for CI)
 ramparts scan-config --root ./ide-configs
+
+# Static analysis only: never start a stdio server or connect to an HTTP one
+ramparts scan-config --root . --static
 ```
+
+Before starting a stdio server (`npx`, `uvx`, …), `scan-config` checks its
+launch package against [OSV.dev](https://osv.dev). A package with a
+malicious-package record is reported and never started. If the check can't
+complete, the server isn't started either. Set `RAMPARTS_OSV_URL` (https) to
+use an OSV mirror or proxy instead of the public `api.osv.dev` endpoint.
 
 ### 2. Scan AI agent skills
 
