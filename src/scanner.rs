@@ -1627,28 +1627,19 @@ impl MCPScanner {
         }
     }
 
-    /// Result for a server that was deliberately not started or contacted:
-    /// static mode, or a launch package flagged as malicious.
+    /// Result for a stdio server that was not started because its launch
+    /// package is listed as malicious or couldn't be checked. The one place
+    /// that shapes a not-started result, so both reasons stay consistent.
     fn not_started_result(
         display_url: String,
         findings: Vec<YaraScanResult>,
-        static_only: bool,
+        reason: String,
+        elapsed_ms: u64,
     ) -> ScanResult {
         let mut result = ScanResult::new(display_url);
-        let malicious: Vec<String> = findings
-            .iter()
-            .filter(|f| crate::osv::is_malicious_finding(f))
-            .map(|f| f.target_name.clone())
-            .collect();
         result.yara_results = findings;
-        if !malicious.is_empty() {
-            result.add_error(format!(
-                "Server not started: launch package {} is listed as malicious",
-                malicious.join(", ")
-            ));
-        } else if static_only {
-            debug!("Static mode: {} not started", result.url);
-        }
+        result.response_time_ms = elapsed_ms;
+        result.add_error(format!("Server not started: {reason}"));
         result
     }
 
@@ -1678,23 +1669,29 @@ impl MCPScanner {
         let osv_findings = match self.launch_package_findings(command, args).await {
             Ok(findings) => findings,
             // Fail closed: no verdict, no launch.
-            Err(e) if !options.static_only => {
-                let mut result = ScanResult::new(display_url);
-                result.add_error(format!(
-                    "Server not started: its launch package could not be checked ({e})"
-                ));
-                return Ok(result);
-            }
             Err(e) => {
-                warn!("{e}");
-                Vec::new()
+                return Ok(Self::not_started_result(
+                    display_url,
+                    Vec::new(),
+                    format!("its launch package could not be checked ({e})"),
+                    scan_timer.elapsed_ms(),
+                ));
             }
         };
-        if options.static_only || osv_findings.iter().any(crate::osv::is_malicious_finding) {
+        let malicious: Vec<String> = osv_findings
+            .iter()
+            .filter(|f| crate::osv::is_malicious_finding(f))
+            .map(|f| f.target_name.clone())
+            .collect();
+        if !malicious.is_empty() {
             return Ok(Self::not_started_result(
                 display_url,
                 osv_findings,
-                options.static_only,
+                format!(
+                    "launch package {} is listed as malicious",
+                    malicious.join(", ")
+                ),
+                scan_timer.elapsed_ms(),
             ));
         }
 
@@ -2193,15 +2190,7 @@ impl MCPScanner {
 
                         let scan_future = async {
                             // Scan the MCP server - HTTP or STDIO
-                            let mut result = if server_options.static_only
-                                && server.command.is_none()
-                            {
-                                // Static mode: no connection. Config findings only.
-                                let mut res = ScanResult::new(server.to_display_url());
-                                res.ide_source = Some(ide_source);
-                                attach_findings(&mut res);
-                                res
-                            } else if let Some(url) = server.scan_url() {
+                            let mut result = if let Some(url) = server.scan_url() {
                                 // HTTP server scanning
                                 match scanner.scan_single(url, server_options).await {
                                     Ok(mut result) => {
@@ -3214,49 +3203,6 @@ mod tests {
         println!("Post-scan rules: {:?}", stats.post_scan_rules);
     }
 
-    /// Static mode never spawns the server command; a normal scan does
-    /// (here it fails because the binary doesn't exist, which proves the
-    /// spawn was attempted).
-    #[tokio::test]
-    async fn static_mode_never_starts_a_stdio_server() {
-        let scanner = MCPScanner::with_timeout(5).unwrap();
-        let server = MCPServerConfig {
-            name: Some("probe".to_string()),
-            url: None,
-            command: Some("/nonexistent/ramparts-test-binary".to_string()),
-            args: Some(vec![]),
-            env: None,
-            description: None,
-            auth_headers: None,
-            options: None,
-        };
-        let static_opts = ScanOptions {
-            timeout: 5,
-            static_only: true,
-            ..ScanOptions::default()
-        };
-        let result = scanner
-            .scan_stdio_server(&server, static_opts)
-            .await
-            .unwrap();
-        assert!(
-            matches!(result.status, ScanStatus::Success),
-            "{:?}",
-            result.status
-        );
-        assert!(result.tools.is_empty());
-
-        let live_opts = ScanOptions {
-            timeout: 5,
-            ..ScanOptions::default()
-        };
-        let live = scanner.scan_stdio_server(&server, live_opts).await;
-        assert!(
-            live.is_err() || !matches!(live.unwrap().status, ScanStatus::Success),
-            "a normal scan should have tried (and failed) to start the binary"
-        );
-    }
-
     #[test]
     fn malicious_launch_package_is_reported_not_started() {
         let finding: YaraScanResult = serde_json::from_value(serde_json::json!({
@@ -3266,10 +3212,15 @@ mod tests {
             "context": ""
         }))
         .unwrap();
-        let result =
-            MCPScanner::not_started_result("stdio:npx evil".to_string(), vec![finding], false);
+        let result = MCPScanner::not_started_result(
+            "stdio:npx evil".to_string(),
+            vec![finding],
+            "launch package npm/evil@? is listed as malicious".to_string(),
+            7,
+        );
         assert!(matches!(result.status, ScanStatus::Failed(_)));
-        assert!(result.errors[0].contains("npm/evil@?"));
+        assert!(result.errors[0].starts_with("Server not started: launch package npm/evil@?"));
+        assert_eq!(result.response_time_ms, 7);
         assert_eq!(result.yara_results.len(), 1);
     }
 }

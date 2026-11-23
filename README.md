@@ -94,9 +94,6 @@ ramparts scan-config --report
 
 # Or walk a checked-in configs-only repo (great for CI)
 ramparts scan-config --root ./ide-configs
-
-# Static analysis only: never start a stdio server or connect to an HTTP one
-ramparts scan-config --root . --static
 ```
 
 Before starting a stdio server (`npx`, `uvx`, …), `scan-config` checks its

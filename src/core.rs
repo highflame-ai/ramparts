@@ -553,7 +553,6 @@ impl MCPScannerCore {
             auth_headers: auth_headers.clone(),
             return_prompts: false,
             only: None,
-            static_only: false,
         };
 
         let result = self.scanner.scan_single(url, scan_options).await?;

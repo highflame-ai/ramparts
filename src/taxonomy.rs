@@ -141,7 +141,9 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         // Emitted by the OSV.dev integration when a stdio MCP server's
         // npx/uvx package release has known security advisories. Pure
         // supply-chain finding.
-        "VulnerableDependency" | "MaliciousDependency" => vec![OwaspTag::new("MCP10")],
+        "VulnerableDependency" | crate::osv::MALICIOUS_DEPENDENCY_RULE => {
+            vec![OwaspTag::new("MCP10")]
+        }
 
         // cross_origin_escalation.yar + the in-process cross-origin scanner
         "CrossOriginEscalation"
@@ -297,7 +299,9 @@ pub fn ast_tags_for_rule(rule_name: &str) -> Vec<OwaspTag> {
 
         // AST02 — Supply Chain: vulnerable bundled deps, and manifest that
         // understates network capability (a supply-chain hiding vector).
-        "VulnerableDependency" | "MaliciousDependency" => vec![OwaspTag::ast("AST02")],
+        "VulnerableDependency" | crate::osv::MALICIOUS_DEPENDENCY_RULE => {
+            vec![OwaspTag::ast("AST02")]
+        }
         "UndeclaredNetworkEgress" => vec![OwaspTag::ast("AST02"), OwaspTag::ast("AST04")],
 
         // AST03 — Over-Privileged Skills: broad grants, identity/memory

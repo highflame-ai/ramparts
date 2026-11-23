@@ -88,7 +88,6 @@ pub struct ScanConfigBuilder {
     // When true, do not call the LLM; instead, return the prompts that would be used
     return_prompts: bool,
     only: Option<Vec<ArtifactKind>>,
-    static_only: bool,
 }
 
 impl Default for ScanConfigBuilder {
@@ -101,7 +100,6 @@ impl Default for ScanConfigBuilder {
             auth_headers: None,
             return_prompts: false,
             only: None,
-            static_only: false,
         }
     }
 }
@@ -155,7 +153,6 @@ impl ScanConfigBuilder {
             auth_headers: self.auth_headers,
             return_prompts: self.return_prompts,
             only: self.only,
-            static_only: self.static_only,
         }
     }
 }
@@ -237,9 +234,6 @@ pub struct ScanOptions {
     /// Restrict the scan to a subset of artifact kinds. `None` = scan all.
     /// Set via the `--only` CLI flag; see `ArtifactKind::parse_set`.
     pub only: Option<Vec<ArtifactKind>>,
-    /// Never start or connect to an MCP server: analyze configs, launch
-    /// packages and agent settings only. Set via `scan-config --static`.
-    pub static_only: bool,
 }
 
 impl Default for ScanOptions {
@@ -252,7 +246,6 @@ impl Default for ScanOptions {
             auth_headers: None,
             return_prompts: false,
             only: None,
-            static_only: false,
         }
     }
 }
@@ -490,7 +483,6 @@ mod tests {
             auth_headers: None,
             return_prompts: false,
             only: None,
-            static_only: false,
         };
 
         let result = config_utils::validate_scan_config(&options);
@@ -507,7 +499,6 @@ mod tests {
             auth_headers: None,
             return_prompts: false,
             only: None,
-            static_only: false,
         };
 
         let result = config_utils::validate_scan_config(&options);
@@ -528,7 +519,6 @@ mod tests {
             auth_headers: None,
             return_prompts: false,
             only: None,
-            static_only: false,
         };
 
         let result = config_utils::validate_scan_config(&options);
@@ -549,7 +539,6 @@ mod tests {
             auth_headers: None,
             return_prompts: false,
             only: None,
-            static_only: false,
         };
 
         let result = config_utils::validate_scan_config(&options);
