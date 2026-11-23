@@ -85,10 +85,7 @@ impl RampartsMcpServer {
     )]
     async fn scan(&self, params: Parameters<ScanParams>) -> Result<CallToolResult, ErrorData> {
         let p = params.0;
-        // http(s) MCP endpoints only: other schemes make the scanner start
-        // a local process, which a tool caller (an agent, or a remote client)
-        // must not be able to request.
-        let url = crate::server::http_target(&p.url)
+        let url = tool_target(&p.url, self.network)
             .map_err(|e| ErrorData::invalid_params(e.message().to_string(), None))?;
         let request = ScanRequest {
             url,
@@ -164,6 +161,18 @@ impl RampartsMcpServer {
     }
 }
 
+/// Scan target for the `scan` tool. Over stdio the caller is the user's own
+/// local agent, so `stdio:` (local-process) targets are allowed, as on the
+/// CLI. Over the network transports they are refused: a remote caller must
+/// not be able to start processes on this host. Everything else must be an
+/// http(s) URL (see `server::http_target`).
+fn tool_target(url: &str, network: bool) -> Result<String, crate::server::TargetError> {
+    if !network && url.trim_start().starts_with("stdio:") {
+        return Ok(url.trim().to_string());
+    }
+    crate::server::http_target(url)
+}
+
 #[tool_handler]
 impl rmcp::ServerHandler for RampartsMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -230,4 +239,20 @@ pub async fn run_streamable_http_server(
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_target;
+
+    #[test]
+    fn stdio_targets_allowed_over_stdio_only() {
+        assert!(tool_target("stdio:npx:-y:some-mcp", false).is_ok());
+        assert!(tool_target("stdio:npx:-y:some-mcp", true).is_err());
+        assert!(tool_target("stdio://bash:-c:id;@example.com", true).is_err());
+        for network in [false, true] {
+            assert!(tool_target("https://mcp.example.com", network).is_ok());
+            assert!(tool_target("file:///etc/passwd", network).is_err());
+        }
+    }
 }
