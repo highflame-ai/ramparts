@@ -15,6 +15,7 @@ mod core;
 mod integration_tests;
 mod mcp_client;
 mod mcp_server;
+mod net_policy;
 mod normalize;
 mod osv;
 #[cfg(test)]
@@ -259,8 +260,9 @@ enum Commands {
         #[arg(short, long, default_value = "3000")]
         port: u16,
 
-        /// Host to bind the server to
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Host to bind the server to. Defaults to loopback; pass
+        /// `--host 0.0.0.0` (and set RAMPARTS_API_TOKEN) to expose it.
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
     },
 
@@ -269,8 +271,9 @@ enum Commands {
 
     /// Run Ramparts as an MCP server over SSE (HTTP SSE endpoint)
     McpSse {
-        /// Host to bind the server to
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Host to bind to. Defaults to loopback; pass `--host 0.0.0.0`
+        /// (and set RAMPARTS_API_TOKEN) to expose it.
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// Port to run the SSE server on
         #[arg(short, long, default_value = "8000")]
@@ -279,8 +282,9 @@ enum Commands {
 
     /// Run Ramparts as an MCP server over streamable HTTP
     McpHttp {
-        /// Host to bind the server to
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Host to bind to. Defaults to loopback; pass `--host 0.0.0.0`
+        /// (and set RAMPARTS_API_TOKEN) to expose it.
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// Port to run the HTTP server on
         #[arg(short, long, default_value = "8081")]

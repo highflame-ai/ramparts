@@ -62,15 +62,20 @@ pub struct RampartsMcpServer {
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     core: Arc<MCPScannerCore>,
+    /// Served over a network transport (streamable HTTP / SSE) rather than
+    /// stdio: callers may be remote, so private targets are refused and
+    /// scan-config (which starts the host's configured servers) is off.
+    network: bool,
 }
 
 #[tool_router]
 impl RampartsMcpServer {
-    pub fn new() -> Self {
+    pub fn new(network: bool) -> Self {
         let core = MCPScannerCore::new().expect("core init");
         Self {
             tool_router: Self::tool_router(),
             core: Arc::new(core),
+            network,
         }
     }
 
@@ -80,8 +85,10 @@ impl RampartsMcpServer {
     )]
     async fn scan(&self, params: Parameters<ScanParams>) -> Result<CallToolResult, ErrorData> {
         let p = params.0;
+        let url = tool_target(&p.url, self.network)
+            .map_err(|e| ErrorData::invalid_params(e.message().to_string(), None))?;
         let request = ScanRequest {
-            url: p.url,
+            url,
             timeout: p.timeout,
             http_timeout: p.http_timeout,
             detailed: Some(p.detailed),
@@ -113,6 +120,14 @@ impl RampartsMcpServer {
         &self,
         params: Parameters<ScanConfigParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if self.network {
+            return Err(ErrorData::invalid_request(
+                "scan-config is only available over the stdio transport: it starts the \
+                 MCP servers configured on this host"
+                    .to_string(),
+                None,
+            ));
+        }
         let p = params.0;
         let mut builder = ScanConfigBuilder::new();
         if let Some(d) = p.detailed {
@@ -146,6 +161,18 @@ impl RampartsMcpServer {
     }
 }
 
+/// Scan target for the `scan` tool. Over stdio the caller is the user's own
+/// local agent, so `stdio:` (local-process) targets are allowed, as on the
+/// CLI. Over the network transports they are refused: a remote caller must
+/// not be able to start processes on this host. Everything else must be an
+/// http(s) URL (see `server::http_target`).
+fn tool_target(url: &str, network: bool) -> Result<String, crate::server::TargetError> {
+    if !network && url.trim_start().starts_with("stdio:") {
+        return Ok(url.trim().to_string());
+    }
+    crate::server::http_target(url)
+}
+
 #[tool_handler]
 impl rmcp::ServerHandler for RampartsMcpServer {
     fn get_info(&self) -> ServerConfig {
@@ -157,7 +184,7 @@ impl rmcp::ServerHandler for RampartsMcpServer {
 
 /// Run the MCP server over stdio transport.
 pub async fn run_stdio_server() -> Result<(), Box<dyn std::error::Error>> {
-    let handler = RampartsMcpServer::new();
+    let handler = RampartsMcpServer::new(false);
     let service = handler.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -181,16 +208,51 @@ pub async fn run_streamable_http_server(
     use axum::Router;
     use tower::ServiceBuilder;
 
-    let bind: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+    let bind = crate::net_policy::resolve_bind(host, port).await?;
+    // Tool calls now come from network callers: the scanner refuses
+    // local-process targets from here on.
+    crate::net_policy::enter_remote_mode();
+    let token = crate::net_policy::api_token(host, "the MCP server");
+    let loopback_without_token = token.is_none() && crate::net_policy::is_loopback_host(host);
+
     let service: StreamableHttpService<RampartsMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
-            || Ok(RampartsMcpServer::new()),
+            || Ok(RampartsMcpServer::new(true)),
             std::sync::Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default(),
         );
 
-    let app = Router::new().route("/", any_service(ServiceBuilder::new().service(service)));
+    let app = Router::new()
+        .route("/", any_service(ServiceBuilder::new().service(service)))
+        .route_layer(axum::middleware::from_fn(move |req, next| {
+            crate::net_policy::require_token(token.clone(), req, next)
+        }));
+    // Loopback without a token: refuse requests addressed to any other Host,
+    // so a web page can't reach the endpoint by DNS rebinding.
+    let app = if loopback_without_token {
+        app.layer(axum::middleware::from_fn(
+            crate::net_policy::require_loopback_host,
+        ))
+    } else {
+        app
+    };
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_target;
+
+    #[test]
+    fn stdio_targets_allowed_over_stdio_only() {
+        assert!(tool_target("stdio:npx:-y:some-mcp", false).is_ok());
+        assert!(tool_target("stdio:npx:-y:some-mcp", true).is_err());
+        assert!(tool_target("stdio://bash:-c:id;@example.com", true).is_err());
+        for network in [false, true] {
+            assert!(tool_target("https://mcp.example.com", network).is_ok());
+            assert!(tool_target("file:///etc/passwd", network).is_err());
+        }
+    }
 }

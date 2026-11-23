@@ -696,8 +696,9 @@ ps aux | grep ramparts
 # Test locally
 curl http://localhost:3000/v1/ramparts/health
 
-# Check host binding
-ramparts server --host 0.0.0.0 --port 3000
+# Check host binding: the default is 127.0.0.1 (loopback only). To accept
+# remote clients, bind all interfaces and set a token:
+RAMPARTS_API_TOKEN=change-me ramparts server --host 0.0.0.0 --port 3000
 
 # Check firewall
 sudo ufw status
