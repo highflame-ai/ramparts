@@ -133,6 +133,22 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         "MCPToolChanged" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP10")],
         "SkillContentChanged" => vec![OwaspTag::new("MCP10")],
         "AgentIdentityFileWrite" => vec![OwaspTag::new("MCP03"), OwaspTag::new("MCP09")],
+        // agent_config_risk.yar + src/agent_config.rs — agent config files
+        // (hooks, helper commands, guardrail settings).
+        "AgentHookRemoteExec" => vec![OwaspTag::new("MCP07"), OwaspTag::new("MCP10")],
+        "AgentConfigTamper" => vec![OwaspTag::new("MCP03"), OwaspTag::new("MCP10")],
+        // ai_credentials.yar
+        "AIProviderKeyExposure" | "AICredentialFileAccess" => {
+            vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
+        }
+        // install_lures.yar
+        "RemoteScriptInstallInstruction" => vec![OwaspTag::new("MCP07"), OwaspTag::new("MCP10")],
+        "LLMBaseUrlOverride" | "AgentTrafficInterception" => {
+            vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
+        }
+        "AutoApprovedProjectMcpServers" | "WildcardAgentPermission" | "AutoRunWorkspaceTask" => {
+            vec![OwaspTag::new("MCP03")]
+        }
         "ExternalReferenceInventory" => vec![OwaspTag::new("MCP10")],
         "UndeclaredNetworkEgress" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP09")],
         // ScanCoverageIncomplete is a scanner-integrity meta-finding, not an
@@ -193,10 +209,10 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
 
         // malware.yar — classic malware behavior embedded in skill/tool
         // content (ported from NVIDIA SkillSpector / signature-base).
-        "ReverseShell" | "C2FrameworkIndicators" => {
+        "ReverseShell" | "ReverseShellMultiline" | "C2FrameworkIndicators" => {
             vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP07")]
         }
-        "BackdoorPersistence" | "RansomwareBehavior" => {
+        "BackdoorPersistence" | "RansomwareBehavior" | "RansomwareBehaviorMultiline" => {
             vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")]
         }
         "KeyloggerIndicators" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP09")],
@@ -219,6 +235,16 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         }
         "PrivilegeEscalationTools" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")],
         "PhishingKit" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP06")],
+
+        // risky_operations.yar — SSRF to cloud metadata, privileged
+        // containers, bucket exfiltration, unsafe deserialization,
+        // refusal suppression.
+        "CloudMetadataAccess" | "CloudStorageExfiltration" => {
+            vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
+        }
+        "PrivilegedContainer" => vec![OwaspTag::new("MCP03"), OwaspTag::new("MCP07")],
+        "UnsafeDeserialization" => vec![OwaspTag::new("MCP07")],
+        "RefusalSuppression" => vec![OwaspTag::new("MCP01"), OwaspTag::new("MCP03")],
 
         // Synthetic findings emitted by the skill parser (src/skills.rs)
         // for structural risks the YARA passes can't see (frontmatter
@@ -275,9 +301,11 @@ pub fn ast_tags_for_rule(rule_name: &str) -> Vec<OwaspTag> {
         | "SkillToolChainingExfiltration"
         | "SkillSystemManipulation"
         | "ReverseShell"
+        | "ReverseShellMultiline"
         | "C2FrameworkIndicators"
         | "BackdoorPersistence"
         | "RansomwareBehavior"
+        | "RansomwareBehaviorMultiline"
         | "KeyloggerIndicators"
         | "InfoStealer"
         | "PHPWebshellGeneric"
@@ -293,7 +321,12 @@ pub fn ast_tags_for_rule(rule_name: &str) -> Vec<OwaspTag> {
         | "CryptoStratumProtocol"
         | "CryptoMiningPools"
         | "CryptoMinerSoftware"
+        | "CloudMetadataAccess"
+        | "CloudStorageExfiltration"
+        | "UnsafeDeserialization"
+        | "RefusalSuppression"
         | "CryptoCoinjacking" => vec![OwaspTag::ast("AST01")],
+        "PrivilegedContainer" => vec![OwaspTag::ast("AST06")],
 
         // AST02 — Supply Chain: vulnerable bundled deps, and manifest that
         // understates network capability (a supply-chain hiding vector).
@@ -307,6 +340,14 @@ pub fn ast_tags_for_rule(rule_name: &str) -> Vec<OwaspTag> {
             vec![OwaspTag::ast("AST03")]
         }
         "AgentIdentityFileWrite" => vec![OwaspTag::ast("AST01"), OwaspTag::ast("AST03")],
+        "AgentHookRemoteExec"
+        | "AgentConfigTamper"
+        | "AIProviderKeyExposure"
+        | "AICredentialFileAccess"
+        | "RemoteScriptInstallInstruction" => vec![OwaspTag::ast("AST01")],
+        "AutoApprovedProjectMcpServers" | "WildcardAgentPermission" | "AutoRunWorkspaceTask" => {
+            vec![OwaspTag::ast("AST03")]
+        }
         "PrivilegeEscalationTools" => vec![OwaspTag::ast("AST01"), OwaspTag::ast("AST03")],
 
         // AST04 — Insecure Metadata: deceptive/invalid manifests,
@@ -393,6 +434,16 @@ mod tests {
             "SQLInjection",
             "PathTraversalVulnerability",
             "MCPConfigRisk",
+            "AgentHookRemoteExec",
+            "AgentConfigTamper",
+            "LLMBaseUrlOverride",
+            "AgentTrafficInterception",
+            "AIProviderKeyExposure",
+            "AICredentialFileAccess",
+            "RemoteScriptInstallInstruction",
+            "AutoRunWorkspaceTask",
+            "AutoApprovedProjectMcpServers",
+            "WildcardAgentPermission",
             "CrossOriginEscalation",
             "CrossDomainContamination",
             "DomainOutlier",
@@ -413,9 +464,11 @@ mod tests {
             "CryptoCoinjacking",
             // malware.yar
             "ReverseShell",
+            "ReverseShellMultiline",
             "BackdoorPersistence",
             "KeyloggerIndicators",
             "RansomwareBehavior",
+            "RansomwareBehaviorMultiline",
             "C2FrameworkIndicators",
             "InfoStealer",
             // webshells.yar
@@ -431,6 +484,12 @@ mod tests {
             "PrivilegeEscalationTools",
             "ExploitFramework",
             "PhishingKit",
+            // risky_operations.yar
+            "CloudMetadataAccess",
+            "PrivilegedContainer",
+            "CloudStorageExfiltration",
+            "UnsafeDeserialization",
+            "RefusalSuppression",
         ] {
             assert!(
                 !tags_for_yara_rule(name).is_empty(),
