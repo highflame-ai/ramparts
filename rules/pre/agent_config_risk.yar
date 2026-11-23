@@ -9,7 +9,7 @@
 //   - AgentConfigTamper:   skill/tool content that writes an agent config
 //                          file (.claude/settings*.json, ~/.claude.json,
 //                          managed-settings.json, .cursor/{hooks,mcp}.json,
-//                          .vscode/mcp.json, .gemini/settings.json,
+//                          .vscode/{mcp,tasks}.json, .gemini/settings.json,
 //                          .mcp.json) through the shell or file APIs. That
 //                          is how a malicious hook or MCP server is planted.
 //
@@ -58,7 +58,7 @@ rule AgentConfigTamper
 {
     meta:
         name = "Agent Config Tamper"
-        description = "Writes an agent configuration file (Claude/Cursor/Gemini settings, hooks, project MCP config) via shell redirection, tee, sed -i, mv/cp/ln, curl -o / wget -O, or a file-write API; this is how malicious hooks and MCP servers are planted"
+        description = "Writes an agent configuration file (Claude/Cursor/Gemini settings, hooks, VS Code tasks, project MCP config) via shell redirection, tee, sed -i, mv/cp/ln, curl -o / wget -O, or a file-write API; this is how malicious hooks and MCP servers are planted"
         severity = "HIGH"
         category = "persistence,config-tamper,security"
         author = "Ramparts Security Team"
@@ -70,16 +70,16 @@ rule AgentConfigTamper
         // (`"$P">f`, `2>f`). That rules out markdown blockquotes
         // (`\n> .claude/...`), HTML tags (`<code>.claude/...`) and arrows
         // (`Settings -> ...`, `=> ...`).
-        $redirect = /([^\s>=<\-][ \t]+>>?|["')}\]0-9&]>>?|\btee\s+(-a\s+)?)\s*["']?[^\s|;&<>]*(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|(^|[\s\/"'])\.mcp\.json)/ nocase
-        $sed_i    = /\bsed\s+(-[a-zA-Z]*i[a-zA-Z]*|--in-place)\b[^\n]{0,200}(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)/ nocase
-        $mv_cp    = /\b(mv|cp|install|ln)\s+(-[a-zA-Z]+\s+)*\S+\s+["']?[^\s|;&<>]*(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)/ nocase
+        $redirect = /([^\s>=<\-][ \t]+>>?|["')}\]0-9&]>>?|\btee\s+(-a\s+)?)\s*["']?[^\s|;&<>]*(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/(mcp|tasks)\.json|\.gemini\/settings\.json|(^|[\s\/"'])\.mcp\.json)/ nocase
+        $sed_i    = /\bsed\s+(-[a-zA-Z]*i[a-zA-Z]*|--in-place)\b[^\n]{0,200}(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/(mcp|tasks)\.json|\.gemini\/settings\.json|\.mcp\.json)/ nocase
+        $mv_cp    = /\b(mv|cp|install|ln)\s+(-[a-zA-Z]+\s+)*\S+\s+["']?[^\s|;&<>]*(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/(mcp|tasks)\.json|\.gemini\/settings\.json|\.mcp\.json)/ nocase
         // curl -o FILE / wget -O FILE (flag may be combined: -sSLo)
-        $download = /\b(curl|wget)\b[^\n]*\s(-[a-zA-Z]*[oO]|--output(-document)?)(\s+|=)["']?[^\s|;&<>]*(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)/ nocase
+        $download = /\b(curl|wget)\b[^\n]*\s(-[a-zA-Z]*[oO]|--output(-document)?)(\s+|=)["']?[^\s|;&<>]*(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/(mcp|tasks)\.json|\.gemini\/settings\.json|\.mcp\.json)/ nocase
         // file-write APIs with the path as an argument, or pathlib
         // `Path('.mcp.json').write_text(...)` with the path first
-        $open_w   = /open\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)[^\n]{0,40}["'][wa]\+?["']/ nocase
-        $api      = /(writeFileSync|writeFile|appendFileSync|write_text|write_bytes)\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)/ nocase
-        $pathlib  = /(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/mcp\.json|\.gemini\/settings\.json|\.mcp\.json)["']?\s*\)?[^\n]{0,80}\.(write_text|write_bytes|open\s*\(\s*["'][wa])/ nocase
+        $open_w   = /open\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/(mcp|tasks)\.json|\.gemini\/settings\.json|\.mcp\.json)[^\n]{0,40}["'][wa]\+?["']/ nocase
+        $api      = /(writeFileSync|writeFile|appendFileSync|write_text|write_bytes)\s*\([^\n]{0,160}(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/(mcp|tasks)\.json|\.gemini\/settings\.json|\.mcp\.json)/ nocase
+        $pathlib  = /(\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\.cursor\/(hooks|mcp)\.json|\.vscode\/(mcp|tasks)\.json|\.gemini\/settings\.json|\.mcp\.json)["']?\s*\)?[^\n]{0,80}\.(write_text|write_bytes|open\s*\(\s*["'][wa])/ nocase
 
     // No exclusions: any phrase that can suppress a match can also be
     // typed next to a malicious write (`> .claude/settings.json # never
