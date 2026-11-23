@@ -13,14 +13,6 @@
 # condition under which the ignore should be re-evaluated. Keep this list
 # short — prefer fixing or upgrading whenever a path exists.
 ignore = [
-    # rsa: Marvin Attack — timing side-channel in PKCS#1 v1.5 decryption.
-    # Path: yara-x → rsa (used only to parse X.509 certs in PE/Macho/CRX
-    # YARA modules). Ramparts performs no RSA decryption against
-    # attacker-controlled input, so the timing oracle isn't reachable.
-    # Re-evaluate when the rsa crate ships a constant-time implementation
-    # (tracked for rsa 0.10.x).
-    "RUSTSEC-2023-0071",
-
     # bincode: unmaintained (informational, no CVE).
     # Path: yara-x → bincode (used to serialize compiled rule databases).
     # Ramparts only deserializes repo-supplied rules, never untrusted input.

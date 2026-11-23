@@ -10,6 +10,7 @@ name = "ramparts"
 # historical archive.
 version = "0.8.2"
 edition = "2021"
+rust-version = "1.95"
 authors = ["Sharath Rajasekar <sharath@highflame.com>"]
 description = "Security scanner for Model Context Protocol (MCP) servers and AI agent skills (Claude Code commands, agentskills.io bundles, Cursor / Codex / Windsurf / Gemini equivalents)."
 license = "Apache-2.0"
@@ -113,7 +114,7 @@ jsonrpc-core = "18.0"
 yara-x = { version = "1.24", optional = true }
 
 # Official Rust MCP SDK
-rmcp = { version = "3.1", features = [
+rmcp = { version = "3.11", features = [
     "client",
     "server",
     "macros",
