@@ -5,7 +5,7 @@ use crate::core::{
 };
 use axum::{
     extract::State,
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     middleware,
     response::Json,
     routing::{get, post},
