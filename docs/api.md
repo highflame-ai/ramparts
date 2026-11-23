@@ -51,7 +51,7 @@ RAMPARTS_API_TOKEN=change-me ramparts server --port 8080 --host 0.0.0.0
 | `--host` | `127.0.0.1` | Bind address. Use `0.0.0.0` only together with `RAMPARTS_API_TOKEN` or an authenticating proxy. |
 | `RAMPARTS_API_TOKEN` | unset | When set, every `/v1/ramparts/*` endpoint except `/v1/ramparts/health` requires `Authorization: Bearer <token>`. |
 | `RAMPARTS_CORS_ORIGINS` | unset (no CORS) | Comma-separated origins allowed to call the API from a browser, or `*`. |
-| `RAMPARTS_ALLOW_PRIVATE_TARGETS` | unset | Set to `1` to allow scanning loopback / private-network targets. |
+| `RAMPARTS_ALLOW_PRIVATE_TARGETS` | unset | Set to `1` to allow scanning loopback / private-network targets. Otherwise private addresses are refused in the URL, in DNS answers and in redirects. |
 
 Scan targets (`url`, `urls`, `reference_url`) must be `http` or `https` URLs.
 
@@ -765,10 +765,12 @@ The API uses standard HTTP status codes and provides detailed error messages:
 
 ### CORS Support
 
-The server includes CORS headers for browser-based applications:
-- `Access-Control-Allow-Origin: *`
+CORS is off by default, so browsers block cross-origin calls. To allow a browser-based client, list its origin(s) in `RAMPARTS_CORS_ORIGINS` (comma-separated, or `*`). The server then sends:
+- `Access-Control-Allow-Origin`: the matching listed origin
 - `Access-Control-Allow-Methods: GET, POST, OPTIONS`
-- `Access-Control-Allow-Headers: *`
+- `Access-Control-Allow-Headers: Authorization, Content-Type, X-Javelin-Apikey`
+
+Invalid entries are ignored with a warning in the server log.
 
 ### Request Validation
 

@@ -14,6 +14,7 @@ mod core;
 mod integration_tests;
 mod mcp_client;
 mod mcp_server;
+mod net_policy;
 mod normalize;
 mod osv;
 #[cfg(test)]

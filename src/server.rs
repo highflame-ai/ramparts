@@ -42,60 +42,76 @@ impl Default for ServerConfig {
     }
 }
 
+/// Why a scan target was refused: a malformed or non-http(s) URL (400), or
+/// a forbidden destination (403).
+#[derive(Debug)]
+enum TargetError {
+    Invalid(String),
+    Forbidden(String),
+}
+
+impl TargetError {
+    fn into_response(self) -> (StatusCode, Json<Value>) {
+        let (status, reason) = match self {
+            TargetError::Invalid(r) => (StatusCode::BAD_REQUEST, r),
+            TargetError::Forbidden(r) => (StatusCode::FORBIDDEN, r),
+        };
+        (
+            status,
+            Json(json!({
+                "success": false,
+                "error": reason,
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            })),
+        )
+    }
+}
+
 /// Validate a caller-supplied scan target and return the URL to scan.
 ///
 /// Every server-mode URL field goes through here. Only `http`/`https` targets
-/// are accepted, and the caller receives the parsed, re-serialized URL, so the
-/// string handed to the scanner is exactly the one that was validated (the
-/// scanner treats other schemes, such as local-process targets, specially).
-fn validated_target(raw: &str) -> Result<String, String> {
+/// are accepted (the scanner treats other schemes, such as local-process
+/// targets, specially). A target that already starts with `http://` or
+/// `https://` is returned exactly as given, so clients see their own URL in
+/// results; the scanner's HTTP stack parses it with the same URL parser
+/// that validated it. Scheme-less input is returned with `http://` added.
+fn validated_target(raw: &str) -> Result<String, TargetError> {
     let raw = raw.trim();
     let candidate = if raw.contains("://") {
         raw.to_string()
     } else {
         format!("http://{raw}")
     };
-    let parsed = url::Url::parse(&candidate).map_err(|e| format!("Invalid URL: {e}"))?;
+    let parsed = url::Url::parse(&candidate)
+        .map_err(|e| TargetError::Invalid(format!("Invalid URL: {e}")))?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("Only HTTP and HTTPS URLs are supported".to_string());
+        return Err(TargetError::Invalid(
+            "Only HTTP and HTTPS URLs are supported".to_string(),
+        ));
     }
-    let normalized = parsed.to_string();
-    reject_forbidden_target(&normalized)?;
-    Ok(normalized)
-}
-
-fn bad_target(status: StatusCode, reason: String) -> (StatusCode, Json<Value>) {
-    (
-        status,
-        Json(json!({
-            "success": false,
-            "error": reason,
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        })),
-    )
+    reject_forbidden_target(&parsed)?;
+    if candidate.starts_with("http://") || candidate.starts_with("https://") {
+        Ok(candidate)
+    } else {
+        Ok(parsed.to_string())
+    }
 }
 
 /// Validate `url` and `reference_url` of a scan request in place.
 fn validate_scan_targets(request: &mut ScanRequest) -> Result<(), (StatusCode, Json<Value>)> {
-    let status = |reason: &str| {
-        if reason.starts_with("Refusing") {
-            StatusCode::FORBIDDEN
-        } else {
-            StatusCode::BAD_REQUEST
-        }
-    };
     if !request.url.is_empty() {
-        request.url = validated_target(&request.url).map_err(|r| bad_target(status(&r), r))?;
+        request.url = validated_target(&request.url).map_err(TargetError::into_response)?;
     }
     if let Some(reference) = request.reference_url.as_mut() {
-        *reference = validated_target(reference).map_err(|r| bad_target(status(&r), r))?;
+        *reference = validated_target(reference).map_err(TargetError::into_response)?;
     }
     Ok(())
 }
 
 /// Bearer-token check for `/v1/ramparts/*` when `RAMPARTS_API_TOKEN` is set.
 /// Unset keeps the API open, which is only appropriate on a loopback bind or
-/// behind an authenticating proxy.
+/// behind an authenticating proxy. The scheme name is case-insensitive
+/// (RFC 7235).
 async fn require_token(token: Option<Arc<str>>, request: Request, next: Next) -> Response {
     let Some(token) = token else {
         return next.run(request).await;
@@ -104,7 +120,9 @@ async fn require_token(token: Option<Arc<str>>, request: Request, next: Next) ->
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.trim().split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, t)| t.trim());
     if presented.is_some_and(|p| constant_time_eq(p.as_bytes(), token.as_bytes())) {
         next.run(request).await
     } else {
@@ -116,8 +134,19 @@ async fn require_token(token: Option<Arc<str>>, request: Request, next: Next) ->
     }
 }
 
+/// `host` without IPv6 brackets (`[::1]` -> `::1`).
+fn bare_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    let host = bare_host(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -135,93 +164,76 @@ fn cors_layer() -> Option<CorsLayer> {
     let allow = if origins == "*" {
         AllowOrigin::from(Any)
     } else {
-        AllowOrigin::list(
-            origins
-                .split(',')
-                .filter_map(|o| HeaderValue::from_str(o.trim()).ok()),
-        )
+        let mut valid = Vec::new();
+        for origin in origins.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+            match HeaderValue::from_str(origin) {
+                Ok(v) => valid.push(v),
+                Err(_) => warn!("Ignoring invalid origin in RAMPARTS_CORS_ORIGINS: {origin:?}"),
+            }
+        }
+        if valid.is_empty() {
+            warn!("RAMPARTS_CORS_ORIGINS has no valid origins; CORS stays off");
+            return None;
+        }
+        AllowOrigin::list(valid)
     };
     Some(
         CorsLayer::new()
             .allow_origin(allow)
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                header::HeaderName::from_static("x-javelin-apikey"),
+            ]),
     )
 }
 
-/// Reject scan targets that resolve to the host itself or to private networks.
+/// Reject scan targets that are the host itself or a private network.
 ///
-/// The scan endpoints make the server fetch a caller-supplied URL, which is a
-/// textbook request-forgery primitive: without this, a caller reaches
-/// `169.254.169.254` for cloud credentials, or any service bound to the host's
-/// private interfaces. Set `RAMPARTS_ALLOW_PRIVATE_TARGETS=1` to scan internal
-/// servers deliberately.
-fn reject_forbidden_target(raw_url: &str) -> Result<(), String> {
+/// The scan endpoints make the server fetch a caller-supplied URL, a request
+/// forgery primitive: without this, a caller reaches the cloud metadata
+/// service or anything on the host's private interfaces. This checks the URL
+/// (IP literals and `localhost`); names that resolve to private addresses and
+/// redirects are stopped at connection time by `net_policy`. Set
+/// `RAMPARTS_ALLOW_PRIVATE_TARGETS=1` to scan internal servers deliberately.
+fn reject_forbidden_target(parsed: &url::Url) -> Result<(), TargetError> {
     let allow_private = std::env::var("RAMPARTS_ALLOW_PRIVATE_TARGETS").is_ok_and(|v| v == "1");
-    reject_forbidden_target_with(raw_url, allow_private)
+    reject_forbidden_target_with(parsed, allow_private)
 }
 
 /// The policy itself, with the environment read out of it, so tests exercise
 /// the rules without mutating process-global state.
-fn reject_forbidden_target_with(raw_url: &str, allow_private: bool) -> Result<(), String> {
+fn reject_forbidden_target_with(parsed: &url::Url, allow_private: bool) -> Result<(), TargetError> {
     if allow_private {
         return Ok(());
     }
-
-    // Normalize the same way the scanner does before inspecting the host.
-    let candidate = if raw_url.contains("://") {
-        raw_url.to_string()
-    } else {
-        format!("http://{raw_url}")
+    let refuse = |what: String| {
+        TargetError::Forbidden(format!(
+            "Refusing to scan {what}: loopback, private, or link-local address. \
+             Set RAMPARTS_ALLOW_PRIVATE_TARGETS=1 to allow it."
+        ))
     };
-
-    let parsed = url::Url::parse(&candidate).map_err(|e| format!("Invalid URL: {e}"))?;
-
-    // Match on the typed host. `host_str` returns an IPv6 literal wrapped in
-    // brackets ("[::1]"), which does not parse as an IpAddr — so a string-based
-    // check silently lets IPv6 loopback through.
-    let ip = match parsed.host() {
-        Some(url::Host::Ipv4(v4)) => Some(std::net::IpAddr::V4(v4)),
-        Some(url::Host::Ipv6(v6)) => Some(std::net::IpAddr::V6(v6)),
+    // Match on the typed host: `host_str` wraps IPv6 in brackets, which
+    // doesn't parse as an IpAddr.
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) if crate::net_policy::is_forbidden_ip(v4.into()) => {
+            Err(refuse(v4.to_string()))
+        }
+        Some(url::Host::Ipv6(v6)) if crate::net_policy::is_forbidden_ip(v6.into()) => {
+            Err(refuse(v6.to_string()))
+        }
         Some(url::Host::Domain(domain)) => {
             let lowered = domain.to_ascii_lowercase();
             if lowered == "localhost" || lowered.ends_with(".localhost") {
-                return Err(
-                    "Refusing to scan a loopback address. Set RAMPARTS_ALLOW_PRIVATE_TARGETS=1 \
-                     to allow it."
-                        .to_string(),
-                );
+                Err(refuse(lowered))
+            } else {
+                Ok(())
             }
-            // A bare domain may still resolve into private space. Resolution
-            // happens later in the HTTP stack, so this check is best-effort by
-            // design; the literal forms below are what an attacker reaches for.
-            None
         }
-        None => return Err("URL has no host".to_string()),
-    };
-
-    if let Some(ip) = ip {
-        let forbidden = match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_broadcast()
-                    || v4.is_unspecified()
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
-            }
-        };
-        if forbidden {
-            return Err(format!(
-                "Refusing to scan {ip}: loopback, private, or link-local address. \
-                 Set RAMPARTS_ALLOW_PRIVATE_TARGETS=1 to allow it."
-            ));
-        }
+        Some(_) => Ok(()),
+        None => Err(TargetError::Invalid("URL has no host".to_string())),
     }
-
-    Ok(())
 }
 
 pub struct MCPScannerServer {
@@ -253,6 +265,14 @@ impl MCPScannerServer {
             core: core.clone(),
             rate_limiter: Arc::new(RwLock::new(HashMap::new())),
         };
+
+        // Scans requested over the API must not reach the host or private
+        // networks, including via DNS answers and redirects.
+        if std::env::var("RAMPARTS_ALLOW_PRIVATE_TARGETS").is_ok_and(|v| v == "1") {
+            warn!("RAMPARTS_ALLOW_PRIVATE_TARGETS=1: API scans may reach private networks");
+        } else {
+            crate::net_policy::block_private_targets();
+        }
 
         let token: Option<Arc<str>> = std::env::var("RAMPARTS_API_TOKEN")
             .ok()
@@ -304,7 +324,11 @@ impl MCPScannerServer {
         };
         let app = app.layer(TraceLayer::new_for_http()).with_state(state);
 
-        let addr = format!("{}:{}", self.config.host, self.config.port);
+        let host = bare_host(&self.config.host).to_string();
+        let addr = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => std::net::SocketAddr::new(ip, self.config.port).to_string(),
+            Err(_) => format!("{host}:{}", self.config.port),
+        };
         info!("Starting MCP Scanner Server on http://{addr}");
         debug!("Protocol version: 2025-06-18");
 
@@ -527,22 +551,6 @@ async fn scan_endpoint(
     headers: HeaderMap,
     Json(mut request): Json<ScanRequest>,
 ) -> Result<Json<ScanResponse>, (StatusCode, Json<Value>)> {
-    // Rate limit the endpoint that actually performs work. This previously
-    // guarded only the deprecated refresh-tools stub.
-    if check_rate_limit(&state, std::slice::from_ref(&request.url))
-        .await
-        .is_err()
-    {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({
-                "success": false,
-                "error": "Rate limit exceeded. Please try again later.",
-                "timestamp": chrono::Utc::now().to_rfc3339()
-            })),
-        ));
-    }
-
     // Extract Javelin API key from headers using helper function
     extract_and_add_api_key(&headers, &mut request.auth_headers);
 
@@ -561,6 +569,22 @@ async fn scan_endpoint(
     // One validator for every target the scanner will fetch: http/https
     // only, no private targets, and the scanner gets the validated form.
     validate_scan_targets(&mut request)?;
+
+    // Rate limit on the validated URL, so rejected input uses no slots and
+    // /scan and /batch-scan count the same target the same way.
+    if check_rate_limit(&state, std::slice::from_ref(&request.url))
+        .await
+        .is_err()
+    {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "success": false,
+                "error": "Rate limit exceeded. Please try again later.",
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            })),
+        ));
+    }
 
     // Validate timeout values
     if let Some(timeout) = request.timeout {
@@ -739,14 +763,7 @@ async fn batch_scan_endpoint(
     // Validate every target (and the shared reference URL) the same way
     // /scan does; the scanner receives the validated, normalized URLs.
     for url in request.urls.iter_mut() {
-        *url = validated_target(url).map_err(|reason| {
-            let status = if reason.starts_with("Refusing") {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            bad_target(status, reason)
-        })?;
+        *url = validated_target(url).map_err(TargetError::into_response)?;
     }
     if let Some(options) = request.options.as_mut() {
         validate_scan_targets(options)?;
@@ -987,6 +1004,19 @@ async fn check_rate_limit(state: &ServerState, urls: &[String]) -> Result<(), St
 mod tests {
     use super::*;
 
+    /// True when the private-target rules allow `raw` (parsed the way
+    /// `validated_target` parses it, without its scheme check).
+    fn forbidden_check(raw: &str, allow_private: bool) -> bool {
+        let candidate = if raw.contains("://") {
+            raw.to_string()
+        } else {
+            format!("http://{raw}")
+        };
+        url::Url::parse(&candidate)
+            .map(|u| reject_forbidden_target_with(&u, allow_private).is_ok())
+            .unwrap_or(false)
+    }
+
     #[test]
     fn validated_target_accepts_only_http_and_returns_the_parsed_url() {
         for raw in [
@@ -1007,17 +1037,34 @@ mod tests {
         // Scheme-less targets are normalized to http and stay http.
         assert_eq!(
             validated_target("mcp.example.com:8080").unwrap(),
-            "http://mcp.example.com:8080/"
+            "http://mcp.example.com:8080"
         );
-        // The forgery guard still applies to the parsed URL.
-        assert!(validated_target("http://127.0.0.1:3000/").is_err());
+        // The forgery guard still applies to the parsed URL, including IPv4
+        // written in IPv6 form, unique-local IPv6 and CGNAT.
+        for raw in [
+            "http://127.0.0.1:3000/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://[::ffff:127.0.0.1]:3000/",
+            "http://[fd00::1]/",
+            "http://100.64.1.1/",
+        ] {
+            assert!(
+                matches!(validated_target(raw), Err(TargetError::Forbidden(_))),
+                "should forbid {raw}"
+            );
+        }
+        // A caller's http(s) URL comes back unchanged.
+        assert_eq!(
+            validated_target("https://mcp.example.com").unwrap(),
+            "https://mcp.example.com"
+        );
         // The private-address guard alone accepts this form (it reads the
         // command as userinfo and checks host example.com), which is why the
         // scheme check above has to run on every target.
-        assert!(
-            reject_forbidden_target_with("stdio://bash:-c:touch${IFS}x;@example.com", false)
-                .is_ok()
-        );
+        assert!(forbidden_check(
+            "stdio://bash:-c:touch${IFS}x;@example.com",
+            false
+        ));
     }
 
     #[test]
@@ -1032,7 +1079,7 @@ mod tests {
         validate_scan_targets(&mut req).unwrap();
         assert_eq!(
             req.reference_url.as_deref(),
-            Some("https://ref.example.com/")
+            Some("https://ref.example.com")
         );
     }
 
@@ -1041,8 +1088,11 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"secreT"));
         assert!(!constant_time_eq(b"secret", b"secret2"));
-        assert!(is_loopback_host("127.0.0.1"));
+        for host in ["127.0.0.1", "127.0.0.2", "::1", "[::1]", "localhost"] {
+            assert!(is_loopback_host(host), "{host}");
+        }
         assert!(!is_loopback_host("0.0.0.0"));
+        assert_eq!(bare_host("[::1]"), "::1");
     }
     // Note: StatusCode is used in the validation logic but not in tests
 
@@ -1055,7 +1105,7 @@ mod tests {
 
     #[test]
     fn test_forbidden_targets_are_rejected() {
-        let denied = |url: &str| reject_forbidden_target_with(url, false).is_err();
+        let denied = |url: &str| !forbidden_check(url, false);
 
         // Cloud metadata, the canonical request-forgery target.
         assert!(denied("http://169.254.169.254/latest/meta-data"));
@@ -1071,18 +1121,18 @@ mod tests {
         assert!(denied("127.0.0.1:3000"));
 
         // Ordinary public targets still scan.
-        assert!(reject_forbidden_target_with("https://mcp.example.com/v1", false).is_ok());
-        assert!(reject_forbidden_target_with("mcp.example.com", false).is_ok());
+        assert!(forbidden_check("https://mcp.example.com/v1", false));
+        assert!(forbidden_check("mcp.example.com", false));
     }
 
     #[test]
     fn test_private_targets_allowed_when_explicitly_opted_in() {
         // Operators who mean to scan internal servers can opt in. Exercised
         // through the pure form so the test mutates no process-global state.
-        assert!(reject_forbidden_target_with("http://10.0.0.5/mcp", true).is_ok());
-        assert!(reject_forbidden_target_with("http://169.254.169.254/", true).is_ok());
+        assert!(forbidden_check("http://10.0.0.5/mcp", true));
+        assert!(forbidden_check("http://169.254.169.254/", true));
         // ...and the same targets are still refused by default.
-        assert!(reject_forbidden_target_with("http://10.0.0.5/mcp", false).is_err());
+        assert!(!forbidden_check("http://10.0.0.5/mcp", false));
     }
 
     #[test]
