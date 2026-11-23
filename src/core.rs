@@ -545,6 +545,13 @@ impl MCPScannerCore {
         url: &str,
         auth_headers: &Option<HashMap<String, String>>,
     ) -> Result<Vec<MCPTool>> {
+        // A reference server is always a remote MCP endpoint; never let this
+        // path reach the scanner's local-process handling.
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(anyhow::anyhow!(
+                "Reference URL must be http or https: {url}"
+            ));
+        }
         let scan_options = ScanOptions {
             timeout: 30,
             http_timeout: 30,

@@ -39,12 +39,21 @@ The enhanced scan API includes intelligent change detection that automatically t
 Start Ramparts as a REST API server for continuous monitoring and integration with other systems:
 
 ```bash
-# Start server on default port 3000
+# Start server on 127.0.0.1:3000 (loopback only)
 ramparts server
 
-# Start server on custom port and host
-ramparts server --port 8080 --host 0.0.0.0
+# Expose it on all interfaces: always set a token when you do
+RAMPARTS_API_TOKEN=change-me ramparts server --port 8080 --host 0.0.0.0
 ```
+
+| Setting | Default | Effect |
+|---|---|---|
+| `--host` | `127.0.0.1` | Bind address. Use `0.0.0.0` only together with `RAMPARTS_API_TOKEN` or an authenticating proxy. |
+| `RAMPARTS_API_TOKEN` | unset | When set, every `/v1/ramparts/*` endpoint except `/v1/ramparts/health` requires `Authorization: Bearer <token>`. |
+| `RAMPARTS_CORS_ORIGINS` | unset (no CORS) | Comma-separated origins allowed to call the API from a browser, or `*`. |
+| `RAMPARTS_ALLOW_PRIVATE_TARGETS` | unset | Set to `1` to allow scanning loopback / private-network targets. |
+
+Scan targets (`url`, `urls`, `reference_url`) must be `http` or `https` URLs.
 
 Once started, the server provides a REST API with the following endpoints:
 

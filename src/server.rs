@@ -4,9 +4,10 @@ use crate::core::{
     RegisterServerResponse, ScanRequest, ScanResponse, ValidationResponse,
 };
 use axum::{
-    extract::State,
-    http::{HeaderMap, Method, StatusCode},
-    response::Json,
+    extract::{Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, Instant};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 
@@ -36,9 +37,116 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             port: 3000,
-            host: "0.0.0.0".to_string(),
+            host: "127.0.0.1".to_string(),
         }
     }
+}
+
+/// Validate a caller-supplied scan target and return the URL to scan.
+///
+/// Every server-mode URL field goes through here. Only `http`/`https` targets
+/// are accepted, and the caller receives the parsed, re-serialized URL, so the
+/// string handed to the scanner is exactly the one that was validated (the
+/// scanner treats other schemes, such as local-process targets, specially).
+fn validated_target(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let parsed = url::Url::parse(&candidate).map_err(|e| format!("Invalid URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Only HTTP and HTTPS URLs are supported".to_string());
+    }
+    let normalized = parsed.to_string();
+    reject_forbidden_target(&normalized)?;
+    Ok(normalized)
+}
+
+fn bad_target(status: StatusCode, reason: String) -> (StatusCode, Json<Value>) {
+    (
+        status,
+        Json(json!({
+            "success": false,
+            "error": reason,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        })),
+    )
+}
+
+/// Validate `url` and `reference_url` of a scan request in place.
+fn validate_scan_targets(request: &mut ScanRequest) -> Result<(), (StatusCode, Json<Value>)> {
+    let status = |reason: &str| {
+        if reason.starts_with("Refusing") {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::BAD_REQUEST
+        }
+    };
+    if !request.url.is_empty() {
+        request.url = validated_target(&request.url).map_err(|r| bad_target(status(&r), r))?;
+    }
+    if let Some(reference) = request.reference_url.as_mut() {
+        *reference = validated_target(reference).map_err(|r| bad_target(status(&r), r))?;
+    }
+    Ok(())
+}
+
+/// Bearer-token check for `/v1/ramparts/*` when `RAMPARTS_API_TOKEN` is set.
+/// Unset keeps the API open, which is only appropriate on a loopback bind or
+/// behind an authenticating proxy.
+async fn require_token(token: Option<Arc<str>>, request: Request, next: Next) -> Response {
+    let Some(token) = token else {
+        return next.run(request).await;
+    };
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if presented.is_some_and(|p| constant_time_eq(p.as_bytes(), token.as_bytes())) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "success": false, "error": "Missing or invalid bearer token" })),
+        )
+            .into_response()
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// CORS is off unless `RAMPARTS_CORS_ORIGINS` lists allowed origins
+/// (comma-separated, or `*`).
+fn cors_layer() -> Option<CorsLayer> {
+    let raw = std::env::var("RAMPARTS_CORS_ORIGINS").ok()?;
+    let origins = raw.trim();
+    if origins.is_empty() {
+        return None;
+    }
+    let allow = if origins == "*" {
+        AllowOrigin::from(Any)
+    } else {
+        AllowOrigin::list(
+            origins
+                .split(',')
+                .filter_map(|o| HeaderValue::from_str(o.trim()).ok()),
+        )
+    };
+    Some(
+        CorsLayer::new()
+            .allow_origin(allow)
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+    )
 }
 
 /// Reject scan targets that resolve to the host itself or to private networks.
@@ -146,22 +254,22 @@ impl MCPScannerServer {
             rate_limiter: Arc::new(RwLock::new(HashMap::new())),
         };
 
-        // Configure CORS
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-            .allow_headers(Any);
+        let token: Option<Arc<str>> = std::env::var("RAMPARTS_API_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .map(Into::into);
+        if token.is_none() && !is_loopback_host(&self.config.host) {
+            warn!(
+                "RAMPARTS_API_TOKEN is not set and the server binds {}: the API is \
+                 unauthenticated. Set a token or bind 127.0.0.1.",
+                self.config.host
+            );
+        }
 
-        // Create router with routes
-        let app = Router::new()
-            // Root-level k8s probe endpoints (platform convention).
-            // Dependency-free so the pod reports ready as soon as the
-            // listener is up.
-            .route("/health", get(probe_ok))
-            .route("/healthz", get(probe_ok))
-            .route("/livez", get(probe_ok))
+        // Probes and health stay open; every other API route needs the
+        // bearer token when one is configured.
+        let api = Router::new()
             .route("/v1/ramparts/", get(api_docs))
-            .route("/v1/ramparts/health", get(health_check))
             .route("/v1/ramparts/protocol", get(protocol_info))
             .route("/v1/ramparts/scan", post(scan_endpoint))
             .route("/v1/ramparts/analyze", post(analyze_endpoint))
@@ -177,9 +285,24 @@ impl MCPScannerServer {
                 post(unregister_server_endpoint),
             )
             .route("/v1/ramparts/list-servers", get(list_servers_endpoint))
-            .layer(cors)
-            .layer(TraceLayer::new_for_http())
-            .with_state(state);
+            .route_layer(middleware::from_fn(move |req, next| {
+                require_token(token.clone(), req, next)
+            }));
+
+        let app = Router::new()
+            // Root-level k8s probe endpoints (platform convention).
+            // Dependency-free so the pod reports ready as soon as the
+            // listener is up.
+            .route("/health", get(probe_ok))
+            .route("/healthz", get(probe_ok))
+            .route("/livez", get(probe_ok))
+            .route("/v1/ramparts/health", get(health_check))
+            .merge(api);
+        let app = match cors_layer() {
+            Some(cors) => app.layer(cors),
+            None => app,
+        };
+        let app = app.layer(TraceLayer::new_for_http()).with_state(state);
 
         let addr = format!("{}:{}", self.config.host, self.config.port);
         info!("Starting MCP Scanner Server on http://{addr}");
@@ -435,31 +558,9 @@ async fn scan_endpoint(
         ));
     }
 
-    // Validate URL format - only HTTP/HTTPS supported with rmcp
-    if !request.url.contains("://") {
-        // Allow URLs without scheme - they'll be normalized to http://
-    } else if !request.url.starts_with("http://") && !request.url.starts_with("https://") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "success": false,
-                "error": "Only HTTP and HTTPS URLs are supported",
-                "timestamp": chrono::Utc::now().to_rfc3339()
-            })),
-        ));
-    }
-
-    // Block request-forgery targets before the scanner fetches anything.
-    if let Err(reason) = reject_forbidden_target(&request.url) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "error": reason,
-                "timestamp": chrono::Utc::now().to_rfc3339()
-            })),
-        ));
-    }
+    // One validator for every target the scanner will fetch: http/https
+    // only, no private targets, and the scanner gets the validated form.
+    validate_scan_targets(&mut request)?;
 
     // Validate timeout values
     if let Some(timeout) = request.timeout {
@@ -635,18 +736,20 @@ async fn batch_scan_endpoint(
         ));
     }
 
-    // Apply the forgery guard to every target, not just the first.
-    for url in &request.urls {
-        if let Err(reason) = reject_forbidden_target(url) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "success": false,
-                    "error": reason,
-                    "timestamp": chrono::Utc::now().to_rfc3339()
-                })),
-            ));
-        }
+    // Validate every target (and the shared reference URL) the same way
+    // /scan does; the scanner receives the validated, normalized URLs.
+    for url in request.urls.iter_mut() {
+        *url = validated_target(url).map_err(|reason| {
+            let status = if reason.starts_with("Refusing") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            bad_target(status, reason)
+        })?;
+    }
+    if let Some(options) = request.options.as_mut() {
+        validate_scan_targets(options)?;
     }
 
     if check_rate_limit(&state, &request.urls).await.is_err() {
@@ -883,13 +986,71 @@ async fn check_rate_limit(state: &ServerState, urls: &[String]) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validated_target_accepts_only_http_and_returns_the_parsed_url() {
+        for raw in [
+            "stdio://bash:-c:touch${IFS}marker;@example.com",
+            "stdio://sh@example.com",
+            "stdio:bash:-c:id",
+            "stdio:///usr/bin/id",
+            "STDIO://bash:-c:id;@example.com",
+            "file:///etc/passwd",
+            "gopher://example.com/",
+        ] {
+            assert!(validated_target(raw).is_err(), "should reject {raw}");
+        }
+        assert_eq!(
+            validated_target("https://mcp.example.com/sse").unwrap(),
+            "https://mcp.example.com/sse"
+        );
+        // Scheme-less targets are normalized to http and stay http.
+        assert_eq!(
+            validated_target("mcp.example.com:8080").unwrap(),
+            "http://mcp.example.com:8080/"
+        );
+        // The forgery guard still applies to the parsed URL.
+        assert!(validated_target("http://127.0.0.1:3000/").is_err());
+        // The private-address guard alone accepts this form (it reads the
+        // command as userinfo and checks host example.com), which is why the
+        // scheme check above has to run on every target.
+        assert!(
+            reject_forbidden_target_with("stdio://bash:-c:touch${IFS}x;@example.com", false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn reference_url_is_validated_like_the_target() {
+        let mut req = ScanRequest {
+            url: "https://mcp.example.com/".to_string(),
+            reference_url: Some("stdio://bash:-c:id;@example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(validate_scan_targets(&mut req).is_err());
+        req.reference_url = Some("https://ref.example.com".to_string());
+        validate_scan_targets(&mut req).unwrap();
+        assert_eq!(
+            req.reference_url.as_deref(),
+            Some("https://ref.example.com/")
+        );
+    }
+
+    #[test]
+    fn token_compare_and_loopback_detection() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret2"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(!is_loopback_host("0.0.0.0"));
+    }
     // Note: StatusCode is used in the validation logic but not in tests
 
     #[test]
     fn test_server_config_default() {
         let config = ServerConfig::default();
         assert_eq!(config.port, 3000);
-        assert_eq!(config.host, "0.0.0.0");
+        assert_eq!(config.host, "127.0.0.1");
     }
 
     #[test]

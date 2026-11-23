@@ -489,7 +489,7 @@ ramparts server [OPTIONS]
 ```bash
 Options:
   -p, --port <PORT>               Server port [default: 3000]
-      --host <HOST>               Server host [default: 0.0.0.0]
+      --host <HOST>               Server host [default: 127.0.0.1]
       --config <FILE>             Configuration file path
   -h, --help                      Print help information
 ```
