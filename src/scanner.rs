@@ -1670,6 +1670,39 @@ impl MCPScanner {
         Ok(result)
     }
 
+    /// OSV.dev findings for a stdio server's launch package. Empty when the
+    /// command isn't a package launcher (e.g. `python3 x.py`: local code,
+    /// nothing to look up); `Err` when the lookup itself failed.
+    async fn launch_package_findings(
+        &self,
+        command: &str,
+        args: &[String],
+    ) -> Result<Vec<YaraScanResult>, String> {
+        match crate::osv::parse_package_spec_from_command(command, args) {
+            Some(spec) => {
+                debug!("OSV lookup for {}/{}", spec.ecosystem, spec.name);
+                crate::osv::check_osv(self.client.clone(), spec).await
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Result for a stdio server that was not started because its launch
+    /// package is listed as malicious or couldn't be checked. The one place
+    /// that shapes a not-started result, so both reasons stay consistent.
+    fn not_started_result(
+        display_url: String,
+        findings: Vec<YaraScanResult>,
+        reason: String,
+        elapsed_ms: u64,
+    ) -> ScanResult {
+        let mut result = ScanResult::new(display_url);
+        result.yara_results = findings;
+        result.response_time_ms = elapsed_ms;
+        result.add_error(format!("Server not started: {reason}"));
+        result
+    }
+
     /// Scan a STDIO MCP server using subprocess transport
     async fn scan_stdio_server(
         &self,
@@ -1689,17 +1722,38 @@ impl MCPScanner {
 
         let mut result = ScanResult::new(display_url.clone());
 
-        // Kick off a parallel OSV.dev lookup for this server's launch package
-        // (e.g. `npx -y @scope/pkg@1.2.3` -> npm:@scope/pkg@1.2.3). We don't
-        // wait on it inline — the future is awaited after the scan body so
-        // the OSV roundtrip overlaps with the actual MCP handshake + tool
-        // enumeration. Returns an empty Vec when no recognizable package
-        // spec can be parsed from the command (e.g. raw `python3 script.py`).
-        let osv_findings_future =
-            crate::osv::parse_package_spec_from_command(command, args).map(|spec| {
-                debug!("Launching OSV lookup for {}/{}", spec.ecosystem, spec.name);
-                crate::osv::query_osv(self.client.clone(), spec)
-            });
+        // Check the launch package (e.g. `npx -y @scope/pkg@1.2.3` ->
+        // npm:@scope/pkg@1.2.3) against OSV.dev *before* starting anything:
+        // starting a stdio server runs its code, so a package listed as
+        // malicious must never be launched just to scan it.
+        let osv_findings = match self.launch_package_findings(command, args).await {
+            Ok(findings) => findings,
+            // Fail closed: no verdict, no launch.
+            Err(e) => {
+                return Ok(Self::not_started_result(
+                    display_url,
+                    Vec::new(),
+                    format!("its launch package could not be checked ({e})"),
+                    scan_timer.elapsed_ms(),
+                ));
+            }
+        };
+        let malicious: Vec<String> = osv_findings
+            .iter()
+            .filter(|f| crate::osv::is_malicious_finding(f))
+            .map(|f| f.target_name.clone())
+            .collect();
+        if !malicious.is_empty() {
+            return Ok(Self::not_started_result(
+                display_url,
+                osv_findings,
+                format!(
+                    "launch package {} is listed as malicious",
+                    malicious.join(", ")
+                ),
+                scan_timer.elapsed_ms(),
+            ));
+        }
 
         // Wrap the entire connect-and-scan pipeline in `options.timeout` so a
         // hung subprocess (no MCP handshake response, deadlocked tool, etc.)
@@ -1726,14 +1780,9 @@ impl MCPScanner {
         })
         .await;
 
-        // Drain the OSV future (no-op if no spec was parseable). Findings
-        // append to result.yara_results regardless of whether the main scan
-        // succeeded — supply-chain risks are real even if the server is
-        // unreachable right now.
-        let osv_findings = match osv_findings_future {
-            Some(fut) => fut.await,
-            None => Vec::new(),
-        };
+        // OSV findings append to result.yara_results regardless of whether
+        // the main scan succeeded: supply-chain risks are real even if the
+        // server is unreachable right now.
 
         match scan_result {
             Ok((session, mut scan_data)) => {
@@ -3723,5 +3772,26 @@ mod tests {
         // Post-scan rules should be empty for now
         assert!(stats.post_scan_rules.is_empty());
         println!("Post-scan rules: {:?}", stats.post_scan_rules);
+    }
+
+    #[test]
+    fn malicious_launch_package_is_reported_not_started() {
+        let finding: YaraScanResult = serde_json::from_value(serde_json::json!({
+            "target_type": "dependency",
+            "target_name": "npm/evil@?",
+            "rule_name": "MaliciousDependency",
+            "context": ""
+        }))
+        .unwrap();
+        let result = MCPScanner::not_started_result(
+            "stdio:npx evil".to_string(),
+            vec![finding],
+            "launch package npm/evil@? is listed as malicious".to_string(),
+            7,
+        );
+        assert!(matches!(result.status, ScanStatus::Failed(_)));
+        assert!(result.errors[0].starts_with("Server not started: launch package npm/evil@?"));
+        assert_eq!(result.response_time_ms, 7);
+        assert_eq!(result.yara_results.len(), 1);
     }
 }

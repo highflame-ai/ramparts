@@ -96,6 +96,12 @@ ramparts scan-config --report
 ramparts scan-config --root ./ide-configs
 ```
 
+Before starting a stdio server (`npx`, `uvx`, …), `scan-config` checks its
+launch package against [OSV.dev](https://osv.dev). A package with a
+malicious-package record is reported and never started. If the check can't
+complete, the server isn't started either. Set `RAMPARTS_OSV_URL` (https) to
+use an OSV mirror or proxy instead of the public `api.osv.dev` endpoint.
+
 `scan-config` also audits the rest of each agent config file, not just its
 MCP servers. It covers committed project files like `.claude/settings.json`,
 `.cursor/hooks.json`, `.gemini/settings.json` and `.vscode/tasks.json`:
