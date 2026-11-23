@@ -62,15 +62,20 @@ pub struct RampartsMcpServer {
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     core: Arc<MCPScannerCore>,
+    /// Served over a network transport (streamable HTTP / SSE) rather than
+    /// stdio: callers may be remote, so private targets are refused and
+    /// scan-config (which starts the host's configured servers) is off.
+    network: bool,
 }
 
 #[tool_router]
 impl RampartsMcpServer {
-    pub fn new() -> Self {
+    pub fn new(network: bool) -> Self {
         let core = MCPScannerCore::new().expect("core init");
         Self {
             tool_router: Self::tool_router(),
             core: Arc::new(core),
+            network,
         }
     }
 
@@ -80,8 +85,13 @@ impl RampartsMcpServer {
     )]
     async fn scan(&self, params: Parameters<ScanParams>) -> Result<CallToolResult, ErrorData> {
         let p = params.0;
+        // http(s) MCP endpoints only: other schemes make the scanner start
+        // a local process, which a tool caller (an agent, or a remote client)
+        // must not be able to request.
+        let url = crate::server::http_target(&p.url, self.network)
+            .map_err(|e| ErrorData::invalid_params(e.message().to_string(), None))?;
         let request = ScanRequest {
-            url: p.url,
+            url,
             timeout: p.timeout,
             http_timeout: p.http_timeout,
             detailed: Some(p.detailed),
@@ -113,6 +123,14 @@ impl RampartsMcpServer {
         &self,
         params: Parameters<ScanConfigParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if self.network {
+            return Err(ErrorData::invalid_request(
+                "scan-config is only available over the stdio transport: it starts the \
+                 MCP servers configured on this host"
+                    .to_string(),
+                None,
+            ));
+        }
         let p = params.0;
         let mut builder = ScanConfigBuilder::new();
         if let Some(d) = p.detailed {
@@ -157,7 +175,7 @@ impl rmcp::ServerHandler for RampartsMcpServer {
 
 /// Run the MCP server over stdio transport.
 pub async fn run_stdio_server() -> Result<(), Box<dyn std::error::Error>> {
-    let handler = RampartsMcpServer::new();
+    let handler = RampartsMcpServer::new(false);
     let service = handler.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -181,15 +199,45 @@ pub async fn run_streamable_http_server(
     use axum::Router;
     use tower::ServiceBuilder;
 
-    let bind: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+    let bare = crate::server::bare_host(host);
+    let bind: std::net::SocketAddr = match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port),
+        Err(_) => tokio::net::lookup_host((bare, port))
+            .await?
+            .next()
+            .ok_or("could not resolve --host")?,
+    };
+
+    // Callers may be remote: scans must not reach this host or private
+    // networks (URL, DNS answers and redirects).
+    if std::env::var("RAMPARTS_ALLOW_PRIVATE_TARGETS").is_ok_and(|v| v == "1") {
+        tracing::warn!("RAMPARTS_ALLOW_PRIVATE_TARGETS=1: MCP scans may reach private networks");
+    } else {
+        crate::net_policy::block_private_targets();
+    }
+    let token: Option<Arc<str>> = std::env::var("RAMPARTS_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(Into::into);
+    if token.is_none() && !crate::server::is_loopback_host(host) {
+        tracing::warn!(
+            "RAMPARTS_API_TOKEN is not set and the MCP server binds {host}: it is \
+             unauthenticated. Set a token or bind 127.0.0.1."
+        );
+    }
+
     let service: StreamableHttpService<RampartsMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
-            || Ok(RampartsMcpServer::new()),
+            || Ok(RampartsMcpServer::new(true)),
             std::sync::Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default(),
         );
 
-    let app = Router::new().route("/", any_service(ServiceBuilder::new().service(service)));
+    let app = Router::new()
+        .route("/", any_service(ServiceBuilder::new().service(service)))
+        .route_layer(axum::middleware::from_fn(move |req, next| {
+            crate::server::require_token(token.clone(), req, next)
+        }));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
     Ok(())

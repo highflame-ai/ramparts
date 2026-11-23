@@ -28,6 +28,10 @@ ramparts init-config
 ramparts mcp-stdio
 ramparts mcp-http  [--host HOST] [--port PORT]
 ramparts mcp-sse   [--host HOST] [--port PORT]   # alias of mcp-http (rmcp 1.x folds SSE into streamable HTTP)
+# mcp-http / mcp-sse bind 127.0.0.1 by default. Exposing them (--host 0.0.0.0)
+# should go with RAMPARTS_API_TOKEN (bearer token). Over these network
+# transports the `scan` tool refuses private targets and `scan-config` is off;
+# over any transport `scan` accepts only http(s) URLs.
 
 # Show help
 ramparts --help

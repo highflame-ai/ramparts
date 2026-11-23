@@ -45,12 +45,18 @@ impl Default for ServerConfig {
 /// Why a scan target was refused: a malformed or non-http(s) URL (400), or
 /// a forbidden destination (403).
 #[derive(Debug)]
-enum TargetError {
+pub(crate) enum TargetError {
     Invalid(String),
     Forbidden(String),
 }
 
 impl TargetError {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            TargetError::Invalid(r) | TargetError::Forbidden(r) => r,
+        }
+    }
+
     fn into_response(self) -> (StatusCode, Json<Value>) {
         let (status, reason) = match self {
             TargetError::Invalid(r) => (StatusCode::BAD_REQUEST, r),
@@ -76,6 +82,13 @@ impl TargetError {
 /// results; the scanner's HTTP stack parses it with the same URL parser
 /// that validated it. Scheme-less input is returned with `http://` added.
 fn validated_target(raw: &str) -> Result<String, TargetError> {
+    http_target(raw, true)
+}
+
+/// `validated_target`, with the private-address check optional: off for a
+/// local caller (the MCP stdio transport, scanning the user's own dev
+/// servers), on for anything reachable over the network.
+pub(crate) fn http_target(raw: &str, block_private: bool) -> Result<String, TargetError> {
     let raw = raw.trim();
     let candidate = if raw.contains("://") {
         raw.to_string()
@@ -89,7 +102,9 @@ fn validated_target(raw: &str) -> Result<String, TargetError> {
             "Only HTTP and HTTPS URLs are supported".to_string(),
         ));
     }
-    reject_forbidden_target(&parsed)?;
+    if block_private {
+        reject_forbidden_target(&parsed)?;
+    }
     if candidate.starts_with("http://") || candidate.starts_with("https://") {
         Ok(candidate)
     } else {
@@ -112,7 +127,11 @@ fn validate_scan_targets(request: &mut ScanRequest) -> Result<(), (StatusCode, J
 /// Unset keeps the API open, which is only appropriate on a loopback bind or
 /// behind an authenticating proxy. The scheme name is case-insensitive
 /// (RFC 7235).
-async fn require_token(token: Option<Arc<str>>, request: Request, next: Next) -> Response {
+pub(crate) async fn require_token(
+    token: Option<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let Some(token) = token else {
         return next.run(request).await;
     };
@@ -135,13 +154,13 @@ async fn require_token(token: Option<Arc<str>>, request: Request, next: Next) ->
 }
 
 /// `host` without IPv6 brackets (`[::1]` -> `::1`).
-fn bare_host(host: &str) -> &str {
+pub(crate) fn bare_host(host: &str) -> &str {
     host.strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host)
 }
 
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let host = bare_host(host);
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -1065,6 +1084,18 @@ mod tests {
             "stdio://bash:-c:touch${IFS}x;@example.com",
             false
         ));
+    }
+
+    #[test]
+    fn http_target_private_check_is_optional_but_scheme_check_is_not() {
+        // Local (MCP stdio) callers may scan their own dev servers...
+        assert!(http_target("http://127.0.0.1:3000/mcp", false).is_ok());
+        // ...network callers may not.
+        assert!(http_target("http://127.0.0.1:3000/mcp", true).is_err());
+        // Nobody gets a local-process target.
+        for raw in ["stdio:bash:-c:id", "stdio://bash:-c:id;@example.com"] {
+            assert!(http_target(raw, false).is_err(), "{raw}");
+        }
     }
 
     #[test]
