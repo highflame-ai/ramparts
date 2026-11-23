@@ -133,6 +133,16 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
         "MCPToolChanged" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP10")],
         "SkillContentChanged" => vec![OwaspTag::new("MCP10")],
         "AgentIdentityFileWrite" => vec![OwaspTag::new("MCP03"), OwaspTag::new("MCP09")],
+        // agent_config_risk.yar + src/agent_config.rs — agent config files
+        // (hooks, helper commands, guardrail settings).
+        "AgentHookRemoteExec" => vec![OwaspTag::new("MCP07"), OwaspTag::new("MCP10")],
+        "AgentConfigTamper" => vec![OwaspTag::new("MCP03"), OwaspTag::new("MCP10")],
+        "LLMBaseUrlOverride" | "AgentTrafficInterception" => {
+            vec![OwaspTag::new("MCP06"), OwaspTag::new("MCP09")]
+        }
+        "AutoApprovedProjectMcpServers" | "WildcardAgentPermission" => {
+            vec![OwaspTag::new("MCP03")]
+        }
         "ExternalReferenceInventory" => vec![OwaspTag::new("MCP10")],
         "UndeclaredNetworkEgress" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP09")],
         // ScanCoverageIncomplete is a scanner-integrity meta-finding, not an
@@ -324,6 +334,10 @@ pub fn ast_tags_for_rule(rule_name: &str) -> Vec<OwaspTag> {
             vec![OwaspTag::ast("AST03")]
         }
         "AgentIdentityFileWrite" => vec![OwaspTag::ast("AST01"), OwaspTag::ast("AST03")],
+        "AgentHookRemoteExec" | "AgentConfigTamper" => vec![OwaspTag::ast("AST01")],
+        "AutoApprovedProjectMcpServers" | "WildcardAgentPermission" => {
+            vec![OwaspTag::ast("AST03")]
+        }
         "PrivilegeEscalationTools" => vec![OwaspTag::ast("AST01"), OwaspTag::ast("AST03")],
 
         // AST04 — Insecure Metadata: deceptive/invalid manifests,
@@ -410,6 +424,12 @@ mod tests {
             "SQLInjection",
             "PathTraversalVulnerability",
             "MCPConfigRisk",
+            "AgentHookRemoteExec",
+            "AgentConfigTamper",
+            "LLMBaseUrlOverride",
+            "AgentTrafficInterception",
+            "AutoApprovedProjectMcpServers",
+            "WildcardAgentPermission",
             "CrossOriginEscalation",
             "CrossDomainContamination",
             "DomainOutlier",
