@@ -76,7 +76,12 @@ rule SkillSystemManipulation
         $loader_preload = /\b(export\s+)?LD_PRELOAD=\/[a-z]/i
 
         // === Process-table manipulation ===
-        $proc_killall = /\b(killall|pkill)\s+-9\s+(sshd|systemd|init|dbus|launchd|gnome-shell|Xorg|wayland)\b/i
+        // Anti-forensics: wiping shell history is only a signal when the
+        // skill also says to do it without the user noticing.
+        $history_wipe = /\b(history\s+-c\b|rm\s+[^;\n]*\.(bash|zsh)_history\b|Clear-History\b|unset\s+HISTFILE\b)/
+        $unattended   = /\b(silently|without\s+(asking|telling|confirmation|prompting|notifying)|do\s+not\s+(ask|tell|notify|prompt))\b/i
+
+        $proc_killall =/\b(killall|pkill)\s+-9\s+(sshd|systemd|init|dbus|launchd|gnome-shell|Xorg|wayland)\b/i
 
         // === Exclusion: routine build / dev-environment cleanup ===
         //
@@ -115,6 +120,7 @@ rule SkillSystemManipulation
             $path_hijack_cwd or
             $path_hijack_unset or
             $loader_preload or
-            $proc_killall
+            $proc_killall or
+            ($history_wipe and $unattended)
         )
 }

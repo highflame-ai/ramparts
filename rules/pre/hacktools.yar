@@ -55,7 +55,7 @@ rule NetworkReconnaissance
 
     strings:
         // nmap is a legitimate scanner, not solely offensive — recon, not hack-tool.
-        $nmap_scan  = /nmap\s+-[sSUAOPpT]/ nocase
+        $nmap_scan  = /\bnmap\s+-[sSUAOPpT]/ nocase
         $port_scan  = /for\s+.*\s+in\s+range\s*\(\s*\d+\s*,\s*\d{4,}\s*\).*connect/ nocase
         $masscan    = /masscan\s+.*-p/ nocase
         $arp_scan   = /arp-scan\s+--/ nocase
@@ -109,7 +109,7 @@ rule ExploitFramework
         $beef_hook     = /hook\.js.*BeEF/ nocase
         $set_toolkit   = /(setoolkit|Social-Engineer)/ nocase
         $pwntools      = /from\s+pwn\s+import/ nocase
-        $rop_chain     = /ROP\s*\(.*elf\)/ nocase
+        $rop_chain     = /\bROP\s*\(.*elf\)/ nocase
         $shellcode_gen = /shellcode.*\\x[0-9a-f]{2}\\x[0-9a-f]{2}\\x[0-9a-f]{2}/ nocase
 
     condition:
