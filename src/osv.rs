@@ -335,6 +335,8 @@ struct OsvRange {
 #[derive(Debug, Deserialize)]
 struct OsvRangeEvent {
     #[serde(default)]
+    introduced: Option<String>,
+    #[serde(default)]
     fixed: Option<String>,
     #[serde(default)]
     last_affected: Option<String>,
@@ -410,18 +412,31 @@ fn is_malicious_id(id: &str) -> bool {
 }
 
 /// True only when the record names affected ranges and every one of them
-/// ends at a `fixed` version, so releases after it are known clean. An
-/// entry with no ranges (a bare version list), an open range or a
-/// `last_affected` bound is false: the newest release may be affected.
+/// ends closed: walking its events in order (OSV sorts them), the last
+/// `introduced` is followed by a `fixed`. A re-introduced range
+/// (`introduced 1.0, fixed 1.1, introduced 2.0`), a `last_affected` bound,
+/// or an entry with no ranges (a bare version list) is false: the newest
+/// release may be affected.
 fn all_ranges_fixed(affected: &[OsvAffected]) -> bool {
+    let range_closed = |r: &OsvRange| {
+        let mut open = false;
+        for e in &r.events {
+            if e.last_affected.is_some() {
+                return false;
+            }
+            if e.introduced.is_some() {
+                open = true;
+            }
+            if e.fixed.is_some() {
+                open = false;
+            }
+        }
+        !open && !r.events.is_empty()
+    };
     !affected.is_empty()
-        && affected.iter().all(|a| {
-            !a.ranges.is_empty()
-                && a.ranges.iter().all(|r| {
-                    r.events.iter().any(|e| e.fixed.is_some())
-                        && r.events.iter().all(|e| e.last_affected.is_none())
-                })
-        })
+        && affected
+            .iter()
+            .all(|a| !a.ranges.is_empty() && a.ranges.iter().all(range_closed))
 }
 
 /// True for an OSV finding that marks the package itself as malware.
@@ -776,6 +791,10 @@ mod tests {
             serde_json::json!([{ "type": "SEMVER", "events": [{ "introduced": "1.0.0" }, { "last_affected": "1.26.2" }] }])
         ));
         assert!(blocks(serde_json::json!([])));
+        // Re-introduced after a fix: the newest release is affected again.
+        assert!(blocks(serde_json::json!([{ "type": "SEMVER", "events": [
+            { "introduced": "1.0.0" }, { "fixed": "1.1.0" }, { "introduced": "2.0.0" }
+        ] }])));
         let one_release = osv_finding_to_yara_result(
             &unpinned,
             rec(
