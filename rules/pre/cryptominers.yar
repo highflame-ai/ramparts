@@ -119,7 +119,9 @@ rule CryptoCoinjacking
         $coin_imp      = "coin-imp" nocase
         $minero_cc     = "minero.cc" nocase
         $monerominer   = "monerominer" nocase
-        $wasm_miner    = /WebAssembly\.instantiate.*(mine|hash|crypto)/
+        // Bounded, miner-specific terms: any WASM module that hashes
+        // something used to match `.*(hash|crypto)`.
+        $wasm_miner    = /WebAssembly\.instantiate.{0,400}(\b(mine|miner)\b|mining\s*\(|cryptonight|randomx|cn_?hash|hashrate)/ nocase
 
     condition:
         any of them

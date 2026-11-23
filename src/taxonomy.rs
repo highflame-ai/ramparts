@@ -193,10 +193,10 @@ pub fn tags_for_yara_rule(rule_name: &str) -> Vec<OwaspTag> {
 
         // malware.yar — classic malware behavior embedded in skill/tool
         // content (ported from NVIDIA SkillSpector / signature-base).
-        "ReverseShell" | "C2FrameworkIndicators" => {
+        "ReverseShell" | "ReverseShellMultiline" | "C2FrameworkIndicators" => {
             vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP07")]
         }
-        "BackdoorPersistence" | "RansomwareBehavior" => {
+        "BackdoorPersistence" | "RansomwareBehavior" | "RansomwareBehaviorMultiline" => {
             vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP03")]
         }
         "KeyloggerIndicators" => vec![OwaspTag::new("MCP02"), OwaspTag::new("MCP09")],
@@ -285,9 +285,11 @@ pub fn ast_tags_for_rule(rule_name: &str) -> Vec<OwaspTag> {
         | "SkillToolChainingExfiltration"
         | "SkillSystemManipulation"
         | "ReverseShell"
+        | "ReverseShellMultiline"
         | "C2FrameworkIndicators"
         | "BackdoorPersistence"
         | "RansomwareBehavior"
+        | "RansomwareBehaviorMultiline"
         | "KeyloggerIndicators"
         | "InfoStealer"
         | "PHPWebshellGeneric"
@@ -428,9 +430,11 @@ mod tests {
             "CryptoCoinjacking",
             // malware.yar
             "ReverseShell",
+            "ReverseShellMultiline",
             "BackdoorPersistence",
             "KeyloggerIndicators",
             "RansomwareBehavior",
+            "RansomwareBehaviorMultiline",
             "C2FrameworkIndicators",
             "InfoStealer",
             // webshells.yar

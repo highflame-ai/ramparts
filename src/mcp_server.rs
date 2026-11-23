@@ -7,7 +7,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::JsonSchema;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
     transport::{
         io::stdio,
@@ -148,8 +148,8 @@ impl RampartsMcpServer {
 
 #[tool_handler]
 impl rmcp::ServerHandler for RampartsMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Ramparts MCP server - provides scan and scan-config tools for MCP security scanning",
         )
     }

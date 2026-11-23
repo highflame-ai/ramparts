@@ -13,14 +13,6 @@
 # condition under which the ignore should be re-evaluated. Keep this list
 # short — prefer fixing or upgrading whenever a path exists.
 ignore = [
-    # rsa: Marvin Attack — timing side-channel in PKCS#1 v1.5 decryption.
-    # Path: yara-x → rsa (used only to parse X.509 certs in PE/Macho/CRX
-    # YARA modules). Ramparts performs no RSA decryption against
-    # attacker-controlled input, so the timing oracle isn't reachable.
-    # Re-evaluate when the rsa crate ships a constant-time implementation
-    # (tracked for rsa 0.10.x).
-    "RUSTSEC-2023-0071",
-
     # bincode: unmaintained (informational, no CVE).
     # Path: yara-x → bincode (used to serialize compiled rule databases).
     # Ramparts only deserializes repo-supplied rules, never untrusted input.
@@ -28,20 +20,23 @@ ignore = [
     # upstream target).
     "RUSTSEC-2025-0141",
 
-    # wasmtime: Stores can mix up type indices between engines.
-    # Path: yara-x -> wasmtime (used internally by YARA-X for compiled rule
-    # evaluation). Ramparts only compiles and runs bundled rules under
-    # rules/pre/*.yar, never attacker-supplied YARA/WASM, so the required
-    # cross-engine type-index confusion path is not reachable.
-    # Re-evaluate when yara-x depends on a RustSec-patched wasmtime release
-    # (>=46.0.2,<47.0.0 or >=47.0.3) or exposes a feature that removes wasmtime.
-    "RUSTSEC-2026-0222",
-
     # proc-macro-error2: unmaintained (informational, no CVE).
     # Path: clap → clap_derive → proc-macro-error2 (used at compile time
     # only for derive macro diagnostics). No runtime exposure.
     # Re-evaluate when clap drops proc-macro-error2 dependency.
     "RUSTSEC-2026-0173",
+
+    # chrono: unmaintained (informational, no CVE, no successor release).
+    # Path: ramparts / ramparts-common -> chrono (timestamps on scan
+    # results; formatting and serde only, no parsing of untrusted dates).
+    # Re-evaluate when a maintained fork or a jiff/time migration lands.
+    "RUSTSEC-2026-0543",
+
+    # unsafe-libyaml: unmaintained (informational, no CVE).
+    # Path: ramparts / ramparts-common -> serde_yaml -> unsafe-libyaml
+    # (parses the local config.yaml and skill front matter).
+    # Re-evaluate when serde_yaml is replaced (serde_yml / saphyr).
+    "RUSTSEC-2024-0449",
 ]
 
 # Warn for categories of informational advisories
