@@ -10,6 +10,7 @@ name = "ramparts"
 # historical archive.
 version = "0.8.2"
 edition = "2021"
+rust-version = "1.95"
 authors = ["Sharath Rajasekar <sharath@highflame.com>"]
 description = "Security scanner for Model Context Protocol (MCP) servers and AI agent skills (Claude Code commands, agentskills.io bundles, Cursor / Codex / Windsurf / Gemini equivalents)."
 license = "Apache-2.0"
@@ -108,32 +109,12 @@ tower = "0.4"
 
 # JSON-RPC handling for microservice
 jsonrpc-core = "18.0"
-# yara-x is git-pinned to a post-v1.16.0 commit that bumps wasmtime
-# from 43.0.1 to 43.0.2, clearing RUSTSEC-2026-0114 (panic when
-# allocating a table exceeding the host's address space). This does
-# not clear RUSTSEC-2026-0222; keep that advisory documented in
-# .cargo/audit.toml until upstream depends on a patched wasmtime.
-#
-# `version = "1.16.0"` is required for `cargo publish` of the
-# `ramparts` crate — when ramparts is published, `path` and `git`
-# are stripped and only `version` remains in the published
-# tarball. Without it, `cargo publish` errors:
-#   "dependency `yara-x` does not specify a version".
-#
-# Note the divergence this creates:
-#   - Workspace + GitHub-released binaries: use the git pin (clears
-#     RUSTSEC-2026-0114, still affected by RUSTSEC-2026-0222).
-#   - `cargo install ramparts` from crates.io: resolves yara-x to
-#     the crates.io version (1.16.0, has the wasmtime CVE).
-# The CVE's attack vector (oversized table allocation in a WASM
-# module) is essentially unreachable from ramparts because we only
-# load bundled rules under `rules/pre/*.yar`, never user-supplied
-# WASM. Switch back to a clean `version = "1.17"` (no git pin)
-# once yara-x cuts that release.
-yara-x = { git = "https://github.com/VirusTotal/yara-x", rev = "664cdfe66fd40826d160fa7009966d9c8a43cba6", version = "1.16.0", optional = true }
+# yara-x 1.24 depends on wasmtime 48.0.10 and zip 9.8, which carry the
+# RustSec fixes the old git pin was working around.
+yara-x = { version = "1.24", optional = true }
 
 # Official Rust MCP SDK
-rmcp = { version = "3.1", features = [
+rmcp = { version = "3.11", features = [
     "client",
     "server",
     "macros",
