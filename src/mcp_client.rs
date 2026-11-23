@@ -260,21 +260,17 @@ impl McpClient {
             debug!("Creating HTTP client without auth headers");
         }
 
-        // In server mode this drops private DNS answers and re-checks every
-        // redirect hop (see `net_policy`); a no-op otherwise.
-        crate::net_policy::guard(
-            HttpClient::builder()
-                .default_headers(headers)
-                .timeout(std::time::Duration::from_secs(self.http_timeout_secs))
-                .use_preconfigured_tls((*crate::tls::default_tls_config()).clone()),
-        )
-        .build()
-        .map_err(|e| {
-            anyhow!(
-                "Failed to build HTTP client: {}",
-                crate::utils::error_utils::format_error_chain(&e)
-            )
-        })
+        HttpClient::builder()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(self.http_timeout_secs))
+            .use_preconfigured_tls((*crate::tls::default_tls_config()).clone())
+            .build()
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to build HTTP client: {}",
+                    crate::utils::error_utils::format_error_chain(&e)
+                )
+            })
     }
 
     /// Try to connect using streamable HTTP transport

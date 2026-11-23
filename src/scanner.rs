@@ -1346,6 +1346,13 @@ impl MCPScanner {
         // STDIO URLs route through `scan_stdio_url` -> `scan_stdio_server`,
         // which sets `response_time_ms` itself. Don't overwrite it here.
         if url.starts_with("stdio:") {
+            // Network-facing modes never start local processes for a caller,
+            // whatever entry point the target arrived through.
+            if crate::net_policy::remote_mode() {
+                return Err(anyhow!(
+                    "Local-process (stdio:) targets are not accepted in server or MCP HTTP mode"
+                ));
+            }
             return self.scan_stdio_url(url, options).await;
         }
 

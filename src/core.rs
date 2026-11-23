@@ -547,7 +547,8 @@ impl MCPScannerCore {
     ) -> Result<Vec<MCPTool>> {
         // A reference server is always a remote MCP endpoint; never let this
         // path reach the scanner's local-process handling.
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
+        let is_http = url::Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"));
+        if !is_http {
             return Err(anyhow::anyhow!(
                 "Reference URL must be http or https: {url}"
             ));

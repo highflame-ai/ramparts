@@ -30,8 +30,8 @@ ramparts mcp-http  [--host HOST] [--port PORT]
 ramparts mcp-sse   [--host HOST] [--port PORT]   # alias of mcp-http (rmcp 1.x folds SSE into streamable HTTP)
 # mcp-http / mcp-sse bind 127.0.0.1 by default. Exposing them (--host 0.0.0.0)
 # should go with RAMPARTS_API_TOKEN (bearer token). Over these network
-# transports the `scan` tool refuses private targets and `scan-config` is off;
-# over any transport `scan` accepts only http(s) URLs.
+# transports `scan-config` is off; over any transport `scan` accepts only
+# http(s) URLs (private MCP servers are fine; cloud metadata addresses aren't).
 
 # Show help
 ramparts --help
@@ -744,8 +744,8 @@ Ramparts can run as a REST API server for continuous monitoring:
 # Start server (default: localhost:3000)
 ramparts server
 
-# Custom host and port
-ramparts server --port 8080 --host 0.0.0.0
+# Custom host and port (set a token whenever you expose it)
+RAMPARTS_API_TOKEN=change-me ramparts server --port 8080 --host 0.0.0.0
 ```
 
 ### Batch Scanning

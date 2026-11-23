@@ -51,9 +51,9 @@ RAMPARTS_API_TOKEN=change-me ramparts server --port 8080 --host 0.0.0.0
 | `--host` | `127.0.0.1` | Bind address. Use `0.0.0.0` only together with `RAMPARTS_API_TOKEN` or an authenticating proxy. |
 | `RAMPARTS_API_TOKEN` | unset | When set, every `/v1/ramparts/*` endpoint except `/v1/ramparts/health` requires `Authorization: Bearer <token>`. |
 | `RAMPARTS_CORS_ORIGINS` | unset (no CORS) | Comma-separated origins allowed to call the API from a browser, or `*`. |
-| `RAMPARTS_ALLOW_PRIVATE_TARGETS` | unset | Set to `1` to allow scanning loopback / private-network targets. Otherwise private addresses are refused in the URL, in DNS answers and in redirects. |
+| Host check | on for a loopback bind without a token | Requests must be addressed to a loopback host (`localhost`, `127.0.0.1`, `[::1]`), so web pages can't reach the API via DNS rebinding. |
 
-Scan targets (`url`, `urls`, `reference_url`) must be `http` or `https` URLs.
+Scan targets (`url`, `urls`, `reference_url`) must be `http` or `https` URLs. Private and loopback MCP servers can be scanned; cloud metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`) are refused.
 
 Once started, the server provides a REST API with the following endpoints:
 

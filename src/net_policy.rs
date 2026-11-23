@@ -1,138 +1,187 @@
-//! Outbound network policy for scans requested by remote callers (server
-//! mode). A caller-supplied URL must not reach the host itself, private
-//! networks or cloud metadata services. Checking the URL string once is not
-//! enough: a public name can resolve to a private address and a public URL
-//! can redirect to one. So the policy is enforced in three places:
+//! Shared policy for Ramparts' network-facing modes (`ramparts server`,
+//! `ramparts mcp-http` / `mcp-sse`), where scan requests may come from
+//! remote callers.
 //!
-//! - `is_forbidden_ip`: the single definition of "private", used by the
-//!   server's URL check for IP literals;
-//! - `GuardedResolver`: DNS answers with private addresses are dropped
-//!   before the HTTP client connects;
-//! - `redirect_policy`: every redirect hop is re-checked.
-//!
-//! The policy is off by default (the CLI scans whatever the operator points
-//! it at, including internal servers) and switched on by `ramparts server`
-//! unless `RAMPARTS_ALLOW_PRIVATE_TARGETS=1`.
+//! - Private destinations (loopback, RFC 1918) may be scanned: internal MCP
+//!   servers are a normal target. Only cloud metadata addresses are refused,
+//!   since they hand out the host's cloud credentials and are never an MCP
+//!   server.
+//! - Remote mode makes the scanner refuse local-process (`stdio:`) targets
+//!   at its own dispatch, whatever entry point a request came through.
+//! - Startup helpers (token, bind address, Host check) are shared by both
+//!   modes.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-static BLOCK_PRIVATE_TARGETS: AtomicBool = AtomicBool::new(false);
+use axum::{
+    extract::Request,
+    http::{header, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Json, Response},
+};
+use serde_json::json;
+use tracing::warn;
 
-/// Turn the policy on for every HTTP client built from now on.
-pub fn block_private_targets() {
-    BLOCK_PRIVATE_TARGETS.store(true, Ordering::SeqCst);
+static REMOTE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Called by the network-facing modes at startup.
+pub fn enter_remote_mode() {
+    REMOTE_MODE.store(true, Ordering::SeqCst);
 }
 
-pub fn private_targets_blocked() -> bool {
-    BLOCK_PRIVATE_TARGETS.load(Ordering::SeqCst)
+/// True once a network-facing mode has started: scan targets come from
+/// callers who must not be able to start local processes.
+pub fn remote_mode() -> bool {
+    REMOTE_MODE.load(Ordering::SeqCst)
 }
 
-/// Loopback, private, link-local, CGNAT, unspecified and similar addresses,
-/// including IPv4 addresses written in IPv6 form (`::ffff:a.b.c.d`, NAT64
-/// `64:ff9b::a.b.c.d`), which a dual-stack socket connects to over IPv4.
-pub fn is_forbidden_ip(ip: IpAddr) -> bool {
+/// Cloud metadata / link-local addresses (169.254.0.0/16, fe80::/10, AWS's
+/// fd00:ec2::254), including IPv4 written in IPv6 form (mapped, compatible,
+/// NAT64 and 6to4), which a dual-stack socket reaches over IPv4.
+pub fn is_metadata_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => is_forbidden_v4(v4),
+        IpAddr::V4(v4) => v4.is_link_local(),
         IpAddr::V6(v6) => {
             if let Some(v4) = embedded_v4(v6) {
-                return is_forbidden_v4(v4);
+                return v4.is_link_local();
             }
-            let first = v6.segments()[0];
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (first & 0xffc0) == 0xfe80 // link-local fe80::/10
-                || (first & 0xfe00) == 0xfc00 // unique local fc00::/7
-                || v6.is_multicast()
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
         }
     }
 }
 
-fn is_forbidden_v4(v4: Ipv4Addr) -> bool {
-    let [a, b, ..] = v4.octets();
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_broadcast()
-        || v4.is_unspecified()
-        || v4.is_multicast()
-        || a == 0 // 0.0.0.0/8
-        || (a == 100 && (64..128).contains(&b)) // CGNAT 100.64.0.0/10
-        || (a == 198 && (b == 18 || b == 19)) // benchmarking 198.18.0.0/15
-}
-
-/// The IPv4 address inside an IPv4-mapped (`::ffff:0:0/96`) or NAT64
-/// (`64:ff9b::/96`) IPv6 address.
+/// The IPv4 address inside an IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible
+/// (`::a.b.c.d`), NAT64 (`64:ff9b::a.b.c.d`) or 6to4 (`2002:aabb:ccdd::`)
+/// IPv6 address.
 fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(v4) = v6.to_ipv4_mapped() {
         return Some(v4);
     }
     let s = v6.segments();
+    let o = v6.octets();
+    let tail = Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+    if s[..6] == [0, 0, 0, 0, 0, 0] && !v6.is_loopback() && !v6.is_unspecified() {
+        return Some(tail); // IPv4-compatible (deprecated)
+    }
     if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-        let o = v6.octets();
-        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+        return Some(tail); // NAT64
+    }
+    if s[0] == 0x2002 {
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5])); // 6to4
     }
     None
 }
 
-/// DNS resolver that drops private addresses from every answer, so a public
-/// name pointing at `127.0.0.1` or `169.254.169.254` never gets connected to.
-pub struct GuardedResolver;
+/// `host` without IPv6 brackets (`[::1]` -> `::1`).
+pub fn bare_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
 
-impl reqwest::dns::Resolve for GuardedResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
-                .await?
-                .filter(|a| !is_forbidden_ip(a.ip()))
-                .collect();
-            if addrs.is_empty() {
-                return Err(format!(
-                    "{host} resolves only to loopback, private or link-local addresses"
-                )
-                .into());
-            }
-            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = bare_host(host).trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Socket address for `--host` / `--port`, accepting IPv6 with or without
+/// brackets and host names.
+pub async fn resolve_bind(host: &str, port: u16) -> std::io::Result<SocketAddr> {
+    let bare = bare_host(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    tokio::net::lookup_host((bare, port))
+        .await?
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("could not resolve {host}"),
+            )
         })
+}
+
+/// `RAMPARTS_API_TOKEN`, if set. Warns when the listener is reachable beyond
+/// loopback without one.
+pub fn api_token(bind_host: &str, mode: &str) -> Option<Arc<str>> {
+    let token: Option<Arc<str>> = std::env::var("RAMPARTS_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(Into::into);
+    if token.is_none() && !is_loopback_host(bind_host) {
+        warn!(
+            "RAMPARTS_API_TOKEN is not set and {mode} binds {bind_host}: it is \
+             unauthenticated. Set a token or bind 127.0.0.1."
+        );
     }
+    token
 }
 
-/// Redirect policy for guarded clients: follow at most 5 hops, only to
-/// http(s), and never to a private IP literal (names are covered by the
-/// resolver).
-pub fn redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        let url = attempt.url();
-        if attempt.previous().len() >= 5 {
-            return attempt.error("too many redirects");
-        }
-        if !matches!(url.scheme(), "http" | "https") {
-            let msg = format!("refusing redirect to non-http URL {url}");
-            return attempt.error(msg);
-        }
-        let ip = match url.host() {
-            Some(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
-            Some(url::Host::Ipv6(v6)) => Some(IpAddr::V6(v6)),
-            _ => None,
-        };
-        if ip.is_some_and(is_forbidden_ip) {
-            let msg = format!("refusing redirect to private address {url}");
-            return attempt.error(msg);
-        }
-        attempt.follow()
-    })
-}
-
-/// Apply the policy to a client builder when it is switched on.
-pub fn guard(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    if private_targets_blocked() {
-        builder
-            .dns_resolver(GuardedResolver)
-            .redirect(redirect_policy())
+/// Bearer-token check when a token is configured. The scheme name is
+/// case-insensitive (RFC 7235); the token is compared in constant time.
+pub async fn require_token(token: Option<Arc<str>>, request: Request, next: Next) -> Response {
+    let Some(token) = token else {
+        return next.run(request).await;
+    };
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, t)| t.trim());
+    if presented.is_some_and(|p| constant_time_eq(p.as_bytes(), token.as_bytes())) {
+        next.run(request).await
     } else {
-        builder
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "success": false, "error": "Missing or invalid bearer token" })),
+        )
+            .into_response()
     }
+}
+
+/// For a loopback listener without a token: only accept requests addressed
+/// to a loopback host. A web page can't then reach the API by rebinding its
+/// own domain to 127.0.0.1 (the browser sends that domain as Host).
+pub async fn require_loopback_host(request: Request, next: Next) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(strip_port);
+    if host.is_some_and(is_loopback_host) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "error": "Host must be a loopback address; set RAMPARTS_API_TOKEN to serve other hosts"
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// `localhost:3000` -> `localhost`, `[::1]:3000` -> `[::1]`.
+fn strip_port(host: &str) -> &str {
+    if let Some(end) = host.starts_with('[').then(|| host.find(']')).flatten() {
+        return &host[..=end];
+    }
+    match host.rsplit_once(':') {
+        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => host,
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]
@@ -140,97 +189,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn private_ranges_and_embedded_v4_are_forbidden() {
+    fn metadata_addresses_in_every_form() {
+        for ip in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "fe80::1",
+            "fd00:ec2::254",
+            "::ffff:169.254.169.254",
+            "::169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "2002:a9fe:a9fe::",
+        ] {
+            assert!(is_metadata_ip(ip.parse().unwrap()), "should refuse {ip}");
+        }
+        // Private and loopback destinations are allowed.
         for ip in [
             "127.0.0.1",
             "10.1.2.3",
-            "172.16.0.1",
             "192.168.1.1",
-            "169.254.169.254",
-            "100.64.0.1",
-            "100.127.255.254",
-            "0.0.0.0",
-            "0.1.2.3",
             "::1",
-            "::",
-            "fe80::1",
-            "fc00::1",
-            "fd12:3456::1",
-            "::ffff:127.0.0.1",
-            "::ffff:169.254.169.254",
-            "64:ff9b::a9fe:a9fe",
-        ] {
-            assert!(is_forbidden_ip(ip.parse().unwrap()), "should forbid {ip}");
-        }
-        for ip in [
+            "fd12::1",
             "93.184.216.34",
-            "100.128.0.1",
-            "2606:4700::1111",
-            "::ffff:8.8.8.8",
         ] {
-            assert!(!is_forbidden_ip(ip.parse().unwrap()), "should allow {ip}");
+            assert!(!is_metadata_ip(ip.parse().unwrap()), "should allow {ip}");
         }
     }
 
-    #[tokio::test]
-    async fn resolver_drops_private_answers() {
-        use reqwest::dns::Resolve;
-        let err = GuardedResolver
-            .resolve("localhost".parse().unwrap())
-            .await
-            .err()
-            .expect("localhost resolves only to loopback");
-        assert!(err.to_string().contains("loopback"), "{err}");
-    }
-
-    /// A guarded client must not follow a redirect to a private address,
-    /// whether it's an IP literal or a name that resolves to one. (The first
-    /// hop here is a loopback literal, which the server's URL check would
-    /// refuse; it stands in for a public redirector.)
-    #[tokio::test]
-    async fn redirects_to_private_targets_are_not_followed() {
-        use std::io::{Read, Write};
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::Arc;
-
-        let bait = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let bait_port = bait.local_addr().unwrap().port();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let h = hits.clone();
-        bait.set_nonblocking(false).unwrap();
-        std::thread::spawn(move || {
-            for stream in bait.incoming().flatten() {
-                h.fetch_add(1, Ordering::SeqCst);
-                drop(stream);
-            }
-        });
-
-        for target in [
-            format!("http://127.0.0.1:{bait_port}/"),
-            format!("http://127.0.0.1.nip.io:{bait_port}/"),
+    #[test]
+    fn loopback_hosts_ports_and_tokens() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "::1",
+            "[::1]",
+            "localhost",
+            "localhost.",
         ] {
-            let redirector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = redirector.local_addr().unwrap().port();
-            let location = target.clone();
-            std::thread::spawn(move || {
-                if let Ok((mut s, _)) = redirector.accept() {
-                    let mut buf = [0u8; 1024];
-                    let _ = s.read(&mut buf);
-                    let _ = write!(
-                        s,
-                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
-                    );
-                }
-            });
-            let client = reqwest::Client::builder()
-                .dns_resolver(GuardedResolver)
-                .redirect(redirect_policy())
-                .build()
-                .unwrap();
-            let res = client.get(format!("http://127.0.0.1:{port}/")).send().await;
-            assert!(res.is_err(), "redirect to {target} was followed");
+            assert!(is_loopback_host(host), "{host}");
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert_eq!(hits.load(Ordering::SeqCst), 0, "bait was reached");
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("attacker.example"));
+        assert_eq!(strip_port("localhost:3000"), "localhost");
+        assert_eq!(strip_port("[::1]:3000"), "[::1]");
+        assert_eq!(strip_port("127.0.0.1"), "127.0.0.1");
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret2"));
     }
 }

@@ -4,10 +4,10 @@ use crate::core::{
     RegisterServerResponse, ScanRequest, ScanResponse, ValidationResponse,
 };
 use axum::{
-    extract::{Request, State},
+    extract::State,
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
-    middleware::{self, Next},
-    response::{IntoResponse, Json, Response},
+    middleware,
+    response::Json,
     routing::{get, post},
     Router,
 };
@@ -75,20 +75,14 @@ impl TargetError {
 
 /// Validate a caller-supplied scan target and return the URL to scan.
 ///
-/// Every server-mode URL field goes through here. Only `http`/`https` targets
-/// are accepted (the scanner treats other schemes, such as local-process
-/// targets, specially). A target that already starts with `http://` or
+/// Every scan target from a network caller (HTTP API fields, the MCP `scan`
+/// tool) goes through here. Only `http`/`https` targets are accepted (the
+/// scanner treats other schemes, such as local-process targets, specially),
+/// and cloud metadata addresses are refused. Private and loopback MCP
+/// servers are fine. A target that already starts with `http://` or
 /// `https://` is returned exactly as given, so clients see their own URL in
-/// results; the scanner's HTTP stack parses it with the same URL parser
-/// that validated it. Scheme-less input is returned with `http://` added.
-fn validated_target(raw: &str) -> Result<String, TargetError> {
-    http_target(raw, true)
-}
-
-/// `validated_target`, with the private-address check optional: off for a
-/// local caller (the MCP stdio transport, scanning the user's own dev
-/// servers), on for anything reachable over the network.
-pub(crate) fn http_target(raw: &str, block_private: bool) -> Result<String, TargetError> {
+/// results; scheme-less input is returned with `http://` added.
+pub(crate) fn http_target(raw: &str) -> Result<String, TargetError> {
     let raw = raw.trim();
     let candidate = if raw.contains("://") {
         raw.to_string()
@@ -102,9 +96,7 @@ pub(crate) fn http_target(raw: &str, block_private: bool) -> Result<String, Targ
             "Only HTTP and HTTPS URLs are supported".to_string(),
         ));
     }
-    if block_private {
-        reject_forbidden_target(&parsed)?;
-    }
+    reject_metadata_target(&parsed)?;
     if candidate.starts_with("http://") || candidate.starts_with("https://") {
         Ok(candidate)
     } else {
@@ -112,64 +104,21 @@ pub(crate) fn http_target(raw: &str, block_private: bool) -> Result<String, Targ
     }
 }
 
+/// Rate-limit key for a validated target: the parsed, normalized URL, so
+/// case, default ports and trailing slashes don't make separate buckets.
+fn rate_key(target: &str) -> String {
+    url::Url::parse(target).map_or_else(|_| target.to_string(), |u| u.to_string())
+}
+
 /// Validate `url` and `reference_url` of a scan request in place.
 fn validate_scan_targets(request: &mut ScanRequest) -> Result<(), (StatusCode, Json<Value>)> {
     if !request.url.is_empty() {
-        request.url = validated_target(&request.url).map_err(TargetError::into_response)?;
+        request.url = http_target(&request.url).map_err(TargetError::into_response)?;
     }
     if let Some(reference) = request.reference_url.as_mut() {
-        *reference = validated_target(reference).map_err(TargetError::into_response)?;
+        *reference = http_target(reference).map_err(TargetError::into_response)?;
     }
     Ok(())
-}
-
-/// Bearer-token check for `/v1/ramparts/*` when `RAMPARTS_API_TOKEN` is set.
-/// Unset keeps the API open, which is only appropriate on a loopback bind or
-/// behind an authenticating proxy. The scheme name is case-insensitive
-/// (RFC 7235).
-pub(crate) async fn require_token(
-    token: Option<Arc<str>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let Some(token) = token else {
-        return next.run(request).await;
-    };
-    let presented = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().split_once(' '))
-        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-        .map(|(_, t)| t.trim());
-    if presented.is_some_and(|p| constant_time_eq(p.as_bytes(), token.as_bytes())) {
-        next.run(request).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "success": false, "error": "Missing or invalid bearer token" })),
-        )
-            .into_response()
-    }
-}
-
-/// `host` without IPv6 brackets (`[::1]` -> `::1`).
-pub(crate) fn bare_host(host: &str) -> &str {
-    host.strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host)
-}
-
-pub(crate) fn is_loopback_host(host: &str) -> bool {
-    let host = bare_host(host);
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// CORS is off unless `RAMPARTS_CORS_ORIGINS` lists allowed origins
@@ -208,51 +157,23 @@ fn cors_layer() -> Option<CorsLayer> {
     )
 }
 
-/// Reject scan targets that are the host itself or a private network.
-///
-/// The scan endpoints make the server fetch a caller-supplied URL, a request
-/// forgery primitive: without this, a caller reaches the cloud metadata
-/// service or anything on the host's private interfaces. This checks the URL
-/// (IP literals and `localhost`); names that resolve to private addresses and
-/// redirects are stopped at connection time by `net_policy`. Set
-/// `RAMPARTS_ALLOW_PRIVATE_TARGETS=1` to scan internal servers deliberately.
-fn reject_forbidden_target(parsed: &url::Url) -> Result<(), TargetError> {
-    let allow_private = std::env::var("RAMPARTS_ALLOW_PRIVATE_TARGETS").is_ok_and(|v| v == "1");
-    reject_forbidden_target_with(parsed, allow_private)
-}
-
-/// The policy itself, with the environment read out of it, so tests exercise
-/// the rules without mutating process-global state.
-fn reject_forbidden_target_with(parsed: &url::Url, allow_private: bool) -> Result<(), TargetError> {
-    if allow_private {
-        return Ok(());
-    }
-    let refuse = |what: String| {
-        TargetError::Forbidden(format!(
-            "Refusing to scan {what}: loopback, private, or link-local address. \
-             Set RAMPARTS_ALLOW_PRIVATE_TARGETS=1 to allow it."
-        ))
+/// Refuse cloud metadata addresses (link-local, AWS IPv6 metadata, and
+/// their IPv4-in-IPv6 forms). Private and loopback MCP servers may be
+/// scanned; the metadata service is never an MCP server and returns the
+/// host's cloud credentials to whoever asks.
+fn reject_metadata_target(parsed: &url::Url) -> Result<(), TargetError> {
+    let ip = match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => std::net::IpAddr::V4(v4),
+        Some(url::Host::Ipv6(v6)) => std::net::IpAddr::V6(v6),
+        Some(url::Host::Domain(_)) => return Ok(()),
+        None => return Err(TargetError::Invalid("URL has no host".to_string())),
     };
-    // Match on the typed host: `host_str` wraps IPv6 in brackets, which
-    // doesn't parse as an IpAddr.
-    match parsed.host() {
-        Some(url::Host::Ipv4(v4)) if crate::net_policy::is_forbidden_ip(v4.into()) => {
-            Err(refuse(v4.to_string()))
-        }
-        Some(url::Host::Ipv6(v6)) if crate::net_policy::is_forbidden_ip(v6.into()) => {
-            Err(refuse(v6.to_string()))
-        }
-        Some(url::Host::Domain(domain)) => {
-            let lowered = domain.to_ascii_lowercase();
-            if lowered == "localhost" || lowered.ends_with(".localhost") {
-                Err(refuse(lowered))
-            } else {
-                Ok(())
-            }
-        }
-        Some(_) => Ok(()),
-        None => Err(TargetError::Invalid("URL has no host".to_string())),
+    if crate::net_policy::is_metadata_ip(ip) {
+        return Err(TargetError::Forbidden(format!(
+            "Refusing to scan {ip}: cloud metadata / link-local address"
+        )));
     }
+    Ok(())
 }
 
 pub struct MCPScannerServer {
@@ -285,25 +206,12 @@ impl MCPScannerServer {
             rate_limiter: Arc::new(RwLock::new(HashMap::new())),
         };
 
-        // Scans requested over the API must not reach the host or private
-        // networks, including via DNS answers and redirects.
-        if std::env::var("RAMPARTS_ALLOW_PRIVATE_TARGETS").is_ok_and(|v| v == "1") {
-            warn!("RAMPARTS_ALLOW_PRIVATE_TARGETS=1: API scans may reach private networks");
-        } else {
-            crate::net_policy::block_private_targets();
-        }
-
-        let token: Option<Arc<str>> = std::env::var("RAMPARTS_API_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-            .map(Into::into);
-        if token.is_none() && !is_loopback_host(&self.config.host) {
-            warn!(
-                "RAMPARTS_API_TOKEN is not set and the server binds {}: the API is \
-                 unauthenticated. Set a token or bind 127.0.0.1.",
-                self.config.host
-            );
-        }
+        // Scan targets now come from network callers: the scanner refuses
+        // local-process targets from here on.
+        crate::net_policy::enter_remote_mode();
+        let token = crate::net_policy::api_token(&self.config.host, "the server");
+        let loopback_without_token =
+            token.is_none() && crate::net_policy::is_loopback_host(&self.config.host);
 
         // Probes and health stay open; every other API route needs the
         // bearer token when one is configured.
@@ -325,7 +233,7 @@ impl MCPScannerServer {
             )
             .route("/v1/ramparts/list-servers", get(list_servers_endpoint))
             .route_layer(middleware::from_fn(move |req, next| {
-                require_token(token.clone(), req, next)
+                crate::net_policy::require_token(token.clone(), req, next)
             }));
 
         let app = Router::new()
@@ -341,17 +249,22 @@ impl MCPScannerServer {
             Some(cors) => app.layer(cors),
             None => app,
         };
+        // Loopback without a token: refuse requests addressed to any other
+        // Host, so a web page can't reach the API by DNS rebinding.
+        let app = if loopback_without_token {
+            app.layer(middleware::from_fn(
+                crate::net_policy::require_loopback_host,
+            ))
+        } else {
+            app
+        };
         let app = app.layer(TraceLayer::new_for_http()).with_state(state);
 
-        let host = bare_host(&self.config.host).to_string();
-        let addr = match host.parse::<std::net::IpAddr>() {
-            Ok(ip) => std::net::SocketAddr::new(ip, self.config.port).to_string(),
-            Err(_) => format!("{host}:{}", self.config.port),
-        };
+        let addr = crate::net_policy::resolve_bind(&self.config.host, self.config.port).await?;
         info!("Starting MCP Scanner Server on http://{addr}");
         debug!("Protocol version: 2025-06-18");
 
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
 
         // Set up graceful shutdown
         info!("Server ready to handle graceful shutdown signals (SIGTERM, SIGINT)");
@@ -591,7 +504,7 @@ async fn scan_endpoint(
 
     // Rate limit on the validated URL, so rejected input uses no slots and
     // /scan and /batch-scan count the same target the same way.
-    if check_rate_limit(&state, std::slice::from_ref(&request.url))
+    if check_rate_limit(&state, &[rate_key(&request.url)])
         .await
         .is_err()
     {
@@ -782,13 +695,14 @@ async fn batch_scan_endpoint(
     // Validate every target (and the shared reference URL) the same way
     // /scan does; the scanner receives the validated, normalized URLs.
     for url in request.urls.iter_mut() {
-        *url = validated_target(url).map_err(TargetError::into_response)?;
+        *url = http_target(url).map_err(TargetError::into_response)?;
     }
     if let Some(options) = request.options.as_mut() {
         validate_scan_targets(options)?;
     }
 
-    if check_rate_limit(&state, &request.urls).await.is_err() {
+    let keys: Vec<String> = request.urls.iter().map(|u| rate_key(u)).collect();
+    if check_rate_limit(&state, &keys).await.is_err() {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({
@@ -1023,21 +937,8 @@ async fn check_rate_limit(state: &ServerState, urls: &[String]) -> Result<(), St
 mod tests {
     use super::*;
 
-    /// True when the private-target rules allow `raw` (parsed the way
-    /// `validated_target` parses it, without its scheme check).
-    fn forbidden_check(raw: &str, allow_private: bool) -> bool {
-        let candidate = if raw.contains("://") {
-            raw.to_string()
-        } else {
-            format!("http://{raw}")
-        };
-        url::Url::parse(&candidate)
-            .map(|u| reject_forbidden_target_with(&u, allow_private).is_ok())
-            .unwrap_or(false)
-    }
-
     #[test]
-    fn validated_target_accepts_only_http_and_returns_the_parsed_url() {
+    fn http_target_accepts_only_http_and_keeps_the_callers_url() {
         for raw in [
             "stdio://bash:-c:touch${IFS}marker;@example.com",
             "stdio://sh@example.com",
@@ -1047,54 +948,44 @@ mod tests {
             "file:///etc/passwd",
             "gopher://example.com/",
         ] {
-            assert!(validated_target(raw).is_err(), "should reject {raw}");
-        }
-        assert_eq!(
-            validated_target("https://mcp.example.com/sse").unwrap(),
-            "https://mcp.example.com/sse"
-        );
-        // Scheme-less targets are normalized to http and stay http.
-        assert_eq!(
-            validated_target("mcp.example.com:8080").unwrap(),
-            "http://mcp.example.com:8080"
-        );
-        // The forgery guard still applies to the parsed URL, including IPv4
-        // written in IPv6 form, unique-local IPv6 and CGNAT.
-        for raw in [
-            "http://127.0.0.1:3000/",
-            "http://[::ffff:169.254.169.254]/",
-            "http://[::ffff:127.0.0.1]:3000/",
-            "http://[fd00::1]/",
-            "http://100.64.1.1/",
-        ] {
             assert!(
-                matches!(validated_target(raw), Err(TargetError::Forbidden(_))),
-                "should forbid {raw}"
+                matches!(http_target(raw), Err(TargetError::Invalid(_))),
+                "should reject {raw}"
             );
         }
-        // A caller's http(s) URL comes back unchanged.
+        // A caller's http(s) URL comes back unchanged; scheme-less gets http.
         assert_eq!(
-            validated_target("https://mcp.example.com").unwrap(),
+            http_target("https://mcp.example.com").unwrap(),
             "https://mcp.example.com"
         );
-        // The private-address guard alone accepts this form (it reads the
-        // command as userinfo and checks host example.com), which is why the
-        // scheme check above has to run on every target.
-        assert!(forbidden_check(
-            "stdio://bash:-c:touch${IFS}x;@example.com",
-            false
-        ));
+        assert_eq!(
+            http_target("mcp.example.com:8080").unwrap(),
+            "http://mcp.example.com:8080"
+        );
     }
 
     #[test]
-    fn http_target_private_check_is_optional_but_scheme_check_is_not() {
-        // Local (MCP stdio) callers may scan their own dev servers...
-        assert!(http_target("http://127.0.0.1:3000/mcp", false).is_ok());
-        // ...network callers may not.
-        assert!(http_target("http://127.0.0.1:3000/mcp", true).is_err());
-        // Nobody gets a local-process target.
-        for raw in ["stdio:bash:-c:id", "stdio://bash:-c:id;@example.com"] {
-            assert!(http_target(raw, false).is_err(), "{raw}");
+    fn private_targets_are_allowed_metadata_is_not() {
+        for raw in [
+            "http://127.0.0.1:3000/mcp",
+            "http://localhost:3000",
+            "http://10.0.0.5/mcp",
+            "http://192.168.1.10:8080",
+            "http://[::1]:3000/",
+            "http://mcp-gw.ns.svc.cluster.local/mcp",
+        ] {
+            assert!(http_target(raw).is_ok(), "should allow {raw}");
+        }
+        for raw in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://[fd00:ec2::254]/",
+            "http://[fe80::1]/",
+        ] {
+            assert!(
+                matches!(http_target(raw), Err(TargetError::Forbidden(_))),
+                "should refuse {raw}"
+            );
         }
     }
 
@@ -1115,55 +1006,22 @@ mod tests {
     }
 
     #[test]
-    fn token_compare_and_loopback_detection() {
-        assert!(constant_time_eq(b"secret", b"secret"));
-        assert!(!constant_time_eq(b"secret", b"secreT"));
-        assert!(!constant_time_eq(b"secret", b"secret2"));
-        for host in ["127.0.0.1", "127.0.0.2", "::1", "[::1]", "localhost"] {
-            assert!(is_loopback_host(host), "{host}");
-        }
-        assert!(!is_loopback_host("0.0.0.0"));
-        assert_eq!(bare_host("[::1]"), "::1");
+    fn rate_key_normalizes_equivalent_urls() {
+        assert_eq!(
+            rate_key("http://VICTIM.example/mcp"),
+            rate_key("http://victim.example:80/mcp")
+        );
+        assert_eq!(
+            rate_key("http://victim.example"),
+            rate_key("http://victim.example/")
+        );
     }
-    // Note: StatusCode is used in the validation logic but not in tests
 
     #[test]
     fn test_server_config_default() {
         let config = ServerConfig::default();
         assert_eq!(config.port, 3000);
         assert_eq!(config.host, "127.0.0.1");
-    }
-
-    #[test]
-    fn test_forbidden_targets_are_rejected() {
-        let denied = |url: &str| !forbidden_check(url, false);
-
-        // Cloud metadata, the canonical request-forgery target.
-        assert!(denied("http://169.254.169.254/latest/meta-data"));
-        // Loopback by name and by address, v4 and v6.
-        assert!(denied("http://localhost:8080"));
-        assert!(denied("http://127.0.0.1:3000"));
-        assert!(denied("http://[::1]:3000"));
-        // RFC 1918 space.
-        assert!(denied("http://10.0.0.5/mcp"));
-        assert!(denied("http://192.168.1.10/mcp"));
-        assert!(denied("http://172.16.4.2/mcp"));
-        // A scheme-less host must be normalized before the check, not skipped.
-        assert!(denied("127.0.0.1:3000"));
-
-        // Ordinary public targets still scan.
-        assert!(forbidden_check("https://mcp.example.com/v1", false));
-        assert!(forbidden_check("mcp.example.com", false));
-    }
-
-    #[test]
-    fn test_private_targets_allowed_when_explicitly_opted_in() {
-        // Operators who mean to scan internal servers can opt in. Exercised
-        // through the pure form so the test mutates no process-global state.
-        assert!(forbidden_check("http://10.0.0.5/mcp", true));
-        assert!(forbidden_check("http://169.254.169.254/", true));
-        // ...and the same targets are still refused by default.
-        assert!(!forbidden_check("http://10.0.0.5/mcp", false));
     }
 
     #[test]

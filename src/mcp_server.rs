@@ -88,7 +88,7 @@ impl RampartsMcpServer {
         // http(s) MCP endpoints only: other schemes make the scanner start
         // a local process, which a tool caller (an agent, or a remote client)
         // must not be able to request.
-        let url = crate::server::http_target(&p.url, self.network)
+        let url = crate::server::http_target(&p.url)
             .map_err(|e| ErrorData::invalid_params(e.message().to_string(), None))?;
         let request = ScanRequest {
             url,
@@ -199,32 +199,12 @@ pub async fn run_streamable_http_server(
     use axum::Router;
     use tower::ServiceBuilder;
 
-    let bare = crate::server::bare_host(host);
-    let bind: std::net::SocketAddr = match bare.parse::<std::net::IpAddr>() {
-        Ok(ip) => std::net::SocketAddr::new(ip, port),
-        Err(_) => tokio::net::lookup_host((bare, port))
-            .await?
-            .next()
-            .ok_or("could not resolve --host")?,
-    };
-
-    // Callers may be remote: scans must not reach this host or private
-    // networks (URL, DNS answers and redirects).
-    if std::env::var("RAMPARTS_ALLOW_PRIVATE_TARGETS").is_ok_and(|v| v == "1") {
-        tracing::warn!("RAMPARTS_ALLOW_PRIVATE_TARGETS=1: MCP scans may reach private networks");
-    } else {
-        crate::net_policy::block_private_targets();
-    }
-    let token: Option<Arc<str>> = std::env::var("RAMPARTS_API_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .map(Into::into);
-    if token.is_none() && !crate::server::is_loopback_host(host) {
-        tracing::warn!(
-            "RAMPARTS_API_TOKEN is not set and the MCP server binds {host}: it is \
-             unauthenticated. Set a token or bind 127.0.0.1."
-        );
-    }
+    let bind = crate::net_policy::resolve_bind(host, port).await?;
+    // Tool calls now come from network callers: the scanner refuses
+    // local-process targets from here on.
+    crate::net_policy::enter_remote_mode();
+    let token = crate::net_policy::api_token(host, "the MCP server");
+    let loopback_without_token = token.is_none() && crate::net_policy::is_loopback_host(host);
 
     let service: StreamableHttpService<RampartsMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
@@ -236,8 +216,17 @@ pub async fn run_streamable_http_server(
     let app = Router::new()
         .route("/", any_service(ServiceBuilder::new().service(service)))
         .route_layer(axum::middleware::from_fn(move |req, next| {
-            crate::server::require_token(token.clone(), req, next)
+            crate::net_policy::require_token(token.clone(), req, next)
         }));
+    // Loopback without a token: refuse requests addressed to any other Host,
+    // so a web page can't reach the endpoint by DNS rebinding.
+    let app = if loopback_without_token {
+        app.layer(axum::middleware::from_fn(
+            crate::net_policy::require_loopback_host,
+        ))
+    } else {
+        app
+    };
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
