@@ -132,19 +132,7 @@ fn server_declares(server_info: Option<&MCPServerInfo>, capability: &str) -> boo
 }
 
 fn is_yara_available(config_enabled: bool) -> bool {
-    if !config_enabled {
-        return false;
-    }
-
-    #[cfg(feature = "yara-x-scanning")]
-    {
-        true
-    }
-
-    #[cfg(not(feature = "yara-x-scanning"))]
-    {
-        false
-    }
+    config_enabled && cfg!(feature = "yara-x-scanning")
 }
 
 /// Print friendly message about YARA installation
