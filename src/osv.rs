@@ -335,8 +335,6 @@ struct OsvRange {
 #[derive(Debug, Deserialize)]
 struct OsvRangeEvent {
     #[serde(default)]
-    introduced: Option<String>,
-    #[serde(default)]
     fixed: Option<String>,
     #[serde(default)]
     last_affected: Option<String>,
@@ -411,19 +409,19 @@ fn is_malicious_id(id: &str) -> bool {
     id.starts_with("MAL-")
 }
 
-/// True when some `affected` entry is an open range from the first release:
-/// `introduced: "0"` with no `fixed` / `last_affected` bound.
-fn affects_all_versions(affected: &[OsvAffected]) -> bool {
-    affected.iter().any(|a| {
-        a.ranges.iter().any(|r| {
-            r.events
-                .iter()
-                .any(|e| e.introduced.as_deref() == Some("0"))
-                && r.events
-                    .iter()
-                    .all(|e| e.fixed.is_none() && e.last_affected.is_none())
+/// True only when the record names affected ranges and every one of them
+/// ends at a `fixed` version, so releases after it are known clean. An
+/// entry with no ranges (a bare version list), an open range or a
+/// `last_affected` bound is false: the newest release may be affected.
+fn all_ranges_fixed(affected: &[OsvAffected]) -> bool {
+    !affected.is_empty()
+        && affected.iter().all(|a| {
+            !a.ranges.is_empty()
+                && a.ranges.iter().all(|r| {
+                    r.events.iter().any(|e| e.fixed.is_some())
+                        && r.events.iter().all(|e| e.last_affected.is_none())
+                })
         })
-    })
 }
 
 /// True for an OSV finding that marks the package itself as malware.
@@ -475,10 +473,11 @@ fn osv_finding_to_yara_result(spec: &PackageSpec, vuln: OsvVulnerability) -> Yar
     // package itself is the payload.
     let mal_record = is_malicious_id(&vuln.id) || vuln.aliases.iter().any(|a| is_malicious_id(a));
     // A pinned version only gets records that affect it. An unpinned launch
-    // gets every record ever filed, so only a record covering every release
-    // (a package published as malware) blocks it; a record for one hijacked
-    // release of a legitimate package is reported, not blocking.
-    let malicious = mal_record && (spec.version.is_some() || affects_all_versions(&vuln.affected));
+    // installs the newest release, which we can't see, so a record blocks it
+    // unless every affected range is closed by a `fixed` version (the
+    // incident is over and newer releases are clean). An ongoing hijack
+    // (open range, `last_affected`, or a bare version list) still blocks.
+    let malicious = mal_record && (spec.version.is_some() || !all_ranges_fixed(&vuln.affected));
     let (rule, name, severity, summary) = if malicious {
         (
             MALICIOUS_DEPENDENCY_RULE,
@@ -749,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn unpinned_launch_blocks_only_on_whole_package_malware() {
+    fn unpinned_launch_blocks_unless_the_incident_is_fixed() {
         let unpinned = PackageSpec {
             ecosystem: "npm",
             name: "pkg".to_string(),
@@ -762,11 +761,21 @@ mod tests {
             }))
             .unwrap()
         };
-        let whole = osv_finding_to_yara_result(
-            &unpinned,
-            rec(serde_json::json!([{ "type": "SEMVER", "events": [{ "introduced": "0" }] }])),
-        );
-        assert!(is_malicious_finding(&whole));
+        let blocks = |ranges: serde_json::Value| {
+            is_malicious_finding(&osv_finding_to_yara_result(&unpinned, rec(ranges)))
+        };
+        // Whole package, an ongoing hijack (open range), last_affected, and a
+        // bare version list all block: the newest release may be affected.
+        assert!(blocks(
+            serde_json::json!([{ "type": "SEMVER", "events": [{ "introduced": "0" }] }])
+        ));
+        assert!(blocks(
+            serde_json::json!([{ "type": "SEMVER", "events": [{ "introduced": "1.26.1" }] }])
+        ));
+        assert!(blocks(
+            serde_json::json!([{ "type": "SEMVER", "events": [{ "introduced": "1.0.0" }, { "last_affected": "1.26.2" }] }])
+        ));
+        assert!(blocks(serde_json::json!([])));
         let one_release = osv_finding_to_yara_result(
             &unpinned,
             rec(
