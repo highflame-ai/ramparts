@@ -26,6 +26,19 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 const OSV_QUERY_URL: &str = "https://api.osv.dev/v1/query";
+
+/// OSV query endpoint. `RAMPARTS_OSV_URL` points the lookup at a mirror or
+/// proxy for networks that can't reach api.osv.dev; it must be https.
+fn osv_query_url() -> String {
+    match std::env::var("RAMPARTS_OSV_URL") {
+        Ok(url) if url.starts_with("https://") => url,
+        Ok(url) if !url.is_empty() => {
+            warn!("Ignoring RAMPARTS_OSV_URL={url}: must be an https:// URL");
+            OSV_QUERY_URL.to_string()
+        }
+        _ => OSV_QUERY_URL.to_string(),
+    }
+}
 const OSV_QUERY_TIMEOUT_SECS: u64 = 5;
 
 /// A parsed (ecosystem, name, version) triple ready to send to OSV.
@@ -37,27 +50,72 @@ pub struct PackageSpec {
 }
 
 /// Parse a stdio MCP launch command into a `PackageSpec` suitable for an
-/// OSV query. Returns `None` when the command isn't a recognized package
-/// runner or the args don't yield a clean package reference. We only
-/// recognize the conservative subset we can parse without false positives:
+/// OSV query. This is the gate that decides whether a launch package gets
+/// checked before the server starts, so it recognizes every common runner:
 ///
-/// - `npx [-y|--yes] [pkg@ver] [...rest]` → npm:pkg@ver
-/// - `uvx [--from pkg[==ver]] [pkg[==ver]] [...rest]` → PyPI:pkg@ver
+/// - npm: `npx`, `bunx`, `bun x`, `pnpm dlx`, `yarn dlx`, `npm exec` / `npm x`
+/// - PyPI: `uvx`, `uv tool run`, `pipx run`
+/// - any of the above behind `cmd /c` (Windows configs)
 ///
-/// Anything more exotic (custom scripts, shell pipelines, npx-with-multiple-
-/// packages) returns `None` so we don't emit false positives.
+/// The command is matched by file name, so `/usr/local/bin/npx`, `npx.cmd`
+/// and `NPX.EXE` count too. Returns `None` for commands that aren't package
+/// runners (`python3 server.py`, `node ./x.js`): there's nothing to look up.
 pub fn parse_package_spec_from_command(command: &str, args: &[String]) -> Option<PackageSpec> {
-    match command {
-        "npx" => parse_npx(args),
-        "uvx" => parse_uvx(args),
+    let name = command
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(command)
+        .to_ascii_lowercase();
+    let name = [".cmd", ".exe", ".ps1", ".bat"]
+        .iter()
+        .find_map(|ext| name.strip_suffix(ext))
+        .unwrap_or(&name)
+        .to_string();
+    let first = args.first().map(|a| a.to_ascii_lowercase());
+    let rest = || args.get(1..).unwrap_or(&[]);
+    match (name.as_str(), first.as_deref()) {
+        ("cmd", Some("/c" | "/k")) => {
+            let inner = args.get(1)?;
+            parse_package_spec_from_command(inner, args.get(2..).unwrap_or(&[]))
+        }
+        ("npx" | "bunx", _) => parse_npx(args),
+        ("bun", Some("x")) | ("pnpm" | "yarn", Some("dlx")) | ("npm", Some("exec" | "x")) => {
+            parse_npx(rest())
+        }
+        ("uvx", _) => parse_uvx(args),
+        ("uv", Some("tool")) if args.get(1).is_some_and(|a| a == "run") => {
+            parse_uvx(args.get(2..).unwrap_or(&[]))
+        }
+        ("pipx", Some("run")) => parse_uvx(rest()),
         _ => None,
     }
 }
 
 fn parse_npx(args: &[String]) -> Option<PackageSpec> {
-    // First positional arg that doesn't start with `-` is the package.
-    let pkg_arg = args.iter().find(|a| !a.starts_with('-'))?;
-    let (name, version) = split_npm_spec(pkg_arg)?;
+    // An explicit `--package=<spec>` / `--package <spec>` / `-p <spec>` names
+    // the package even when a different bin name follows it.
+    let mut iter = args.iter();
+    let mut positional = None;
+    while let Some(arg) = iter.next() {
+        if let Some(spec) = arg.strip_prefix("--package=") {
+            return npm_spec(spec);
+        }
+        if arg == "--package" || arg == "-p" {
+            return npm_spec(iter.next()?);
+        }
+        if (arg == "--call" || arg == "-c") && positional.is_none() {
+            iter.next(); // the shell command string, not a package
+            continue;
+        }
+        if !arg.starts_with('-') && positional.is_none() {
+            positional = Some(arg);
+        }
+    }
+    npm_spec(positional?)
+}
+
+fn npm_spec(raw: &str) -> Option<PackageSpec> {
+    let (name, version) = split_npm_spec(raw)?;
     Some(PackageSpec {
         ecosystem: "npm",
         name,
@@ -67,7 +125,8 @@ fn parse_npx(args: &[String]) -> Option<PackageSpec> {
 
 /// Split an npm package reference into (name, version). Handles scoped
 /// packages (`@scope/pkg`) where the leading `@` must NOT be parsed as a
-/// version separator.
+/// version separator. Ranges and tags (`^1.0`, `latest`) yield no version,
+/// so OSV considers every release.
 fn split_npm_spec(raw: &str) -> Option<(String, Option<String>)> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -77,33 +136,30 @@ fn split_npm_spec(raw: &str) -> Option<(String, Option<String>)> {
     if let Some(stripped) = raw.strip_prefix('@') {
         let (scope, rest) = stripped.split_once('/')?;
         if let Some((pkg, ver)) = rest.split_once('@') {
-            return Some((format!("@{scope}/{pkg}"), version_or_none(ver)));
+            return Some((format!("@{scope}/{pkg}"), exact_version(ver)));
         }
         return Some((format!("@{scope}/{rest}"), None));
     }
     if let Some((name, ver)) = raw.split_once('@') {
-        return Some((name.to_string(), version_or_none(ver)));
+        return Some((name.to_string(), exact_version(ver)));
     }
     Some((raw.to_string(), None))
 }
 
 fn parse_uvx(args: &[String]) -> Option<PackageSpec> {
-    // `uvx --from pkg[==ver] cmd ...` or `uvx pkg[==ver] [...]`. Take the
-    // first non-flag token after a known flag, or the first non-flag token
-    // overall.
+    // `uvx --from pkg[==ver] cmd ...`, `pipx run --spec pkg cmd ...`, or the
+    // first non-flag token.
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.peek() {
-        if *arg == "--from" {
+        if let Some(spec) = arg
+            .strip_prefix("--from=")
+            .or_else(|| arg.strip_prefix("--spec="))
+        {
+            return pypi_spec(spec);
+        }
+        if *arg == "--from" || *arg == "--spec" {
             iter.next();
-            if let Some(spec) = iter.next() {
-                let (name, version) = split_pypi_spec(spec)?;
-                return Some(PackageSpec {
-                    ecosystem: "PyPI",
-                    name,
-                    version,
-                });
-            }
-            return None;
+            return pypi_spec(iter.next()?);
         }
         if arg.starts_with('-') {
             iter.next();
@@ -111,8 +167,11 @@ fn parse_uvx(args: &[String]) -> Option<PackageSpec> {
         }
         break;
     }
-    let pkg = iter.next()?;
-    let (name, version) = split_pypi_spec(pkg)?;
+    pypi_spec(iter.next()?)
+}
+
+fn pypi_spec(raw: &str) -> Option<PackageSpec> {
+    let (name, version) = split_pypi_spec(raw)?;
     Some(PackageSpec {
         ecosystem: "PyPI",
         name,
@@ -120,18 +179,39 @@ fn parse_uvx(args: &[String]) -> Option<PackageSpec> {
     })
 }
 
+/// `pkg==1.2.3` and uv's `pkg@1.2.3` give an exact version. Any other
+/// specifier (`>=`, `~=`, `!=`, `<`, extras `[x]`) is stripped from the name
+/// and yields no version, so OSV considers every release.
 fn split_pypi_spec(raw: &str) -> Option<(String, Option<String>)> {
-    // PyPI version specifiers we care about: `pkg==1.2.3`, `pkg`. We leave
-    // looser specs (`pkg>=1.0`) alone because OSV needs an exact version
-    // to give a useful answer.
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
-    if let Some((name, ver)) = raw.split_once("==") {
-        return Some((name.to_string(), version_or_none(ver)));
-    }
-    Some((raw.to_string(), None))
+    let exact = raw
+        .split_once("==")
+        .or_else(|| raw.split_once('@'))
+        .and_then(|(n, v)| exact_version(v).map(|v| (n, v)));
+    let (name_part, version) = match exact {
+        Some((n, v)) => (n, Some(v)),
+        None => (raw, None),
+    };
+    let name = name_part
+        .split(['[', '<', '>', '=', '!', '~', ';', '@', ' '])
+        .next()
+        .unwrap_or("")
+        .trim();
+    (!name.is_empty()).then(|| (name.to_string(), version))
+}
+
+/// An exact release version (`1.2.3`, `1.2.3-beta.1`), or `None` for a
+/// range, tag or anything else OSV can't match as a single version.
+fn exact_version(raw: &str) -> Option<String> {
+    let v = raw.trim().trim_start_matches(['v', '=']);
+    let exact = v.starts_with(|c: char| c.is_ascii_digit())
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+        && !v.contains(['x', 'X']);
+    exact.then(|| v.to_string())
 }
 
 /// Parse a dependency manifest bundled with a skill into OSV-queryable
@@ -199,18 +279,6 @@ pub fn parse_manifest_specs(filename: &str, content: &str) -> Vec<PackageSpec> {
     }
 }
 
-fn version_or_none(s: &str) -> Option<String> {
-    let s = s.trim();
-    // npm/PyPI both treat "latest" as a tag rather than a real version. OSV
-    // can't resolve tags, so drop these and return the package alone — OSV
-    // will tell us "any known vulns at all", which is still useful info.
-    if s.is_empty() || s.eq_ignore_ascii_case("latest") {
-        None
-    } else {
-        Some(s.to_string())
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct OsvQueryResponse {
     #[serde(default)]
@@ -267,7 +335,11 @@ struct OsvRange {
 #[derive(Debug, Deserialize)]
 struct OsvRangeEvent {
     #[serde(default)]
+    introduced: Option<String>,
+    #[serde(default)]
     fixed: Option<String>,
+    #[serde(default)]
+    last_affected: Option<String>,
 }
 
 /// Query OSV.dev for vulnerabilities affecting `spec`. Returns an empty
@@ -279,13 +351,23 @@ struct OsvRangeEvent {
 /// `PackageSpec` by value so callers can spawn the resulting future onto
 /// a `tokio::task` without lifetime gymnastics.
 pub async fn query_osv(client: Client, spec: PackageSpec) -> Vec<YaraScanResult> {
+    check_osv(client, spec).await.unwrap_or_else(|e| {
+        warn!("{e}");
+        Vec::new()
+    })
+}
+
+/// Like `query_osv`, but a failed lookup is an `Err` instead of an empty
+/// list, so a caller that must not proceed without a verdict (starting a
+/// stdio server) can tell "no advisories" from "couldn't check".
+pub async fn check_osv(client: Client, spec: PackageSpec) -> Result<Vec<YaraScanResult>, String> {
     debug!(
         "Querying OSV.dev for {}/{} ({:?})",
         spec.ecosystem, spec.name, spec.version
     );
     let request_body = build_osv_request(&spec);
     let response = match client
-        .post(OSV_QUERY_URL)
+        .post(osv_query_url())
         .timeout(Duration::from_secs(OSV_QUERY_TIMEOUT_SECS))
         .json(&request_body)
         .send()
@@ -293,37 +375,73 @@ pub async fn query_osv(client: Client, spec: PackageSpec) -> Vec<YaraScanResult>
     {
         Ok(r) => r,
         Err(e) => {
-            warn!(
+            return Err(format!(
                 "OSV query failed for {}/{}: {}",
                 spec.ecosystem, spec.name, e
-            );
-            return Vec::new();
+            ))
         }
     };
     if !response.status().is_success() {
-        warn!(
+        return Err(format!(
             "OSV returned {} for {}/{}",
             response.status(),
             spec.ecosystem,
             spec.name
-        );
-        return Vec::new();
+        ));
     }
-    let body: OsvQueryResponse = match response.json().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                "Failed to parse OSV response for {}/{}: {}",
-                spec.ecosystem, spec.name, e
-            );
-            return Vec::new();
-        }
-    };
+    let body: OsvQueryResponse = response.json().await.map_err(|e| {
+        format!(
+            "Failed to parse OSV response for {}/{}: {}",
+            spec.ecosystem, spec.name, e
+        )
+    })?;
 
-    body.vulns
+    Ok(body
+        .vulns
         .into_iter()
         .map(|v| osv_finding_to_yara_result(&spec, v))
-        .collect()
+        .collect())
+}
+
+/// Rule name for a launch package that is itself malware. The pre-launch
+/// gate keys off this, so it lives in one place.
+pub const MALICIOUS_DEPENDENCY_RULE: &str = "MaliciousDependency";
+
+fn is_malicious_id(id: &str) -> bool {
+    id.starts_with("MAL-")
+}
+
+/// True only when the record names affected ranges and every one of them
+/// ends closed: walking its events in order (OSV sorts them), the last
+/// `introduced` is followed by a `fixed`. A re-introduced range
+/// (`introduced 1.0, fixed 1.1, introduced 2.0`), a `last_affected` bound,
+/// or an entry with no ranges (a bare version list) is false: the newest
+/// release may be affected.
+fn all_ranges_fixed(affected: &[OsvAffected]) -> bool {
+    let range_closed = |r: &OsvRange| {
+        let mut open = false;
+        for e in &r.events {
+            if e.last_affected.is_some() {
+                return false;
+            }
+            if e.introduced.is_some() {
+                open = true;
+            }
+            if e.fixed.is_some() {
+                open = false;
+            }
+        }
+        !open && !r.events.is_empty()
+    };
+    !affected.is_empty()
+        && affected
+            .iter()
+            .all(|a| !a.ranges.is_empty() && a.ranges.iter().all(range_closed))
+}
+
+/// True for an OSV finding that marks the package itself as malware.
+pub fn is_malicious_finding(f: &YaraScanResult) -> bool {
+    f.rule_name == MALICIOUS_DEPENDENCY_RULE
 }
 
 fn build_osv_request(spec: &PackageSpec) -> serde_json::Value {
@@ -365,6 +483,39 @@ fn osv_finding_to_yara_result(spec: &PackageSpec, vuln: OsvVulnerability) -> Yar
         summary
     );
     let fixed_version = extract_fixed_version(spec, &vuln.affected);
+    // OSV's malicious-package records use `MAL-` IDs (GitHub malware
+    // advisories carry one as an alias). These aren't bugs to patch: the
+    // package itself is the payload.
+    let mal_record = is_malicious_id(&vuln.id) || vuln.aliases.iter().any(|a| is_malicious_id(a));
+    // A pinned version only gets records that affect it. An unpinned launch
+    // installs the newest release, which we can't see, so a record blocks it
+    // unless every affected range is closed by a `fixed` version (the
+    // incident is over and newer releases are clean). An ongoing hijack
+    // (open range, `last_affected`, or a bare version list) still blocks.
+    let malicious = mal_record && (spec.version.is_some() || !all_ranges_fixed(&vuln.affected));
+    let (rule, name, severity, summary) = if malicious {
+        (
+            MALICIOUS_DEPENDENCY_RULE,
+            "Malicious Dependency",
+            "CRITICAL",
+            summary.to_string(),
+        )
+    } else if mal_record {
+        (
+            "VulnerableDependency",
+            "Vulnerable Dependency",
+            "HIGH",
+            format!("Malicious releases of this package were published ({summary}); pin a known-good version"),
+        )
+    } else {
+        (
+            "VulnerableDependency",
+            "Vulnerable Dependency",
+            severity,
+            summary.to_string(),
+        )
+    };
+    let summary = summary.as_str();
     YaraScanResult {
         target_type: "dependency".to_string(),
         target_name: format!(
@@ -373,12 +524,12 @@ fn osv_finding_to_yara_result(spec: &PackageSpec, vuln: OsvVulnerability) -> Yar
             spec.name,
             spec.version.as_deref().unwrap_or("?")
         ),
-        rule_name: "VulnerableDependency".to_string(),
+        rule_name: rule.to_string(),
         rule_file: Some("osv".to_string()),
         matched_text: Some(vuln.id.clone()),
         context,
         rule_metadata: Some(YaraRuleMetadata {
-            name: Some("Vulnerable Dependency".to_string()),
+            name: Some(name.to_string()),
             author: Some("OSV.dev".to_string()),
             date: None,
             version: None,
@@ -388,7 +539,7 @@ fn osv_finding_to_yara_result(spec: &PackageSpec, vuln: OsvVulnerability) -> Yar
             confidence: Some("HIGH".to_string()),
             tags: vec!["dependency".to_string(), "osv".to_string()],
         }),
-        owasp_tags: crate::taxonomy::tags_for_yara_rule("VulnerableDependency"),
+        owasp_tags: crate::taxonomy::tags_for_yara_rule(rule),
         installed_version: spec.version.clone(),
         fixed_version,
         phase: Some("pre-scan".to_string()),
@@ -556,6 +707,147 @@ mod tests {
         assert!(
             parse_package_spec_from_command("docker", &["run".into(), "image".into()]).is_none()
         );
+    }
+
+    #[test]
+    fn launcher_forms_resolve_to_the_package() {
+        let spec = |cmd: &str, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse_package_spec_from_command(cmd, &args).map(|s| {
+                format!(
+                    "{}:{}@{}",
+                    s.ecosystem,
+                    s.name,
+                    s.version.unwrap_or_default()
+                )
+            })
+        };
+        let cases: &[(&str, &[&str], &str)] = &[
+            ("/usr/local/bin/npx", &["-y", "evil"], "npm:evil@"),
+            ("npx.cmd", &["-y", "evil@1.2.3"], "npm:evil@1.2.3"),
+            ("NPX.EXE", &["evil"], "npm:evil@"),
+            (
+                "cmd",
+                &["/c", "npx", "-y", "@scope/evil@2.0.0"],
+                "npm:@scope/evil@2.0.0",
+            ),
+            ("bunx", &["evil"], "npm:evil@"),
+            ("bun", &["x", "evil"], "npm:evil@"),
+            ("pnpm", &["dlx", "evil"], "npm:evil@"),
+            ("yarn", &["dlx", "evil"], "npm:evil@"),
+            ("npm", &["exec", "--yes", "evil"], "npm:evil@"),
+            ("npx", &["--package=evil", "-y", "bin"], "npm:evil@"),
+            ("npx", &["-p", "evil@1.0.0", "bin"], "npm:evil@1.0.0"),
+            ("npx", &["-y", "evil@^1.0"], "npm:evil@"),
+            ("npx", &["-y", "evil@latest"], "npm:evil@"),
+            ("uvx", &["evil>=1.0"], "PyPI:evil@"),
+            ("uvx", &["evil@1.0"], "PyPI:evil@1.0"),
+            ("uvx", &["evil[extra]==2.1"], "PyPI:evil@2.1"),
+            ("uv", &["tool", "run", "evil"], "PyPI:evil@"),
+            (
+                "pipx",
+                &["run", "--spec", "evil==3.0", "evil-cli"],
+                "PyPI:evil@3.0",
+            ),
+        ];
+        for (cmd, args, want) in cases {
+            assert_eq!(spec(cmd, args).as_deref(), Some(*want), "{cmd} {args:?}");
+        }
+        for (cmd, args) in [
+            ("python3", &["server.py"][..]),
+            ("node", &["./x.js"][..]),
+            ("npm", &["run", "x"][..]),
+        ] {
+            assert!(spec(cmd, args).is_none(), "{cmd} {args:?}");
+        }
+    }
+
+    #[test]
+    fn unpinned_launch_blocks_unless_the_incident_is_fixed() {
+        let unpinned = PackageSpec {
+            ecosystem: "npm",
+            name: "pkg".to_string(),
+            version: None,
+        };
+        let rec = |ranges: serde_json::Value| -> OsvVulnerability {
+            serde_json::from_value(serde_json::json!({
+                "id": "MAL-2026-9",
+                "affected": [{ "package": { "name": "pkg", "ecosystem": "npm" }, "ranges": ranges }]
+            }))
+            .unwrap()
+        };
+        let blocks = |ranges: serde_json::Value| {
+            is_malicious_finding(&osv_finding_to_yara_result(&unpinned, rec(ranges)))
+        };
+        // Whole package, an ongoing hijack (open range), last_affected, and a
+        // bare version list all block: the newest release may be affected.
+        assert!(blocks(
+            serde_json::json!([{ "type": "SEMVER", "events": [{ "introduced": "0" }] }])
+        ));
+        assert!(blocks(
+            serde_json::json!([{ "type": "SEMVER", "events": [{ "introduced": "1.26.1" }] }])
+        ));
+        assert!(blocks(
+            serde_json::json!([{ "type": "SEMVER", "events": [{ "introduced": "1.0.0" }, { "last_affected": "1.26.2" }] }])
+        ));
+        assert!(blocks(serde_json::json!([])));
+        // Re-introduced after a fix: the newest release is affected again.
+        assert!(blocks(serde_json::json!([{ "type": "SEMVER", "events": [
+            { "introduced": "1.0.0" }, { "fixed": "1.1.0" }, { "introduced": "2.0.0" }
+        ] }])));
+        let one_release = osv_finding_to_yara_result(
+            &unpinned,
+            rec(
+                serde_json::json!([{ "type": "SEMVER", "events": [{ "introduced": "4.1.1" }, { "fixed": "4.1.2" }] }]),
+            ),
+        );
+        assert!(!is_malicious_finding(&one_release));
+        assert_eq!(
+            one_release
+                .rule_metadata
+                .as_ref()
+                .unwrap()
+                .severity
+                .as_deref(),
+            Some("HIGH")
+        );
+        // A pinned version only receives records that affect it: always blocks.
+        let pinned = PackageSpec {
+            version: Some("4.1.1".to_string()),
+            ..unpinned.clone()
+        };
+        assert!(is_malicious_finding(&osv_finding_to_yara_result(
+            &pinned,
+            rec(
+                serde_json::json!([{ "type": "SEMVER", "events": [{ "introduced": "4.1.1" }, { "fixed": "4.1.2" }] }])
+            ),
+        )));
+    }
+
+    #[test]
+    fn malicious_package_records_are_classified_separately() {
+        let spec = PackageSpec {
+            ecosystem: "npm",
+            name: "some-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+        };
+        let vuln = |id: &str, aliases: &[&str]| -> OsvVulnerability {
+            serde_json::from_value(serde_json::json!({ "id": id, "aliases": aliases })).unwrap()
+        };
+        let by_id = osv_finding_to_yara_result(&spec, vuln("MAL-2026-1", &[]));
+        let by_alias =
+            osv_finding_to_yara_result(&spec, vuln("GHSA-aaaa-bbbb-cccc", &["MAL-2026-2"]));
+        let cve = osv_finding_to_yara_result(&spec, vuln("GHSA-dddd-eeee-ffff", &["CVE-2026-1"]));
+        for f in [&by_id, &by_alias] {
+            assert!(is_malicious_finding(f));
+            assert_eq!(f.rule_name, "MaliciousDependency");
+            assert_eq!(
+                f.rule_metadata.as_ref().unwrap().severity.as_deref(),
+                Some("CRITICAL")
+            );
+        }
+        assert!(!is_malicious_finding(&cve));
+        assert_eq!(cve.rule_name, "VulnerableDependency");
     }
 
     #[test]
