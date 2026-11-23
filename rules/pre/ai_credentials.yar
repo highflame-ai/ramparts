@@ -33,7 +33,7 @@ rule AIProviderKeyExposure
 
     condition:
         for any i in (1..#key) : (
-            not ($filler in (@key[i]..@key[i] + !key[i]))
+            not ($filler in (@key[i]..@key[i] + !key[i] - 1))
         )
 }
 
@@ -48,10 +48,11 @@ rule AICredentialFileAccess
         version = "1.0"
 
     strings:
-        // A read / copy / archive / upload verb, then the credential path on
-        // the same line. A bare mention (setup docs saying where the file
-        // lives) doesn't match.
-        $access = /\b(cat|less|head|tail|cp|mv|scp|rsync|tar|zip|base64|xxd|curl|wget|type|Get-Content|gc|open|readFile(Sync)?|read_text|read_bytes|fs\.read|shutil\.copy\w*|requests\.(post|put))\b[^\n]{0,120}(\.claude\/\.credentials\.json|\.codex\/auth\.json|\.gemini\/oauth_creds\.json|github-copilot\/(hosts|apps)\.json)/ nocase
+        // A read / copy / archive / upload command, then the credential path
+        // (either slash) on the same line. English-looking verbs are only
+        // counted in command form (`open(`, `type "%…`), so prose like
+        // "open ~/.codex/auth.json and check the token type" doesn't match.
+        $access = /(\b(cat|cp|mv|scp|rsync|tar|zip|7z|base64|xxd|curl|wget|Get-Content|Copy-Item|gc|readFile(Sync)?|read_text|read_bytes|fs\.read\w*|shutil\.copy\w*|requests\.(post|put))\b|\bopen\s*\(|(^|[;&|]\s*|\s)type\s+["'%$])[^\n]{0,120}(\.claude[\\\/]\.credentials\.json|\.codex[\\\/]auth\.json|\.gemini[\\\/]oauth_creds\.json|github-copilot[\\\/](hosts|apps)\.json)/ nocase
 
     condition:
         $access

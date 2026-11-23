@@ -1844,7 +1844,6 @@ const IDENTITY_ARTIFACTS: &[&str] = &[
     ".mcp.json",
     ".claude.json",
     ".vscode/mcp.json",
-    ".vscode/tasks.json",
     "managed-settings.json",
 ];
 

