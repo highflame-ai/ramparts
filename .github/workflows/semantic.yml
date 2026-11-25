@@ -1,0 +1,82 @@
+name: Semantic Version - Ramparts
+
+on:
+  workflow_dispatch:
+
+env:
+  AUTHORIZED_BRANCH: main
+  DEVOPS_REPO: "highflame-cloud"
+  DEVOPS_BRANCH: "main"
+  RELEASE_ASSETS: "Cargo.toml,common/Cargo.toml"
+  UPDATE_VERSION_SCRIPT: "./update-version.sh"
+  NODE_VER: 22
+
+jobs:
+  highflame-semantic-release:
+    permissions:
+      contents: 'write'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create APP token
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.token.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Validate Manual Branch
+        shell: bash
+        run: |-
+          if [[ "${{ github.ref }}" == "refs/heads/${{ env.AUTHORIZED_BRANCH }}" ]] ; then
+            echo "Proceeding"
+          else
+            echo "${{ github.ref }} branch is not authorized to perform this action"
+            exit 1
+          fi
+
+      - name: DevOps Repository Checkout
+        uses: actions/checkout@v6
+        with:
+          repository: "${{ github.repository_owner }}/${{ env.DEVOPS_REPO }}"
+          token: ${{ steps.token.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.DEVOPS_BRANCH }}
+          path: ${{ env.DEVOPS_REPO }}
+
+      - name: Setup Node configs
+        shell: bash
+        run: |-
+          if [[ -d ${{ env.DEVOPS_REPO }}/semantic-release ]] ; then
+            cp -rf ${{ env.DEVOPS_REPO }}/semantic-release/.releaserc.cjs ./
+            cp -rf ${{ env.DEVOPS_REPO }}/semantic-release/semantic-release-packages.txt ./
+            rm -rf ${{ env.DEVOPS_REPO }}
+          else
+            echo "The required dir semantic-release is missing"
+            exit 1
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VER }}
+
+      - name: Semantic Release
+        env:
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+        shell: bash
+        run: |-
+          while read -r package; do
+            [[ -z "$package" || "$package" == \#* ]] && continue
+            args+=(--package="$package")
+          done < semantic-release-packages.txt
+
+          npx "${args[@]}" semantic-release

@@ -6,10 +6,8 @@ on:
       - "v*.*.*"
 
 env:
-  PY_VER: 3.11.8
-  RELEASE_BRANCH: "main"
+  RELEASE_VERSION: ${{ github.event.release.tag_name || github.ref_name }}
   REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
-  RELEASE_NAME: ${{ github.event.release.tag_name || github.ref_name }}
 
 jobs:
   highflame-validate:
@@ -27,43 +25,47 @@ jobs:
         id: validate_tag
         shell: bash
         run: |-
-          if [[ "${{ env.RELEASE_NAME }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
-            echo "Valid version format: ${{ env.RELEASE_NAME }}"
+          if [[ "${{ env.RELEASE_VERSION }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
+            echo "Valid version format: ${{ env.RELEASE_VERSION }}"
           else
-            echo "Invalid version format: ${{ env.RELEASE_NAME }}"
-            echo "Expected bare semver (X.Y.Z); got: ${{ env.RELEASE_NAME }}"
+            echo "Invalid version format: ${{ env.RELEASE_VERSION }}"
+            echo "Expected bare semver (X.Y.Z); got: ${{ env.RELEASE_VERSION }}"
             exit 1
           fi
 
-      - name: Stamp release version into Cargo.toml files
+      - name: Verify versions match
         shell: bash
         run: |-
           set -euo pipefail
-          VERSION=$(echo "$RELEASE_NAME" | sed 's|^v||g')
-          echo "Releasing version: $VERSION"
+
+          RELEASE_VERSION="${RELEASE_VERSION#v}"
+          echo "Expected version: $RELEASE_VERSION"
+
           for f in Cargo.toml common/Cargo.toml; do
             if [[ ! -f "$f" ]]; then
               echo "::error::Expected $f to exist; aborting release."
               exit 1
             fi
-            sed -i "s|^version = \".*\"|version = \"$VERSION\"|" "$f"
-            actual="$(grep -m1 '^version = ' "$f" | cut -d'"' -f2)"
-            if [[ "$actual" != "$VERSION" ]]; then
-              echo "::error::$f version did not update to $VERSION (got: $actual)"
+
+            ACTUAL_VERSION=$(grep -m1 '^version = ' "$f" | cut -d'"' -f2)
+
+            echo "$f version: $ACTUAL_VERSION"
+
+            if [[ "$ACTUAL_VERSION" != "$RELEASE_VERSION" ]]; then
+              echo "::error::$f version mismatch: expected $RELEASE_VERSION, got $ACTUAL_VERSION"
               exit 1
             fi
-            echo "Stamped $f -> $actual"
           done
 
-      - name: Upload version-stamped Cargo.toml files
-        uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: cargo-toml
-          path: |
-            Cargo.toml
-            common/Cargo.toml
-          retention-days: 1
+          echo "All versions match: $RELEASE_VERSION"
+
+      - name: Check Cargo.toml
+        shell: bash
+        run: |-
+          for f in Cargo.toml common/Cargo.toml; do
+            echo "printing contents of $f"
+            cat $f
+          done
 
   highflame-artifact:
     needs:
@@ -94,19 +96,6 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: false
-
-      - name: Download cargo-toml
-        uses: actions/download-artifact@v7
-        with:
-          name: cargo-toml
-
-      - name: Check Cargo.toml
-        shell: bash
-        run: |-
-          for f in Cargo.toml common/Cargo.toml; do
-            echo "printing contents of $f"
-            cat $f
-          done
 
       - name: Setting up Envs
         id: set_env
@@ -219,7 +208,7 @@ jobs:
         shell: bash
         run: |
           gh release upload \
-            "${RELEASE_NAME}" \
+            "${RELEASE_VERSION}" \
             "./release/${{ steps.set_env.outputs.crate_release }}"
 
       - name: Upload checksums
@@ -228,7 +217,7 @@ jobs:
         shell: bash
         run: |
           gh release upload \
-            "${RELEASE_NAME}" \
+            "${RELEASE_VERSION}" \
             "./release/${{ matrix.target }}-${{ matrix.arch }}_checksums.txt"
 
       # - name: Upload release assets
@@ -262,19 +251,6 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: false
-
-      - name: Download cargo-toml
-        uses: actions/download-artifact@v7
-        with:
-          name: cargo-toml
-
-      - name: Check Cargo.toml
-        shell: bash
-        run: |-
-          for f in Cargo.toml common/Cargo.toml; do
-            echo "printing contents of $f"
-            cat $f
-          done
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
