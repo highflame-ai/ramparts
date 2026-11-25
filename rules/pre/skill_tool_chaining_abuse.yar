@@ -74,6 +74,20 @@ rule SkillToolChainingExfiltration
         // requests.post / fetch / etc. on the same statement.
         $env_var_chain = /\b(os\.environ|getenv|process\.env)[^.\n]{0,40}\b(SECRET|PRIVATE|PASSWORD|CREDENTIAL|TOKEN)[^.\n]{0,120}\b(requests\.(post|get|put)|axios\.(post|get|put)|fetch\s*\(|urllib|curl|wget)\b/i
 
+        // === File-wide secret -> send -> collector chain ===
+        //
+        // The single-line chains above miss a bundled script that reads
+        // a secret on one line and posts it to a webhook ten lines later.
+        // All three groups must appear somewhere in the same file.
+        $fw_secret_env    = /\b(os\.environ\s*(\.items\s*\(|\.get\s*\(|\[)|os\.getenv\s*\(|process\.env\b)/
+        $fw_secret_dotenv = /open\s*\(\s*['"][^'"\n]*\.env['"]/
+        $fw_secret_ssh    = /\.ssh\/(id_rsa|id_ed25519|id_ecdsa|authorized_keys)\b/
+        $fw_secret_named  = /\b(OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|HF_TOKEN)\b/
+        $fw_send_py       = /\b(requests|httpx)\.(post|put)\s*\(/
+        $fw_send_js       = /\b(fetch|axios\.post)\s*\(/
+        $fw_send_curl     = /\bcurl\b[^\n]{0,200}(-X\s*POST|\s-d\s|--data)/
+        $fw_collector     = /(discord(app)?\.com\/api\/webhooks|api\.telegram\.org\/bot|hooks\.slack\.com\/services|webhook\.site|requestbin\.(com|net)|pipedream\.net|ngrok-free\.app|ngrok\.io)/i
+
         // === Exclusions ===
 
         // Security-doc / threat-model context.
@@ -101,6 +115,7 @@ rule SkillToolChainingExfiltration
             $chain_secret_dotfile or
             $explicit_exfil or
             $attacker_destination or
-            $env_var_chain
+            $env_var_chain or
+            (any of ($fw_secret_*) and any of ($fw_send_*) and $fw_collector)
         )
 }

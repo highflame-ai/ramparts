@@ -28,6 +28,11 @@ ramparts init-config
 ramparts mcp-stdio
 ramparts mcp-http  [--host HOST] [--port PORT]
 ramparts mcp-sse   [--host HOST] [--port PORT]   # alias of mcp-http (rmcp 1.x folds SSE into streamable HTTP)
+# mcp-http / mcp-sse bind 127.0.0.1 by default. Exposing them (--host 0.0.0.0)
+# should go with RAMPARTS_API_TOKEN (bearer token). Over these network
+# transports `scan-config` is off and `scan` accepts only http(s) URLs
+# (private MCP servers are fine; cloud metadata addresses aren't). Over
+# mcp-stdio, `scan` also accepts stdio: targets, as on the CLI.
 
 # Show help
 ramparts --help
@@ -489,7 +494,7 @@ ramparts server [OPTIONS]
 ```bash
 Options:
   -p, --port <PORT>               Server port [default: 3000]
-      --host <HOST>               Server host [default: 0.0.0.0]
+      --host <HOST>               Server host [default: 127.0.0.1]
       --config <FILE>             Configuration file path
   -h, --help                      Print help information
 ```
@@ -740,8 +745,8 @@ Ramparts can run as a REST API server for continuous monitoring:
 # Start server (default: localhost:3000)
 ramparts server
 
-# Custom host and port
-ramparts server --port 8080 --host 0.0.0.0
+# Custom host and port (set a token whenever you expose it)
+RAMPARTS_API_TOKEN=change-me ramparts server --port 8080 --host 0.0.0.0
 ```
 
 ### Batch Scanning

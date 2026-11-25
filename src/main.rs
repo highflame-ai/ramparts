@@ -4,6 +4,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use crate::config::ScannerConfig;
 
+mod agent_config;
 mod banner;
 mod baseline;
 mod cache;
@@ -14,6 +15,7 @@ mod core;
 mod integration_tests;
 mod mcp_client;
 mod mcp_server;
+mod net_policy;
 mod normalize;
 mod osv;
 #[cfg(test)]
@@ -102,6 +104,76 @@ struct Cli {
     /// Useful for troubleshooting connection issues or understanding scan behavior.
     #[arg(short, long)]
     debug: bool,
+
+    /// Exit non-zero when any finding is at or above this severity
+    /// (low, medium, high, critical). For CI gates: the report is still
+    /// printed to stdout; the failure message goes to stderr.
+    #[arg(long, global = true, value_enum, value_name = "SEVERITY")]
+    fail_on_findings: Option<FailOn>,
+}
+
+/// Severity threshold for `--fail-on-findings`. Variant order is the
+/// ranking (derive `Ord`), lowest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+enum FailOn {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+fn parse_severity(sev: &str) -> Option<FailOn> {
+    match sev.trim().to_ascii_uppercase().as_str() {
+        "LOW" => Some(FailOn::Low),
+        "MEDIUM" => Some(FailOn::Medium),
+        "HIGH" => Some(FailOn::High),
+        "CRITICAL" => Some(FailOn::Critical),
+        _ => None,
+    }
+}
+
+/// Count YARA findings and LLM security issues at or above `threshold`.
+/// Findings with no or unknown severity are not counted.
+fn count_findings_at_or_above(results: &[types::ScanResult], threshold: FailOn) -> usize {
+    results
+        .iter()
+        .flat_map(|r| {
+            let yara = r
+                .yara_results
+                .iter()
+                .filter_map(|y| y.rule_metadata.as_ref()?.severity.as_deref());
+            let llm = r
+                .security_issues
+                .iter()
+                .flat_map(|s| {
+                    s.tool_issues
+                        .iter()
+                        .chain(&s.prompt_issues)
+                        .chain(&s.resource_issues)
+                })
+                .map(|i| i.severity.as_str());
+            yara.chain(llm)
+        })
+        .filter(|sev| parse_severity(sev).is_some_and(|s| s >= threshold))
+        .count()
+}
+
+/// `Err` (→ exit code 1 from `main`) when the gate is set and tripped.
+fn enforce_fail_on(
+    results: &[types::ScanResult],
+    fail_on: Option<FailOn>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(threshold) = fail_on else {
+        return Ok(());
+    };
+    match count_findings_at_or_above(results, threshold) {
+        0 => Ok(()),
+        n => Err(format!(
+            "--fail-on-findings: {n} finding(s) at or above {}",
+            format!("{threshold:?}").to_uppercase()
+        )
+        .into()),
+    }
 }
 
 #[derive(Subcommand)]
@@ -188,8 +260,9 @@ enum Commands {
         #[arg(short, long, default_value = "3000")]
         port: u16,
 
-        /// Host to bind the server to
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Host to bind the server to. Defaults to loopback; pass
+        /// `--host 0.0.0.0` (and set RAMPARTS_API_TOKEN) to expose it.
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
     },
 
@@ -198,8 +271,9 @@ enum Commands {
 
     /// Run Ramparts as an MCP server over SSE (HTTP SSE endpoint)
     McpSse {
-        /// Host to bind the server to
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Host to bind to. Defaults to loopback; pass `--host 0.0.0.0`
+        /// (and set RAMPARTS_API_TOKEN) to expose it.
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// Port to run the SSE server on
         #[arg(short, long, default_value = "8000")]
@@ -208,8 +282,9 @@ enum Commands {
 
     /// Run Ramparts as an MCP server over streamable HTTP
     McpHttp {
-        /// Host to bind the server to
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Host to bind to. Defaults to loopback; pass `--host 0.0.0.0`
+        /// (and set RAMPARTS_API_TOKEN) to expose it.
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// Port to run the HTTP server on
         #[arg(short, long, default_value = "8081")]
@@ -492,6 +567,7 @@ async fn execute_command(
     scanner_config: ScannerConfig,
     scanner: Option<MCPScanner>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let fail_on = cli.fail_on_findings;
     match cli.command {
         Commands::Scan {
             url,
@@ -510,6 +586,7 @@ async fn execute_command(
                 timeout,
                 http_timeout,
                 only,
+                fail_on,
                 &scanner_config,
                 scanner,
             )
@@ -532,6 +609,7 @@ async fn execute_command(
                 http_timeout,
                 root,
                 only,
+                fail_on,
                 &scanner_config,
                 scanner,
             )
@@ -546,13 +624,14 @@ async fn execute_command(
         Commands::McpSse { host, port } => handle_mcp_sse_command(host, port).await,
         Commands::McpHttp { host, port } => handle_mcp_http_command(host, port).await,
         Commands::Replay { input, format } => handle_replay_command(input, format, &scanner_config),
-        Commands::Skills(args) => handle_skills_command(args, &scanner_config).await,
+        Commands::Skills(args) => handle_skills_command(args, fail_on, &scanner_config).await,
     }
 }
 
 /// Dispatcher for the `skills` namespace.
 async fn handle_skills_command(
     args: SkillsArgs,
+    fail_on: Option<FailOn>,
     scanner_config: &ScannerConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match args.command {
@@ -565,7 +644,8 @@ async fn handle_skills_command(
             timeout,
         } => {
             let format = resolve_format(format, json, sarif);
-            handle_skills_scan_command(vec![path], format, report, timeout, scanner_config).await
+            handle_skills_scan_command(vec![path], format, report, timeout, fail_on, scanner_config)
+                .await
         }
         SkillsCommand::ScanConfig {
             format,
@@ -593,7 +673,8 @@ async fn handle_skills_command(
                     format!("No skill discovery roots found. Looked at: {looked_at}").into(),
                 );
             }
-            handle_skills_scan_command(existing, format, report, timeout, scanner_config).await
+            handle_skills_scan_command(existing, format, report, timeout, fail_on, scanner_config)
+                .await
         }
     }
 }
@@ -610,6 +691,7 @@ async fn handle_skills_scan_command(
     format: Option<String>,
     report: bool,
     timeout: Option<u64>,
+    fail_on: Option<FailOn>,
     scanner_config: &ScannerConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output_format = format.unwrap_or(scanner_config.scanner.format.clone());
@@ -992,6 +1074,7 @@ async fn handle_skills_scan_command(
     result.response_time_ms = scan_timer.elapsed_ms();
 
     utils::print_result(&result, &output_format, scanner_config.scanner.detailed);
+    let gate = enforce_fail_on(std::slice::from_ref(&result), fail_on);
 
     if report {
         match utils::write_markdown_report(&[result]) {
@@ -1000,7 +1083,7 @@ async fn handle_skills_scan_command(
         }
     }
 
-    Ok(())
+    gate
 }
 
 /// Read a previously-emitted scan result JSON file and re-emit it through
@@ -1049,6 +1132,7 @@ async fn handle_scan_command(
     timeout: Option<u64>,
     http_timeout: Option<u64>,
     only: Option<String>,
+    fail_on: Option<FailOn>,
     scanner_config: &ScannerConfig,
     scanner: Option<MCPScanner>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1073,6 +1157,7 @@ async fn handle_scan_command(
     match scanner.scan_single(&url, options.clone()).await {
         Ok(result) => {
             utils::print_result(&result, &output_format, options.detailed);
+            let gate = enforce_fail_on(std::slice::from_ref(&result), fail_on);
 
             // Generate report if requested
             if report {
@@ -1086,7 +1171,7 @@ async fn handle_scan_command(
                 }
             }
 
-            Ok(())
+            gate
         }
         Err(e) => {
             error!(
@@ -1108,6 +1193,7 @@ async fn handle_scan_config_command(
     http_timeout: Option<u64>,
     root: Option<std::path::PathBuf>,
     only: Option<String>,
+    fail_on: Option<FailOn>,
     scanner_config: &ScannerConfig,
     scanner: Option<MCPScanner>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1154,7 +1240,7 @@ async fn handle_scan_config_command(
                 }
             }
 
-            Ok(())
+            enforce_fail_on(&results, fail_on)
         }
         Err(e) => {
             error!(
@@ -1291,4 +1377,57 @@ fn parse_auth_headers(headers: &[String]) -> Option<std::collections::HashMap<St
         }
     }
     Some(map)
+}
+
+#[cfg(test)]
+mod fail_on_tests {
+    use super::*;
+
+    fn yara(severity: Option<&str>) -> types::YaraScanResult {
+        serde_json::from_value(serde_json::json!({
+            "target_type": "prompt",
+            "target_name": "skill",
+            "rule_name": "R",
+            "context": "",
+            "rule_metadata": { "severity": severity },
+        }))
+        .expect("valid YaraScanResult fixture")
+    }
+
+    #[test]
+    fn gate_counts_yara_and_llm_findings_at_or_above_threshold() {
+        let mut r = types::ScanResult::new("skills".into());
+        r.yara_results = vec![yara(Some("MEDIUM")), yara(Some("critical")), yara(None)];
+        let mut sec = security::SecurityScanResult::new();
+        let mut issue =
+            security::SecurityIssue::new(security::SecurityIssueType::SecretsLeakage, "x".into());
+        issue.severity = "HIGH".into();
+        sec.prompt_issues.push(issue);
+        r.security_issues = Some(sec);
+        let results = [r];
+
+        assert_eq!(count_findings_at_or_above(&results, FailOn::Low), 3);
+        assert_eq!(count_findings_at_or_above(&results, FailOn::High), 2);
+        assert_eq!(count_findings_at_or_above(&results, FailOn::Critical), 1);
+
+        assert!(enforce_fail_on(&results, None).is_ok());
+        assert!(enforce_fail_on(&results, Some(FailOn::High)).is_err());
+        assert!(
+            enforce_fail_on(&[types::ScanResult::new("clean".into())], Some(FailOn::Low)).is_ok()
+        );
+    }
+
+    #[test]
+    fn flag_parses_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "ramparts",
+            "skills",
+            "scan",
+            ".",
+            "--fail-on-findings",
+            "high",
+        ])
+        .expect("flag should parse");
+        assert_eq!(cli.fail_on_findings, Some(FailOn::High));
+    }
 }

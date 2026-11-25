@@ -96,8 +96,34 @@ mod tests {
         );
     }
 
+    /// These tests set and remove the same process-wide env vars
+    /// (`LLM_API_KEY`, `X_API_KEY`); run in parallel they overwrite each
+    /// other's values. Async lock because one test awaits while holding it.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    const ENV_VARS: &[&str] = &["LLM_API_KEY", "X_API_KEY", "API_KEY"];
+
+    /// Holds `ENV_LOCK` and clears the env vars on entry and on drop, so a
+    /// failed assert can't leave a key set for later tests.
+    struct EnvGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+
+    impl EnvGuard {
+        async fn acquire() -> Self {
+            let guard = Self(ENV_LOCK.lock().await);
+            ENV_VARS.iter().for_each(|v| std::env::remove_var(v));
+            guard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            ENV_VARS.iter().for_each(|v| std::env::remove_var(v));
+        }
+    }
+
     #[tokio::test]
     async fn test_environment_variable_mapping() {
+        let _env = EnvGuard::acquire().await;
         let _ = tracing_subscriber::fmt::try_init();
 
         // Set environment variable
@@ -125,6 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_env_mapping_function() {
+        let _env = EnvGuard::acquire().await;
         // Clean up any existing env vars first
         std::env::remove_var("LLM_API_KEY");
         std::env::remove_var("X_API_KEY");
@@ -157,6 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_env_mapping_respects_existing_headers() {
+        let _env = EnvGuard::acquire().await;
         // Clean up any existing env vars first
         std::env::remove_var("LLM_API_KEY");
         std::env::remove_var("X_API_KEY");
