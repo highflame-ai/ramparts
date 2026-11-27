@@ -154,7 +154,7 @@ webpki-roots = "1"
 #   time). `cargo publish` REJECTS a manifest where a workspace
 #   dependency lacks a version — `cargo publish --dry-run` catches
 #   this locally. Must move in lockstep with `common/Cargo.toml`.
-ramparts-common = { path = "common", version = "0.8.1" }
+ramparts-common = { path = "common", version = "0.9.0" }
 
 [build-dependencies]
 chrono = "0.4"
