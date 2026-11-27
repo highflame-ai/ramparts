@@ -8,7 +8,7 @@ name = "ramparts"
 # persists. Publishing 0.8.1 cleanly skips the orphan; crates.io
 # users go 0.7.3 -> 0.8.1, GitHub's 0.8.0 binary release stays as
 # historical archive.
-version = "0.8.2"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.95"
 authors = ["Sharath Rajasekar <sharath@highflame.com>"]
